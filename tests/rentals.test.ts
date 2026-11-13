@@ -109,12 +109,18 @@ function fixture() {
 describe('independent AR rental lifecycle', () => {
   it('defaults omitted device types while preserving explicit and existing types', async () => {
     const f = fixture();
-    expect(await f.service.createDevice(f.manager, { uuid: 'default-type-device' })).toMatchObject({ created: true, device: { type: 'rokid studio2' } });
+    expect(await f.service.createDevice(f.manager, { uuid: 'default-type-device' })).toMatchObject({ created: true, device: { type: 'Rokid Studio2' } });
     expect(await f.service.createDevice(f.manager, { uuid: 'explicit-ios-device', type: 'ios' })).toMatchObject({ device: { type: 'ios' } });
     expect(await f.service.createDevice(f.manager, { uuid: 'explicit-rokid-device', type: 'rokid' })).toMatchObject({ device: { type: 'rokid' } });
-    expect(await f.service.createDevice(f.manager, { uuid: 'explicit-studio-device', type: 'rokid studio2' })).toMatchObject({ device: { type: 'rokid studio2' } });
+    expect(await f.service.createDevice(f.manager, { uuid: 'explicit-studio-device', type: 'rokid studio2' })).toMatchObject({ device: { type: 'Rokid Studio2' } });
+    expect(await f.service.createDevice(f.manager, { uuid: 'short-studio-device', type: 'rs2' })).toMatchObject({ created: true, device: { type: 'Rokid Studio2' } });
+    expect((await f.db.one('SELECT device_type FROM ar_device WHERE uuid=?', ['short-studio-device']))!.device_type).toBe('Rokid Studio2');
+    expect(await f.service.createDevice(f.manager, { uuid: 'camera-8', type: 'rs2' })).toMatchObject({ created: false, device: { type: 'ios' } });
     expect((await f.service.context(f.user, 'camera-8')).device.type).toBe('ios');
-    expect(DeviceService.display({ id: 99, uuid: 'legacy-empty', device_type: '' }).type).toBe('rokid studio2');
+    expect(DeviceService.display({ id: 99, uuid: 'legacy-empty', device_type: '' }).type).toBe('Rokid Studio2');
+    await f.db.insert('ar_device', { uuid: 'legacy-model-case', name: 'Synthetic legacy model', device_type: 'rokid studio3' });
+    expect((await f.service.context(f.user, 'legacy-model-case')).device.type).toBe('Rokid Studio3');
+    expect((await f.db.one('SELECT device_type FROM ar_device WHERE uuid=?', ['legacy-model-case']))!.device_type).toBe('rokid studio3');
   });
   it('registers devices only for managers, without creating a rental configuration or mutating duplicate scans', async () => {
     const f = fixture();

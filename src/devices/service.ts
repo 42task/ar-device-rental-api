@@ -1,8 +1,9 @@
 import type { Row, Services } from '../core/contracts';
 import { ApiError } from '../core/errors';
 import { requireManager } from '../core/roles';
+import { DEFAULT_DEVICE_TYPE, resolveDeviceType } from './types';
 
-export const DEFAULT_DEVICE_TYPE = 'rokid studio2';
+export { DEFAULT_DEVICE_TYPE } from './types';
 
 export function deviceUuid(value: unknown): string {
   if (typeof value !== 'string' || !/^\S{1,255}$/u.test(value) || /[\x00-\x1f\x7f]/.test(value)) {
@@ -17,7 +18,7 @@ export function deviceType(value: unknown): string {
     || [...value].length > 32 || /[\x00-\x1f\x7f]/.test(value)) {
     throw new ApiError(422, '设备类型须为 1 至 32 个字符，且不含首尾空白或控制字符');
   }
-  return value;
+  return resolveDeviceType(value);
 }
 
 function deviceName(value: unknown, uuid: string): string {
@@ -33,7 +34,7 @@ export class DeviceService {
   constructor(private readonly services: Services) {}
 
   static display(row: Row): Row {
-    return { id: Number(row.id), uuid: String(row.uuid), name: String(row.name || row.uuid), type: String(row.device_type || DEFAULT_DEVICE_TYPE) };
+    return { id: Number(row.id), uuid: String(row.uuid), name: String(row.name || row.uuid), type: resolveDeviceType(String(row.device_type || DEFAULT_DEVICE_TYPE)) };
   }
 
   async create(user: Row, input: Row): Promise<Row> {

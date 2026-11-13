@@ -2,7 +2,7 @@
 
 独立的 Node.js 24 / TypeScript / Express 5 后端，为原生微信小程序 **AR设备租赁**（`wx03dbf50c15cac06f`）提供登录、设备、租赁、微信支付与退款接口。使用全新 MySQL 8.4 数据库，所有业务表以 `ar_` 开头，不连接旧 `wechat` 服务或旧数据库，也不需要 Redis。
 
-公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://c.4mr.cn/d?uuid=UUID&type=TYPE`；扫码入口与 API 域名分别配置。前端源码在 [ar-device-rental-mp](https://github.com/42task/ar-device-rental-mp)。
+公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://d.4mr.cn/d?i=UUID&t=rs2`；扫码入口与 API 域名分别配置。前端源码在 [ar-device-rental-mp](https://github.com/42task/ar-device-rental-mp)。
 
 ## 部署
 
@@ -105,3 +105,7 @@ npm run admin -- bootstrap-root --phone-stdin
 ```
 
 初始化仍要求系统没有 root，并在事务中重新核对当前 AppID 的已验证绑定；已有 root 时须沿用现有管理员授权流程。管理员身份和手机授权须分别确认。
+
+## 设备型号
+
+前端登记使用 `Rokid Studio`、`Rokid Studio2`、`Rokid Studio3` 三个选项，默认 `Rokid Studio2`。数据库 `device_type` 保持字符串字段；已知型号和二维码短码 `rs`、`rs2`、`rs3` 统一为上述规范名称，历史其他类型仍可读取。schema 5 只调整新建设备的数据库默认值，不批量重写旧设备记录。
