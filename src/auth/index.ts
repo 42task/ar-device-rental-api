@@ -15,6 +15,7 @@ const publicUser = (user: Row): Row => ({ id: Number(user.id), role: role(user.r
 const validIdentity = (value: unknown): value is string => typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,128}$/u.test(value);
 
 export class RentalAuth {
+  webAuthenticate?: (ctx: Context) => Promise<RentalPrincipal>;
   readonly appId: string;
   private readonly issuer: string;
   private readonly audience: string;
@@ -84,12 +85,16 @@ export class RentalAuth {
     return this.response(user);
   }
   async refresh(value: unknown): Promise<Row> { return this.response(await this.verify(value, 'refresh')); }
-  readonly authenticate = async (ctx: Context): Promise<RentalPrincipal> => {
+  readonly authenticateBearer = async (ctx: Context): Promise<RentalPrincipal> => {
     const header = ctx.req.headers.authorization;
     const match = typeof header === 'string' ? /^Bearer\s+(\S+)$/i.exec(header) : null;
     if (!match) { ctx.res.setHeader('WWW-Authenticate', 'Bearer'); throw new ApiError(401, '请先登录'); }
     const user = await this.verify(match[1], 'access');
     return { user, appid: this.appId, openid: user.openid };
+  };
+  readonly authenticate = async (ctx: Context): Promise<RentalPrincipal> => {
+    if (ctx.req.headers.authorization === undefined && this.webAuthenticate) return this.webAuthenticate(ctx);
+    return this.authenticateBearer(ctx);
   };
   private async users(ctx: Context): Promise<Row> {
     const principal = await this.authenticate(ctx);

@@ -79,3 +79,7 @@ Portainer 单独配置同一香港 registry 的拉取凭据；默认使用 `publ
 | `POST /api/v2/rental/refund-notify` | 微信退款通知 |
 
 金额均使用整数分；支付与退款状态以经过服务端校验的微信结果为准。配置不完整时不会提供支付就绪状态。业务写入、设备占用与结算由数据库事务、唯一约束及幂等标识保护。
+
+## 网页后台扫码登录
+
+网页管理后台由独立的 `42task/ar-device-rental-admin` 仓库部署，入口保持 `https://d.4mr.cn/admin/`。本服务提供同源 `/api/v2/rental/admin/auth` 扫码会话、管理员总览及全量订单查询；不包含前端静态文件。部署及联调要求见 [后台登录说明](docs/admin.md)。

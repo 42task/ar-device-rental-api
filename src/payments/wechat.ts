@@ -23,6 +23,8 @@ export class WeChatClient {
   private readonly nonce: () => string;
   private loginConfigurationError = false;
   private paymentConfigurationError = false;
+  private accessToken?: { value: string; expires: number };
+  private accessTokenRequest?: Promise<string>;
 
   constructor(options: WeChatOptions = {}) {
     const env = process.env;
@@ -83,6 +85,49 @@ export class WeChatClient {
     if (!response.ok || !object(result) || result.errcode !== undefined && result.errcode !== 0 || !identity(result.openid)) throw new ApiError(401, '微信登录失败，请重新授权');
     if (result.unionid !== undefined && !identity(result.unionid)) throw new ApiError(401, '微信登录身份无效');
     return { openid: result.openid, ...(result.unionid ? { unionid: result.unionid } : {}) };
+  }
+  async stableToken(): Promise<string> {
+    if (this.loginConfigurationError || !/^wx[0-9a-f]{16}$/i.test(this.config.appId || '') || !this.config.appSecret) throw new ApiError(503, '小程序 AppID 或 AppSecret 未配置');
+    if (this.accessToken && this.accessToken.expires > this.now()) return this.accessToken.value;
+    if (this.accessTokenRequest) return this.accessTokenRequest;
+    const request = (async () => {
+      const response = await this.transport('https://api.weixin.qq.com/cgi-bin/stable_token', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'client_credential', appid: this.config.appId, secret: this.config.appSecret, force_refresh: false }),
+      });
+      let result: unknown;
+      try { result = await response.json(); } catch { throw new ApiError(502, '微信凭据响应格式无效'); }
+      if (!response.ok || !object(result) || result.errcode !== undefined && result.errcode !== 0
+        || typeof result.access_token !== 'string' || !/^[^\s\x00-\x1f\x7f]{16,2048}$/.test(result.access_token)
+        || !Number.isSafeInteger(result.expires_in) || result.expires_in < 1) throw new ApiError(503, '微信小程序码服务暂时不可用，请检查后台凭据及IP白名单');
+      this.accessToken = { value: result.access_token, expires: this.now() + Math.max(0, result.expires_in - 120) };
+      return result.access_token;
+    })();
+    this.accessTokenRequest = request;
+    try { return await request; } finally { if (this.accessTokenRequest === request) this.accessTokenRequest = undefined; }
+  }
+  async unlimitedCode(scene: string, envVersion: 'release' | 'trial' | 'develop' = 'release'): Promise<Buffer> {
+    if (!/^[a-f0-9]{32}$/.test(scene) || !['release', 'trial', 'develop'].includes(envVersion)) throw new ApiError(422, '登录二维码参数无效');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const token = await this.stableToken();
+      const response = await this.transport(`https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=${encodeURIComponent(token)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scene, page: 'pages/admin/login', check_path: envVersion === 'release', env_version: envVersion, width: 430, is_hyaline: false }),
+      });
+      let bytes: Buffer;
+      try { bytes = Buffer.from(await response.arrayBuffer()); } catch { throw new ApiError(503, '微信小程序码读取失败'); }
+      const png = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+      const jpeg = bytes.length >= 5 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 && bytes.at(-2) === 255 && bytes.at(-1) === 217;
+      if (response.ok && bytes.length <= 2 * 1024 * 1024 && (png || jpeg)) return bytes;
+      let error: unknown;
+      try { error = JSON.parse(bytes.subarray(0, 4096).toString('utf8')); } catch { /* Never forward provider output. */ }
+      if (attempt === 0 && object(error) && [40001, 40014, 42001].includes(error.errcode)) {
+        if (this.accessToken?.value === token) this.accessToken = undefined;
+        continue;
+      }
+      throw new ApiError(503, '微信登录二维码生成失败，请确认小程序确认页已发布及版本配置');
+    }
+    throw new ApiError(503, '微信登录二维码暂时不可用');
   }
   private verifyPayment(raw: string, headers: Headers | Record<string, unknown>): void {
     const get = (name: string): string => {

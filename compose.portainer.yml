@@ -15,6 +15,7 @@ services:
       HOST: "0.0.0.0"
       TRUST_PROXY: "1"
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://d.4mr.cn}
+      ADMIN_LOGIN_ENV_VERSION: ${ADMIN_LOGIN_ENV_VERSION:-release}
       MYSQL_HOST: mysql
       MYSQL_PORT: "3306"
       MYSQL_DATABASE: ${MYSQL_DATABASE:-ar_device_rental}

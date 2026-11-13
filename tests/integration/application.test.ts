@@ -63,6 +63,18 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       const disabledPayment = await request(app).post('/api/v2/rentals').set('Authorization', ordinaryToken).send({ deviceId, priceVersion: 1, idempotencyKey: 'payment-disabled-test' });
       expect(disabledPayment.status).toBe(503);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_order'))!.total)).toBe(0);
+      expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', managerToken)).body).toMatchObject({ devices: { total: 1, available: 1, disabled: 0 }, orders: { total: 0, active: 0, refunding: 0 }, paymentsEnabled: false });
+      expect((await request(app).get('/api/v2/rental/admin/orders').set('Authorization', ordinaryToken)).status).toBe(403);
+      const seedOrder = { device_id: deviceId, device_uuid: uuid, device_name: 'Integration device', user_id: ordinary.user.id, appid: appId, payer_openid: 'private-payer-identity', mch_id: 'synthetic-merchant', use_fee_cents: 100, deposit_cents: 5000, total_cents: 5100, price_version: 1, status: 'CANCELLED', payment_status: 'CLOSED', out_trade_no: 'synthetic-management-order', idempotency_key: 'synthetic-management-request', expires_ms: Date.now(), created_ms: Date.now(), updated_ms: Date.now() };
+      const seeded = await db.insert('ar_rental_order', seedOrder);
+      await db.insert('ar_rental_order', { ...seedOrder, appid: 'wx0000000000000000', out_trade_no: 'synthetic-other-app-order', idempotency_key: 'synthetic-other-app-request' });
+      const managedOrders = await request(app).get('/api/v2/rental/admin/orders').query({ search: uuid, status: 'CANCELLED' }).set('Authorization', managerToken);
+      expect(managedOrders.status).toBe(200);
+      expect(managedOrders.body).toMatchObject({ total: 1, page: 1, pageSize: 20, items: [{ id: Number(seeded.id), status: 'CANCELLED' }] });
+      expect(JSON.stringify(managedOrders.body)).not.toContain('private-payer-identity');
+      expect((await request(app).get('/api/v2/rental/admin/orders').query({ search: '%' }).set('Authorization', managerToken)).body.total).toBe(0);
+      expect((await request(app).get('/api/v2/rental/admin/orders').query({ status: 'INVALID' }).set('Authorization', managerToken)).status).toBe(422);
+      expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', managerToken)).body.orders.total).toBe(1);
       expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.accessToken })).status).toBe(401);
       expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.refreshToken })).status).toBe(200);
       expect((await request(app).get('/api/v2/rentals').set('Authorization', 'Bearer ' + ordinary.token.refreshToken)).status).toBe(401);
