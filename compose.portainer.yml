@@ -1,7 +1,7 @@
 # Docker Standalone / Compose Stack; not a Docker Swarm stack.
 services:
   app:
-    image: ${RENTAL_API_IMAGE:-ghcr.io/42task/ar-device-rental-api:main}
+    image: ${RENTAL_API_IMAGE:-hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api:publish}
     pull_policy: always
     restart: unless-stopped
     init: true
