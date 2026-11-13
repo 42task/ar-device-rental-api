@@ -1,0 +1,82 @@
+import { randomBytes } from 'node:crypto';
+import mysql from 'mysql2/promise';
+import request from 'supertest';
+import { describe, expect, it } from 'vitest';
+import { createApplication } from '../../src/application';
+import { Database } from '../../src/core/database';
+import { migrate } from '../../src/core/migrations';
+import { RentalAuth, bootstrapRoot } from '../../src/auth';
+import { WeChatClient } from '../../src/payments/wechat';
+
+describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complete non-payment HTTP integration', () => {
+  it('migrates twice, logs in, explicitly bootstraps root and manages a device without the old backend', async () => {
+    if (!['127.0.0.1', 'localhost'].includes(process.env.MYSQL_HOST || '') || process.env.MYSQL_DATABASE !== 'ar_rental_test') throw new Error('Use the dedicated localhost AR rental test environment.');
+    const database = 'ar_http_test_' + randomBytes(10).toString('hex');
+    const settings = { host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT || 3306), user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD };
+    const admin = await mysql.createConnection(settings);
+    let db: Database | undefined, created = false;
+    try {
+      await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4`); created = true;
+      db = new Database(mysql.createPool({ ...settings, database, connectionLimit: 8 }));
+      await migrate(db);
+      await migrate(db);
+      const appId = 'wx03dbf50c15cac06f';
+      const client = new WeChatClient({ appId, appSecret: 'synthetic-test-only', payEnabled: false, fetch: async input => {
+        const url = new URL(String(input));
+        expect(url.origin).toBe('https://api.weixin.qq.com');
+        const code = url.searchParams.get('js_code');
+        return new Response(JSON.stringify({ openid: 'test-openid-' + code }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      } });
+      const auth = new RentalAuth(db, client, { jwtSecret: 'integration-test-signing-key-at-least-32-bytes' });
+      const { app } = createApplication({ db, client, auth });
+      const login = async (code: string) => {
+        const response = await request(app).post('/api/v2/rental/auth/login').send({ code });
+        expect(response.status).toBe(200);
+        return response.body.data;
+      };
+      const owner = await login('owner');
+      expect(owner.user.role).toBe('user');
+      await bootstrapRoot(db, owner.user.id, appId);
+      await expect(bootstrapRoot(db, owner.user.id, appId)).rejects.toMatchObject({ status: 409 });
+      const manager = await login('manager');
+      const ordinary = await login('ordinary');
+      const ownerToken = 'Bearer ' + owner.token.accessToken, managerToken = 'Bearer ' + manager.token.accessToken, ordinaryToken = 'Bearer ' + ordinary.token.accessToken;
+      const promoted = await request(app).put(`/api/v2/rental/admin/users/${manager.user.id}/role`).set('Authorization', ownerToken).send({ role: 'manager' });
+      expect(promoted.status).toBe(200);
+      expect(promoted.body).toMatchObject({ id: manager.user.id, role: 'manager' });
+      const users = await request(app).get('/api/v2/rental/admin/users').set('Authorization', ownerToken);
+      expect(users.status).toBe(200);
+      expect(users.body.items).toHaveLength(2);
+      expect(JSON.stringify(users.body)).not.toContain('test-openid');
+      const uuid = 'http-device-test';
+      const missing = await request(app).get('/api/v2/rental/devices/context').query({ uuid }).set('Authorization', ordinaryToken);
+      expect(missing.body).toMatchObject({ state: 'UNREGISTERED', actions: { canCreate: false } });
+      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', ordinaryToken).send({ uuid })).status).toBe(403);
+      const registered = await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid, type: 'rokid' });
+      expect(registered.status).toBe(200);
+      const deviceId = registered.body.device.id;
+      expect(registered.body.device).toMatchObject({ uuid, type: 'rokid' });
+      const configured = await request(app).patch(`/api/v2/rental/devices/${deviceId}/config`).set('Authorization', managerToken).send({ enabled: true, useFeeCents: 100, depositCents: 5000, version: 0 });
+      expect(configured.status).toBe(200);
+      const context = await request(app).get('/api/v2/rental/devices/context').query({ uuid }).set('Authorization', ordinaryToken);
+      expect(context.body).toMatchObject({ state: 'AVAILABLE', paymentReady: false, pricing: { useFeeCents: 100, depositCents: 5000, totalCents: 5100 }, actions: { canRent: false } });
+      const disabledPayment = await request(app).post('/api/v2/rentals').set('Authorization', ordinaryToken).send({ deviceId, priceVersion: 1, idempotencyKey: 'payment-disabled-test' });
+      expect(disabledPayment.status).toBe(503);
+      expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_order'))!.total)).toBe(0);
+      expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.accessToken })).status).toBe(401);
+      expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.refreshToken })).status).toBe(200);
+      expect((await request(app).get('/api/v2/rentals').set('Authorization', 'Bearer ' + ordinary.token.refreshToken)).status).toBe(401);
+      expect((await request(app).put(`/api/v2/rental/admin/users/${manager.user.id}/role`).set('Authorization', ownerToken).send({ role: 'user' })).status).toBe(200);
+      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid: 'forbidden-device' })).status).toBe(403);
+      await migrate(db);
+      expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_device'))!.total)).toBe(1);
+      expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_user'))!.total)).toBe(3);
+      expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_role_audit'))!.total)).toBe(3);
+      expect((await request(app).get('/health')).body).toMatchObject({ status: 'healthy', schema: 'ready', payments: 'disabled' });
+    } finally {
+      await db?.close();
+      if (created) await admin.query(`DROP DATABASE ${database}`);
+      await admin.end();
+    }
+  });
+});

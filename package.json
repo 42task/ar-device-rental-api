@@ -1,0 +1,32 @@
+{
+  "name": "@42task/ar-device-rental-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Independent Node.js backend for AR设备租赁",
+  "engines": { "node": ">=24 <25" },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/main.js",
+    "migrate": "node dist/scripts/migrate.js",
+    "admin": "node dist/scripts/admin.js",
+    "test": "vitest run",
+    "test:integration": "RUN_INTEGRATION=1 vitest run tests/integration"
+  },
+  "dependencies": {
+    "dotenv": "17.4.2",
+    "express": "5.3.0",
+    "jsonwebtoken": "9.0.3",
+    "mysql2": "3.24.6"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/jsonwebtoken": "9.0.10",
+    "@types/node": "24.19.2",
+    "@types/supertest": "6.0.3",
+    "supertest": "7.3.1",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}

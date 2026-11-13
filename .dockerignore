@@ -1,0 +1,22 @@
+# Send only build inputs to Docker; environment, local data and tests stay out.
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!scripts/
+!scripts/**
+!database/
+!database/**
+**/.env*
+**/secrets/**
+**/*.pem
+**/*.key
+**/*.p8
+**/*.p12
+**/*.pfx
+**/*.log
+**/*.sql.gz
+**/*.dump
