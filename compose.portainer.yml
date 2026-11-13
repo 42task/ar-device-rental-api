@@ -15,6 +15,7 @@ services:
       HOST: "0.0.0.0"
       TRUST_PROXY: "1"
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://d.4mr.cn}
+      ADMIN_LOGIN_ENV_VERSION: ${ADMIN_LOGIN_ENV_VERSION:-release}
       MYSQL_HOST: mysql
       MYSQL_PORT: "3306"
       MYSQL_DATABASE: ${MYSQL_DATABASE:-ar_device_rental}
@@ -25,6 +26,7 @@ services:
       JWT_SECRET_PATH: ${JWT_SECRET_PATH:-/run/secrets/jwt-secret}
       JWT_ISSUER: ${JWT_ISSUER:-ar-device-rental-api}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-ar-device-rental-mini-program}
+      ROOT_PHONE: "${ROOT_PHONE:-}"
       WECHAT_APP_ID: wx03dbf50c15cac06f
       WECHAT_APP_SECRET: ${WECHAT_APP_SECRET:-}
       WECHAT_APP_SECRET_PATH: ${WECHAT_APP_SECRET_PATH:-/run/secrets/wechat-app-secret}

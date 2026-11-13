@@ -6,9 +6,10 @@ import { ApiRouter } from '../src/core/router';
 import { WeChatClient } from '../src/payments/wechat';
 import { RentalAuth } from '../src/auth';
 import express from 'express';
+import { SCHEMA_VERSION } from '../src/core/migrations';
 
 const appId = 'wx03dbf50c15cac06f';
-const fakeDb = () => ({ query: async () => [{ one: 1 }], one: async () => ({ version: 1 }) }) as unknown as Database;
+const fakeDb = () => ({ query: async () => [{ one: 1 }], one: async () => ({ version: SCHEMA_VERSION }) }) as unknown as Database;
 const build = () => {
   const db = fakeDb();
   const client = new WeChatClient({ appId, appSecret: '', payEnabled: false });
@@ -34,6 +35,13 @@ describe('standalone API HTTP boundary', () => {
     expect((await request(app).get('/api/v2/files')).status).toBe(404);
     expect((await request(app).get('/api/v2/root/managers')).status).toBe(404);
     expect((await request(app).post('/api/v2/rental/payment-notify').send({})).status).not.toBe(200);
+  });
+  it('protects management reads and leaves static admin hosting to the separate frontend', async () => {
+    const { app } = build();
+    expect((await request(app).get('/admin/')).status).toBe(404);
+    expect((await request(app).get('/api/v2/rental/admin/auth/session')).status).toBe(401);
+    expect((await request(app).get('/api/v2/rental/admin/overview')).status).toBe(401);
+    expect((await request(app).get('/api/v2/rental/admin/orders')).status).toBe(401);
   });
   it('rejects invalid JSON and oversized bodies without reflecting raw content', async () => {
     const { app } = build();

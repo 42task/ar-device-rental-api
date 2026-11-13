@@ -2,6 +2,8 @@ import type { Row, Services } from '../core/contracts';
 import { ApiError } from '../core/errors';
 import { requireManager } from '../core/roles';
 
+export const DEFAULT_DEVICE_TYPE = 'rokid studio2';
+
 export function deviceUuid(value: unknown): string {
   if (typeof value !== 'string' || !/^\S{1,255}$/u.test(value) || /[\x00-\x1f\x7f]/.test(value)) {
     throw new ApiError(422, '设备 UUID 无效');
@@ -10,7 +12,7 @@ export function deviceUuid(value: unknown): string {
 }
 
 export function deviceType(value: unknown): string {
-  if (value === undefined) return 'ios';
+  if (value === undefined) return DEFAULT_DEVICE_TYPE;
   if (typeof value !== 'string' || !value.trim() || value !== value.trim()
     || [...value].length > 32 || /[\x00-\x1f\x7f]/.test(value)) {
     throw new ApiError(422, '设备类型须为 1 至 32 个字符，且不含首尾空白或控制字符');
@@ -31,7 +33,7 @@ export class DeviceService {
   constructor(private readonly services: Services) {}
 
   static display(row: Row): Row {
-    return { id: Number(row.id), uuid: String(row.uuid), name: String(row.name || row.uuid), type: String(row.device_type || 'ios') };
+    return { id: Number(row.id), uuid: String(row.uuid), name: String(row.name || row.uuid), type: String(row.device_type || DEFAULT_DEVICE_TYPE) };
   }
 
   async create(user: Row, input: Row): Promise<Row> {

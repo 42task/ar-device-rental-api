@@ -6,25 +6,34 @@ import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
 import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
+import { maskedPhone, normalizePhoneInput } from './phone';
+import { initializeRootFromVerifiedPhone } from './admin';
 
 export { bootstrapRoot } from './admin';
 export interface RentalPrincipal { user: Row; appid: string; openid: string }
-export interface RentalAuthOptions { jwtSecret?: string; jwtSecretPath?: string; issuer?: string; audience?: string; appId?: string; now?: () => number }
+export interface RentalAuthOptions { jwtSecret?: string; jwtSecretPath?: string; issuer?: string; audience?: string; appId?: string; rootPhone?: string; now?: () => number }
 const role = (value: unknown) => value === 'root' || value === 'manager' ? value : 'user';
-const publicUser = (user: Row): Row => ({ id: Number(user.id), role: role(user.role), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.tel ?? null });
+const publicUser = (user: Row): Row => ({ id: Number(user.id), role: role(user.role), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.verified_phone ? maskedPhone(user.verified_phone, user.phone_country_code) : user.tel ?? null, ...(user.verified_phone ? { phoneVerified: true } : {}) });
 const validIdentity = (value: unknown): value is string => typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,128}$/u.test(value);
 
 export class RentalAuth {
+  webAuthenticate?: (ctx: Context) => Promise<RentalPrincipal>;
   readonly appId: string;
   private readonly issuer: string;
   private readonly audience: string;
   private readonly now: () => number;
   private readonly jwtSecret?: string;
+  private readonly rootPhone?: string;
+  private readonly rootPhoneInvalid: boolean = false;
   constructor(private readonly db: Database, private readonly client: WeChatClient, options: RentalAuthOptions = {}) {
     this.appId = options.appId ?? client.config.appId ?? '';
     this.issuer = options.issuer ?? process.env.JWT_ISSUER ?? 'ar-device-rental-api';
     this.audience = options.audience ?? process.env.JWT_AUDIENCE ?? 'ar-device-rental-mini-program';
     this.now = options.now ?? Date.now;
+    try {
+      const rootPhone = options.rootPhone ?? process.env.ROOT_PHONE ?? '';
+      if (rootPhone.trim()) this.rootPhone = normalizePhoneInput(rootPhone);
+    } catch { this.rootPhoneInvalid = true; }
     try {
       const path = options.jwtSecretPath ?? process.env.JWT_SECRET_PATH;
       this.jwtSecret = options.jwtSecret?.trim() || process.env.JWT_SECRET?.trim() || (path?.trim() ? readFileSync(path, 'utf8').trim() : undefined);
@@ -33,6 +42,7 @@ export class RentalAuth {
   private configured(): void {
     if (!/^wx[0-9a-f]{16}$/i.test(this.appId) || this.appId !== this.client.config.appId) throw new ApiError(503, '小程序 AppID 配置无效');
     if (!this.jwtSecret || Buffer.byteLength(this.jwtSecret) < 32) throw new ApiError(503, '登录签名密钥未配置或长度不足');
+    if (this.rootPhoneInvalid) throw new ApiError(503, 'ROOT_PHONE 手机号配置无效，请检查环境变量');
   }
   private issue(user: Row): Row {
     const now = Math.floor(this.now() / 1000), accessSeconds = 7200;
@@ -52,7 +62,8 @@ export class RentalAuth {
     } catch { throw new ApiError(401, '登录已失效，请重新登录'); }
     const user = await this.db.one('SELECT * FROM ar_user WHERE id=? AND appid=?', [claims.uid, this.appId]);
     if (!user || !validIdentity(user.openid)) throw new ApiError(401, '当前微信账号已失效，请重新登录');
-    return { ...user, role: role(user.role) };
+    const current = this.rootPhone ? await initializeRootFromVerifiedPhone(this.db, user, this.appId, this.rootPhone) : user;
+    return { ...current, role: role(current.role) };
   }
   async login(code: unknown): Promise<Row> {
     this.configured();
@@ -81,26 +92,32 @@ export class RentalAuth {
       }
     }
     if (!user) throw new ApiError(503, '微信登录暂时不可用');
+    if (this.rootPhone) user = await initializeRootFromVerifiedPhone(this.db, user, this.appId, this.rootPhone);
     return this.response(user);
   }
   async refresh(value: unknown): Promise<Row> { return this.response(await this.verify(value, 'refresh')); }
-  readonly authenticate = async (ctx: Context): Promise<RentalPrincipal> => {
+  readonly authenticateBearer = async (ctx: Context): Promise<RentalPrincipal> => {
     const header = ctx.req.headers.authorization;
     const match = typeof header === 'string' ? /^Bearer\s+(\S+)$/i.exec(header) : null;
     if (!match) { ctx.res.setHeader('WWW-Authenticate', 'Bearer'); throw new ApiError(401, '请先登录'); }
     const user = await this.verify(match[1], 'access');
     return { user, appid: this.appId, openid: user.openid };
   };
+  readonly authenticate = async (ctx: Context): Promise<RentalPrincipal> => {
+    if (ctx.req.headers.authorization === undefined && this.webAuthenticate) return this.webAuthenticate(ctx);
+    return this.authenticateBearer(ctx);
+  };
   private async users(ctx: Context): Promise<Row> {
     const principal = await this.authenticate(ctx);
     if (principal.user.role !== 'root') throw new ApiError(403, '仅 root 可以管理用户');
     const page = Math.max(1, Math.min(1000000, Math.floor(Number(ctx.query.page)) || 1)), pageSize = 20;
     const search = typeof ctx.query.search === 'string' ? ctx.query.search.trim().slice(0, 100) : '';
-    const searchSql = search ? ' AND (nickname LIKE ? OR tel LIKE ? OR CAST(id AS CHAR)=?)' : '';
+    const searchSql = search ? ' AND (u.nickname LIKE ? OR u.tel LIKE ? OR p.phone_e164 LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
     const pattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
-    const values = search ? [this.appId, principal.user.id, pattern, pattern, search] : [this.appId, principal.user.id];
-    const count = await this.db.one('SELECT COUNT(*) AS total FROM ar_user WHERE appid=? AND id<>?' + searchSql, values);
-    const items = await this.db.query(`SELECT * FROM ar_user WHERE appid=? AND id<>?${searchSql} ORDER BY id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values);
+    const values = search ? [this.appId, principal.user.id, pattern, pattern, pattern, search] : [this.appId, principal.user.id];
+    const from = ' FROM ar_user u LEFT JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=u.appid AND p.verified_ms>0 WHERE u.appid=? AND u.id<>?';
+    const count = await this.db.one('SELECT COUNT(*) AS total' + from + searchSql, values);
+    const items = await this.db.query(`SELECT u.*,p.phone_e164 AS verified_phone,p.country_code AS phone_country_code${from}${searchSql} ORDER BY u.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values);
     return { items: items.map(publicUser), page, pageSize, total: Number(count?.total || 0) };
   }
   private async setRole(ctx: Context): Promise<Row> {
