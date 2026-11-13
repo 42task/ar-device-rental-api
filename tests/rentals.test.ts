@@ -6,6 +6,7 @@ import { RentalService, registerRentals } from '../src/rentals';
 import { ApiRouter } from '../src/core/router';
 import type { Context, Row, Services } from '../src/core/contracts';
 import type { RentalPrincipal } from '../src/rentals/types';
+import { DeviceService } from '../src/devices/service';
 
 const opened: RentalDb[] = [];
 class RentalDb {
@@ -106,6 +107,15 @@ function fixture() {
 }
 
 describe('independent AR rental lifecycle', () => {
+  it('defaults omitted device types while preserving explicit and existing types', async () => {
+    const f = fixture();
+    expect(await f.service.createDevice(f.manager, { uuid: 'default-type-device' })).toMatchObject({ created: true, device: { type: 'rokid studio2' } });
+    expect(await f.service.createDevice(f.manager, { uuid: 'explicit-ios-device', type: 'ios' })).toMatchObject({ device: { type: 'ios' } });
+    expect(await f.service.createDevice(f.manager, { uuid: 'explicit-rokid-device', type: 'rokid' })).toMatchObject({ device: { type: 'rokid' } });
+    expect(await f.service.createDevice(f.manager, { uuid: 'explicit-studio-device', type: 'rokid studio2' })).toMatchObject({ device: { type: 'rokid studio2' } });
+    expect((await f.service.context(f.user, 'camera-8')).device.type).toBe('ios');
+    expect(DeviceService.display({ id: 99, uuid: 'legacy-empty', device_type: '' }).type).toBe('rokid studio2');
+  });
   it('registers devices only for managers, without creating a rental configuration or mutating duplicate scans', async () => {
     const f = fixture();
     await expect(f.service.createDevice(f.user, { uuid: 'new-device' })).rejects.toMatchObject({ status: 403 });
