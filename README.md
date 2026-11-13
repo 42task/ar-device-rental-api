@@ -51,9 +51,19 @@ MySQL 集成测试另外使用隔离的本机测试实例，要求 `MYSQL_HOST=1
 npm run test:integration
 ```
 
-CI 会运行测试、TypeScript 构建及 MySQL 并发测试。`main` 分支验证通过后，使用仓库的 `GITHUB_TOKEN` 发布 `ghcr.io/42task/ar-device-rental-api:main` 和 `:sha-完整提交号` 两个标签，构建 Linux amd64 / arm64 镜像。工作流不部署 Portainer，也不需要 TCR 或生产数据库 secrets。
+CI 在 `main`、`develop`、`publish` 三个分支运行测试、TypeScript 构建及 MySQL 并发测试。验证通过后，构建 Linux amd64 镜像并推送到腾讯云香港镜像仓库 `hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api`。沿用参考 CI 已验证的单架构 Docker schema2 格式，关闭 provenance/SBOM 附加清单。
 
-GHCR 首次发布默认是私有包；管理员仍需检查组织包权限。Portainer 拉取私有镜像需另配有该包读取权限的账号及 `read:packages` 凭据，不能使用工作流中短期有效的 `GITHUB_TOKEN`。配置方法见 [部署文档](docs/portainer.md)，权限依据见 [GitHub Container registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
+| Git 分支 | 镜像标签 |
+| --- | --- |
+| `main` | `main` |
+| `develop` | `develop` |
+| `publish` | `publish`、`latest` |
+
+仅发布上述四个标签，`latest` 只由 `publish` 更新。拉取请求只校验，不登录镜像仓库或推送镜像；手动运行也仅允许这三个分支发布。每个分支的工作流串行执行，发布前核对远端分支提交。发布后重新查询每个远端标签的 digest，并拉取不可变镜像核对 OCI revision。镜像保留 `/health` 的 `gitCommit`，Actions 摘要记录镜像 digest，部署与回滚使用 `镜像仓库@sha256:...` 固定版本。
+
+在本仓库的 **Settings → Secrets and variables → Actions** 配置 `TENCENT_DOCKER_USERNAME` 和 `TENCENT_DOCKER_PASSWORD`，账号须有香港目标镜像仓库的推送权限。参考仓库的 Secrets 不会自动共享给本仓库；凭据缺失时发布任务会明确失败。不要把真实凭据写入源码、镜像或聊天记录。
+
+Portainer 单独配置同一香港 registry 的拉取凭据；默认使用 `publish` 标签。CI 负责测试和镜像发布，运行服务仍由 Portainer 部署并核对健康检查，详见 [部署文档](docs/portainer.md)。CI 无需生产数据库或微信支付密钥。
 
 ## 接口
 
