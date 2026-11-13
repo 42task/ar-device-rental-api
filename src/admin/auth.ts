@@ -6,6 +6,7 @@ import { ApiError } from '../core/errors';
 import { requireManager } from '../core/roles';
 import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
+import { requireVerifiedPhone } from '../auth/phone';
 
 const BASE = '/v2/rental/admin/auth';
 const BROWSER_COOKIE = 'ar_admin_browser', SESSION_COOKIE = 'ar_admin_session';
@@ -94,6 +95,7 @@ export class AdminAuth {
   }
   private async scan(ctx: Context): Promise<Row> {
     const principal = await this.auth.authenticateBearer(ctx); requireManager(principal.user);
+    await requireVerifiedPhone(this.db, principal);
     return this.db.transaction(async db => {
       const row = await this.challenge(db, ctx, false, true);
       if (row.scanned_user_id && Number(row.scanned_user_id) !== Number(principal.user.id)) throw new ApiError(409, '该二维码已由其他管理员扫描，请刷新后重试');
@@ -106,6 +108,7 @@ export class AdminAuth {
   }
   private async confirm(ctx: Context): Promise<Row> {
     const principal = await this.auth.authenticateBearer(ctx); requireManager(principal.user);
+    await requireVerifiedPhone(this.db, principal);
     if (typeof ctx.body.approved !== 'boolean') throw new ApiError(422, '请选择确认或取消登录');
     return this.db.transaction(async db => {
       const row = await this.challenge(db, ctx, false, true);
@@ -115,6 +118,7 @@ export class AdminAuth {
         const user = await db.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [principal.user.id, this.auth.appId]);
         if (!user) throw new ApiError(401, '当前微信账号已失效，请重新登录');
         requireManager(user);
+        await requireVerifiedPhone(db, { ...principal, user });
         await db.execute('UPDATE ar_admin_login_challenge SET status=? WHERE id=?', [desired, row.id]);
         row.status = desired;
       } else if (![desired, 'expired', 'consumed'].includes(row.status)) throw new ApiError(409, '当前二维码无法确认，请刷新后重试');
@@ -131,6 +135,7 @@ export class AdminAuth {
       const user = await db.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [row.scanned_user_id, this.auth.appId]);
       if (!user || typeof user.openid !== 'string' || !user.openid) throw new ApiError(401, '当前微信账号已失效，请重新登录');
       requireManager(user);
+      await requireVerifiedPhone(db, { user, appid: this.auth.appId, openid: user.openid });
       await db.execute('INSERT INTO ar_admin_session (id,user_id,appid,created_ms,expires_ms) VALUES (?,?,?,?,?)', [hash(token), user.id, this.auth.appId, now, now + SESSION_MS]);
       await db.execute("UPDATE ar_admin_login_challenge SET status='consumed',consumed_ms=? WHERE id=?", [now, row.id]);
       const previous = this.cookie(ctx, SESSION_COOKIE);
@@ -148,6 +153,7 @@ export class AdminAuth {
     const user = await this.db.one('SELECT * FROM ar_user WHERE id=? AND appid=?', [row.user_id, this.auth.appId]);
     if (!user || typeof user.openid !== 'string' || !user.openid) throw new ApiError(401, '当前微信账号已失效，请重新登录');
     requireManager(user);
+    await requireVerifiedPhone(this.db, { user, appid: this.auth.appId, openid: user.openid });
     return { principal: { user, appid: this.auth.appId, openid: user.openid }, row };
   }
   readonly authenticate = async (ctx: Context): Promise<RentalPrincipal> => {

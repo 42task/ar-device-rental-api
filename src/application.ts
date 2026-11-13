@@ -8,6 +8,7 @@ import { registerRentals } from './rentals';
 import { AdminAuth } from './admin/auth';
 import { registerManagement } from './admin/management';
 import { SCHEMA_VERSION } from './core/migrations';
+import { PhoneBinding } from './auth/phone';
 
 interface ApplicationOptions { db?: Database; client?: WeChatClient; auth?: RentalAuth }
 
@@ -16,6 +17,7 @@ export function createApplication(options: ApplicationOptions = {}) {
   const client = options.client ?? new WeChatClient();
   const auth = options.auth ?? new RentalAuth(db, client);
   const admin = new AdminAuth(db, client, auth);
+  const phone = new PhoneBinding(db, client, auth);
   auth.webAuthenticate = admin.authenticate;
   const app = express();
   app.disable('x-powered-by');
@@ -52,6 +54,7 @@ export function createApplication(options: ApplicationOptions = {}) {
   app.use('/api/v2/rental/admin/auth', limitAuthentication('admin', req => req.method === 'GET' ? 180 : 30));
   const router = new ApiRouter();
   auth.registerAuth(router);
+  phone.register(router);
   admin.register(router);
   const rentals = registerRentals(router, { db }, { appId: client.config.appId || '', payment: client, authenticate: auth.authenticate });
   registerManagement(router, db, auth, rentals);
@@ -74,5 +77,5 @@ export function createApplication(options: ApplicationOptions = {}) {
     res.status(status).json({ success: false, message: known ? error.message : bodyError ? 'JSON 格式无效' : tooLarge ? '请求内容过大' : '服务暂时不可用，请稍后重试', ...(known && error.code ? { code: error.code } : {}) });
   };
   app.use(errorHandler);
-  return { app, db, client, auth, admin, rentals };
+  return { app, db, client, auth, admin, phone, rentals };
 }

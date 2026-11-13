@@ -15,6 +15,8 @@ async function fixture() {
   const sqlite = new DatabaseSync(':memory:'); opened.push(sqlite);
   sqlite.exec(`CREATE TABLE ar_user(id INTEGER PRIMARY KEY,appid TEXT,openid TEXT,role TEXT,nickname TEXT,avatar TEXT,tel TEXT,unionid TEXT);
     INSERT INTO ar_user VALUES(1,'${appId}','manager-openid','manager',NULL,NULL,NULL,NULL),(2,'${appId}','ordinary-openid','user',NULL,NULL,NULL,NULL),(3,'${appId}','other-openid','manager',NULL,NULL,NULL,NULL);
+    CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT UNIQUE,UNIQUE(appid,phone_e164));
+    INSERT INTO ar_user_phone VALUES(1,'${appId}','+8613800138000','86',1800000000000,'${'a'.repeat(64)}'),(3,'${appId}','+8613900139000','86',1800000000000,'${'b'.repeat(64)}');
     CREATE TABLE ar_admin_login_challenge(id TEXT PRIMARY KEY,browser_hash TEXT,origin TEXT,confirmation_code TEXT,status TEXT,scanned_user_id INTEGER,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,qrcode_image BLOB);
     CREATE TABLE ar_admin_session(id TEXT PRIMARY KEY,user_id INTEGER,appid TEXT,created_ms INTEGER,expires_ms INTEGER,revoked_ms INTEGER);`);
   const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/^(DELETE FROM .*?) LIMIT 100$/, '$1');
@@ -152,6 +154,21 @@ describe('durable admin scan login', () => {
       expect(context.res.end).toHaveBeenCalledWith(jpeg);
     }
     expect(f.client.unlimitedCode).toHaveBeenCalledTimes(1);
+  });
+  it('requires verified phone provenance for scan, confirmation, consumption and existing sessions', async () => {
+    const f = await fixture(), c = await f.create();
+    await f.db.execute('DELETE FROM ar_user_phone WHERE user_id=1');
+    await expect(f.invoke('POST', '/challenges/:id/scan', { id: c.id, token: f.tokens.manager })).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [1, appId, '+8613800138000', '86', 1800000000000, 'a'.repeat(64)]);
+    await f.invoke('POST', '/challenges/:id/scan', { id: c.id, token: f.tokens.manager });
+    await f.db.execute('DELETE FROM ar_user_phone WHERE user_id=1');
+    await expect(f.invoke('POST', '/challenges/:id/confirm', { id: c.id, token: f.tokens.manager, body: { approved: true } })).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [1, appId, '+8613800138000', '86', 1800000000000, 'a'.repeat(64)]);
+    await f.approve(c); await f.db.execute('DELETE FROM ar_user_phone WHERE user_id=1');
+    await expect(f.consume(c)).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [1, appId, '+8613800138000', '86', 1800000000000, 'a'.repeat(64)]);
+    const session = await f.consume(c); await f.db.execute('DELETE FROM ar_user_phone WHERE user_id=1');
+    await expect(f.invoke('GET', '/session', { cookie: session.cookie })).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
   });
 });
 

@@ -83,3 +83,19 @@ Portainer 单独配置同一香港 registry 的拉取凭据；默认使用 `publ
 ## 网页后台扫码登录
 
 网页管理后台由独立的 `42task/ar-device-rental-admin` 仓库部署，入口保持 `https://d.4mr.cn/admin/`。本服务提供同源 `/api/v2/rental/admin/auth` 扫码会话、管理员总览及全量订单查询；不包含前端静态文件。部署及联调要求见 [后台登录说明](docs/admin.md)。
+
+
+## 已验证手机号与后台登录
+
+后台扫码确认前，小程序使用微信原生手机号授权；服务端仅接收专用授权 code，在当前 AppID 下兑换并校验号码。`GET /api/v2/rental/auth/phone` 查询本人绑定状态，`POST` 同路径仅接受 `{code}`，两者都要求小程序 Bearer。返回掩码号码，不返回完整号码。
+
+验证记录单独存于 `ar_user_phone`，schema 为 3。旧 `ar_user.tel` 不作为已验证身份，不会因绑定号码自动改变角色；已绑定号码不能由此接口转移或更换。root 用户管理支持按已验证手机号搜索，列表返回掩码及验证标记。
+
+首个管理员可在受控容器 Console 用已验证手机号核对，程序要求从标准输入接收号码，TTY 输入不回显，不把号码放入命令参数、日志或角色审计原因：
+
+```sh
+npm run admin -- find-user-by-phone --phone-stdin
+npm run admin -- bootstrap-root --phone-stdin
+```
+
+初始化仍要求系统没有 root，并在事务中重新核对当前 AppID 的已验证绑定；已有 root 时须沿用现有管理员授权流程。管理员身份和手机授权须分别确认。

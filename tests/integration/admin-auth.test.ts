@@ -22,6 +22,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       expect(Number((await db.one('SELECT version FROM ar_schema_meta'))!.version)).toBe(SCHEMA_VERSION);
       const appId = 'wx03dbf50c15cac06f', origin = 'https://admin.integration.test';
       for (const [id, role] of [[1, 'manager'], [2, 'user'], [3, 'root']] as const) await db.insert('ar_user', { id, role, appid: appId, openid: 'synthetic-admin-' + id });
+      for (const id of [1, 3]) await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [id, appId, id === 1 ? '+8613800138000' : '+8613900139000', '86', Date.now(), String(id).repeat(64)]);
       let providerCalls = 0;
       const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
       const client = { config: { appId }, codeSession: async (code: string) => ({ openid: 'synthetic-admin-' + code }), unlimitedCode: async () => { providerCalls++; return image; } };

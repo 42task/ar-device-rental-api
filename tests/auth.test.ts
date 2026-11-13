@@ -16,9 +16,10 @@ afterEach(() => { opened.splice(0).forEach(db => db.close()); temporary.splice(0
 function fixture() {
   const sqlite = new DatabaseSync(':memory:'); opened.push(sqlite);
   sqlite.exec(`CREATE TABLE ar_user(id INTEGER PRIMARY KEY AUTOINCREMENT,appid TEXT,openid TEXT,unionid TEXT,nickname TEXT,avatar TEXT,tel TEXT,role TEXT DEFAULT 'user',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(appid,openid));
+    CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT UNIQUE);
     CREATE TABLE ar_role_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_user_id INTEGER,target_user_id INTEGER,previous_role TEXT,next_role TEXT,source TEXT,reason TEXT);
     CREATE TABLE ar_admin_guard(id INTEGER PRIMARY KEY); INSERT INTO ar_admin_guard VALUES(1);`);
-  const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/CURRENT_TIMESTAMP\(3\)/g, 'CURRENT_TIMESTAMP').replace(/CAST\(id AS CHAR\)/g, 'CAST(id AS TEXT)');
+  const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/CURRENT_TIMESTAMP\(3\)/g, 'CURRENT_TIMESTAMP').replace(/CAST\((u\.)?id AS CHAR\)/g, 'CAST($1id AS TEXT)');
   const db = {
     async query(query: string, values: any[] = []) { return sqlite.prepare(sql(query)).all(...values) as Row[]; },
     async one(query: string, values: any[] = []) { return (await this.query(query, values))[0] ?? null; },
@@ -105,6 +106,16 @@ describe('independent rental authentication', () => {
     expect(router.routes).toHaveLength(4);
     await expect(auth.login('code')).rejects.toMatchObject({ status: 503 });
     expect(f.client.codeSession).not.toHaveBeenCalled();
+  });
+  it('searches verified phone ownership for root and exposes only a masked phone', async () => {
+    const f = fixture(), root = await f.auth.login('root'); await bootstrapRoot(f.db as unknown as Database, root.user.id, appId);
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'verified-phone-owner' });
+    const target = await f.auth.login('second');
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [target.user.id, appId, '+8613800138000', '86', Date.now(), 'a'.repeat(64)]);
+    const response: any = await f.route('GET', '/v2/rental/admin/users')(f.context(root.token.accessToken, {}, {}, { search: '13800138000' }));
+    expect(response).toMatchObject({ total: 1, items: [{ id: target.user.id, tel: '+86 138****8000', phoneVerified: true }] });
+    expect(JSON.stringify(response)).not.toContain('+8613800138000');
+    expect((await f.auth.refresh(target.token.refreshToken)).user.tel).toBeNull();
   });
   it('uses a valid secret file when Compose injects an empty inline secret', async () => {
     const f = fixture(), directory = mkdtempSync(join(tmpdir(), 'ar-auth-test-')); temporary.push(directory);

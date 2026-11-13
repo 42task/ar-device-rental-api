@@ -106,6 +106,35 @@ export class WeChatClient {
     this.accessTokenRequest = request;
     try { return await request; } finally { if (this.accessTokenRequest === request) this.accessTokenRequest = undefined; }
   }
+  /** Phone authorization uses getPhoneNumber's one-use code, never wx.login's code. */
+  async phoneNumber(code: string): Promise<{ phoneE164: string; countryCode: string }> {
+    if (typeof code !== 'string' || !/^[\x21-\x7e]{1,1024}$/.test(code)) throw new ApiError(400, '微信手机号授权 code 无效，请重新授权');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const token = await this.stableToken();
+      const response = await this.transport(`https://api.weixin.qq.com/wxa/business/getuserphonenumber?access_token=${encodeURIComponent(token)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }),
+      });
+      let result: unknown;
+      try { result = await response.json(); } catch { throw new ApiError(502, '微信手机号响应格式无效，请重新授权'); }
+      if (attempt === 0 && object(result) && [40001, 40014, 42001].includes(result.errcode)) {
+        if (this.accessToken?.value === token) this.accessToken = undefined;
+        continue;
+      }
+      if (!response.ok || !object(result) || result.errcode !== 0 || !object(result.phone_info)) throw new ApiError(400, '微信手机号授权已失效或未成功，请重新授权');
+      const info = result.phone_info, watermark = info.watermark;
+      const countryCode: unknown = info.countryCode, pure: unknown = info.purePhoneNumber, phone: unknown = info.phoneNumber;
+      const now = this.now();
+      if (!object(watermark) || watermark.appid !== this.config.appId || !Number.isSafeInteger(watermark.timestamp)
+        || watermark.timestamp < now - 300 || watermark.timestamp > now + 60
+        || typeof countryCode !== 'string' || !/^[1-9][0-9]{0,2}$/.test(countryCode)
+        || typeof pure !== 'string' || !/^[0-9]{4,14}$/.test(pure) || !/[1-9]/.test(pure)
+        || countryCode.length + pure.length < 7 || countryCode.length + pure.length > 15
+        || countryCode === '86' && !/^1[3-9][0-9]{9}$/.test(pure)
+        || typeof phone !== 'string' || phone !== pure && phone !== countryCode + pure && phone !== '+' + countryCode + pure) throw new ApiError(400, '微信手机号验证失败，请重新授权');
+      return { phoneE164: '+' + countryCode + pure, countryCode };
+    }
+    throw new ApiError(503, '微信手机号服务暂时不可用，请重新授权');
+  }
   async unlimitedCode(scene: string, envVersion: 'release' | 'trial' | 'develop' = 'release'): Promise<Buffer> {
     if (!/^[a-f0-9]{32}$/.test(scene) || !['release', 'trial', 'develop'].includes(envVersion)) throw new ApiError(422, '登录二维码参数无效');
     for (let attempt = 0; attempt < 2; attempt++) {

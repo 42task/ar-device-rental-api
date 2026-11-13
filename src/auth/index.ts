@@ -6,12 +6,13 @@ import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
 import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
+import { maskedPhone } from './phone';
 
 export { bootstrapRoot } from './admin';
 export interface RentalPrincipal { user: Row; appid: string; openid: string }
 export interface RentalAuthOptions { jwtSecret?: string; jwtSecretPath?: string; issuer?: string; audience?: string; appId?: string; now?: () => number }
 const role = (value: unknown) => value === 'root' || value === 'manager' ? value : 'user';
-const publicUser = (user: Row): Row => ({ id: Number(user.id), role: role(user.role), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.tel ?? null });
+const publicUser = (user: Row): Row => ({ id: Number(user.id), role: role(user.role), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.verified_phone ? maskedPhone(user.verified_phone, user.phone_country_code) : user.tel ?? null, ...(user.verified_phone ? { phoneVerified: true } : {}) });
 const validIdentity = (value: unknown): value is string => typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,128}$/u.test(value);
 
 export class RentalAuth {
@@ -101,11 +102,12 @@ export class RentalAuth {
     if (principal.user.role !== 'root') throw new ApiError(403, '仅 root 可以管理用户');
     const page = Math.max(1, Math.min(1000000, Math.floor(Number(ctx.query.page)) || 1)), pageSize = 20;
     const search = typeof ctx.query.search === 'string' ? ctx.query.search.trim().slice(0, 100) : '';
-    const searchSql = search ? ' AND (nickname LIKE ? OR tel LIKE ? OR CAST(id AS CHAR)=?)' : '';
+    const searchSql = search ? ' AND (u.nickname LIKE ? OR u.tel LIKE ? OR p.phone_e164 LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
     const pattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
-    const values = search ? [this.appId, principal.user.id, pattern, pattern, search] : [this.appId, principal.user.id];
-    const count = await this.db.one('SELECT COUNT(*) AS total FROM ar_user WHERE appid=? AND id<>?' + searchSql, values);
-    const items = await this.db.query(`SELECT * FROM ar_user WHERE appid=? AND id<>?${searchSql} ORDER BY id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values);
+    const values = search ? [this.appId, principal.user.id, pattern, pattern, pattern, search] : [this.appId, principal.user.id];
+    const from = ' FROM ar_user u LEFT JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=u.appid AND p.verified_ms>0 WHERE u.appid=? AND u.id<>?';
+    const count = await this.db.one('SELECT COUNT(*) AS total' + from + searchSql, values);
+    const items = await this.db.query(`SELECT u.*,p.phone_e164 AS verified_phone,p.country_code AS phone_country_code${from}${searchSql} ORDER BY u.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values);
     return { items: items.map(publicUser), page, pageSize, total: Number(count?.total || 0) };
   }
   private async setRole(ctx: Context): Promise<Row> {
