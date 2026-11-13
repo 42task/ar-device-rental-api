@@ -29,14 +29,20 @@ npm start
 
 本机数据库应使用 `MYSQL_HOST=127.0.0.1` 及实际端口；从文件加载密钥时，`*_PATH` 也须改为本机文件路径。`RENTAL_API_IMAGE`、`TRAEFIK_*`、`RENTAL_SECRETS_DIR` 和 `MYSQL_ROOT_PASSWORD` 由部署文件使用，不是应用连接旧数据库的入口。
 
-首次小程序登录会创建普通用户。部署管理员在受控控制台执行以下命令，先核对账号，再显式初始化首个 root：
+首次小程序登录会创建普通用户。首个 root 可通过环境变量 `ROOT_PHONE` 初始化：在 Portainer Stack 的环境变量区域填写目标管理员的手机号，点击 **Update the stack** 重新部署；本机则在 `.env` 中设置并重启 API。支持 `+86 <你的11位手机号>` 或 `<你的11位手机号>`，会忽略空格。Portainer 的值直接填号码；`.env` 中带空格的值须用双引号包围。占位文字须替换为真实号码，真实配置不要提交 Git。
+
+目标账号须先在当前小程序完成微信原生手机号授权。服务端只核对当前 AppID 的已验证绑定；匹配配置且系统尚无 root 时，在之后的登录、令牌刷新或身份校验中自动初始化首个 root，并记录 `env-root-bootstrap` 审计。旧 `tel` 字段、手填号码或仅完成微信登录都不能取得该权限。
+
+`ROOT_PHONE` 留空时关闭自动初始化。已有 root 时不会新增、替换或撤销 root，修改或清空该变量也不会迁移既有权限；后续 manager 由 root 管理。非空号码配置无效时，登录与身份校验返回安全的 503 配置错误，不回显号码。
+
+也可保留受控控制台的人工初始化方式，先用已验证手机号核对账号：
 
 ```sh
-npm run admin -- list-users
-npm run admin -- bootstrap-root --user-id 123
+npm run admin -- find-user-by-phone --phone-stdin
+npm run admin -- bootstrap-root --phone-stdin
 ```
 
-`123` 只是示例，应替换为上一步核对的真实新用户 ID。已有 root 时，初始化命令不会继续创建 root。后续 manager 授权通过 root 管理界面完成。
+号码从标准输入读取，TTY 输入不回显。人工初始化同样要求系统没有 root。
 
 ## 构建与校验
 
@@ -89,7 +95,7 @@ Portainer 单独配置同一香港 registry 的拉取凭据；默认使用 `publ
 
 后台扫码确认前，小程序使用微信原生手机号授权；服务端仅接收专用授权 code，在当前 AppID 下兑换并校验号码。`GET /api/v2/rental/auth/phone` 查询本人绑定状态，`POST` 同路径仅接受 `{code}`，两者都要求小程序 Bearer。返回掩码号码，不返回完整号码。
 
-验证记录单独存于 `ar_user_phone`，schema 为 3。旧 `ar_user.tel` 不作为已验证身份，不会因绑定号码自动改变角色；已绑定号码不能由此接口转移或更换。root 用户管理支持按已验证手机号搜索，列表返回掩码及验证标记。
+验证记录单独存于 `ar_user_phone`，schema 为 3。旧 `ar_user.tel` 不作为已验证身份；绑定手机号后，仅配置了 `ROOT_PHONE` 且通过上述首个 root 校验的账号会自动初始化角色。已绑定号码不能由此接口转移或更换。root 用户管理支持按已验证手机号搜索，列表返回掩码及验证标记。
 
 首个管理员可在受控容器 Console 用已验证手机号核对，程序要求从标准输入接收号码，TTY 输入不回显，不把号码放入命令参数、日志或角色审计原因：
 

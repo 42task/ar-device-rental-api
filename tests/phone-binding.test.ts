@@ -100,7 +100,9 @@ describe('verified phone ownership binding', () => {
   it('accepts only complete E.164 or unambiguous mainland input', () => {
     expect(normalizePhoneInput('13800138000')).toBe(number);
     expect(normalizePhoneInput(number)).toBe(number);
+    expect(normalizePhoneInput(' +86 138 0013 8000 ')).toBe(number);
+    expect(normalizePhoneInput(' 138 0013 8000\n')).toBe(number);
     expect(normalizePhoneInput('+447700900123')).toBe('+447700900123');
-    for (const value of ['138****8000', '138 0013 8000', '008613800138000', '8613800138000', '+8612800138000', '+123', '13800138000\n', null]) expect(() => normalizePhoneInput(value)).toThrow();
+    for (const value of ['138****8000', '138-0013-8000', '008613800138000', '8613800138000', '+8612800138000', '+123', null]) expect(() => normalizePhoneInput(value)).toThrow();
   });
 });

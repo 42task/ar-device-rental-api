@@ -1,4 +1,5 @@
 import type { Database } from '../core/database';
+import type { Row } from '../core/contracts';
 import { ApiError } from '../core/errors';
 import { maskedPhone, normalizePhoneInput } from './phone';
 
@@ -32,4 +33,24 @@ export async function bootstrapRootByPhone(db: Database, phone: string, appId: s
   // bootstrapRoot takes guard -> user locks, then rechecks the immutable verified binding.
   await bootstrapRoot(db, match.userId, appId, normalized);
   return { maskedNumber: match.maskedNumber, role: 'root' };
+}
+
+/** ROOT_PHONE authorizes only a server-verified binding, and only the first root. */
+export async function initializeRootFromVerifiedPhone(db: Database, user: Row, appId: string, configuredPhone: string): Promise<Row> {
+  if (user.role === 'root' || !configuredPhone) return user;
+  if (!await db.one('SELECT user_id FROM ar_user_phone WHERE user_id=? AND appid=? AND phone_e164=? AND verified_ms>0', [user.id, appId, configuredPhone])) return user;
+  const existingRoot = await db.one("SELECT id FROM ar_user WHERE role='root' LIMIT 1");
+  if (existingRoot) return Number(existingRoot.id) === Number(user.id) ? { ...user, role: 'root' } : user;
+  // This runs after login/binding transactions, preserving guard -> user lock order.
+  return db.transaction(async tx => {
+    if (!await tx.one('SELECT id FROM ar_admin_guard WHERE id=1 FOR UPDATE')) throw new ApiError(503, '请先初始化数据库');
+    const root = await tx.one("SELECT id FROM ar_user WHERE role='root' LIMIT 1");
+    if (root) return Number(root.id) === Number(user.id) ? { ...user, role: 'root' } : user;
+    const current = await tx.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [user.id, appId]);
+    if (!current) throw new ApiError(401, '当前微信账号已失效，请重新登录');
+    if (!await tx.one('SELECT user_id FROM ar_user_phone WHERE user_id=? AND appid=? AND phone_e164=? AND verified_ms>0', [current.id, appId, configuredPhone])) return current;
+    await tx.execute("UPDATE ar_user SET role='root',updated_at=CURRENT_TIMESTAMP(3) WHERE id=?", [current.id]);
+    await tx.insert('ar_role_audit', { actor_user_id: null, target_user_id: current.id, previous_role: current.role, next_role: 'root', source: 'env-root-bootstrap', reason: 'Initial root bootstrap from verified phone matched against ROOT_PHONE' });
+    return { ...current, role: 'root' };
+  });
 }

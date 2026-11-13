@@ -6,11 +6,12 @@ import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
 import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
-import { maskedPhone } from './phone';
+import { maskedPhone, normalizePhoneInput } from './phone';
+import { initializeRootFromVerifiedPhone } from './admin';
 
 export { bootstrapRoot } from './admin';
 export interface RentalPrincipal { user: Row; appid: string; openid: string }
-export interface RentalAuthOptions { jwtSecret?: string; jwtSecretPath?: string; issuer?: string; audience?: string; appId?: string; now?: () => number }
+export interface RentalAuthOptions { jwtSecret?: string; jwtSecretPath?: string; issuer?: string; audience?: string; appId?: string; rootPhone?: string; now?: () => number }
 const role = (value: unknown) => value === 'root' || value === 'manager' ? value : 'user';
 const publicUser = (user: Row): Row => ({ id: Number(user.id), role: role(user.role), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.verified_phone ? maskedPhone(user.verified_phone, user.phone_country_code) : user.tel ?? null, ...(user.verified_phone ? { phoneVerified: true } : {}) });
 const validIdentity = (value: unknown): value is string => typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,128}$/u.test(value);
@@ -22,11 +23,17 @@ export class RentalAuth {
   private readonly audience: string;
   private readonly now: () => number;
   private readonly jwtSecret?: string;
+  private readonly rootPhone?: string;
+  private readonly rootPhoneInvalid: boolean = false;
   constructor(private readonly db: Database, private readonly client: WeChatClient, options: RentalAuthOptions = {}) {
     this.appId = options.appId ?? client.config.appId ?? '';
     this.issuer = options.issuer ?? process.env.JWT_ISSUER ?? 'ar-device-rental-api';
     this.audience = options.audience ?? process.env.JWT_AUDIENCE ?? 'ar-device-rental-mini-program';
     this.now = options.now ?? Date.now;
+    try {
+      const rootPhone = options.rootPhone ?? process.env.ROOT_PHONE ?? '';
+      if (rootPhone.trim()) this.rootPhone = normalizePhoneInput(rootPhone);
+    } catch { this.rootPhoneInvalid = true; }
     try {
       const path = options.jwtSecretPath ?? process.env.JWT_SECRET_PATH;
       this.jwtSecret = options.jwtSecret?.trim() || process.env.JWT_SECRET?.trim() || (path?.trim() ? readFileSync(path, 'utf8').trim() : undefined);
@@ -35,6 +42,7 @@ export class RentalAuth {
   private configured(): void {
     if (!/^wx[0-9a-f]{16}$/i.test(this.appId) || this.appId !== this.client.config.appId) throw new ApiError(503, '小程序 AppID 配置无效');
     if (!this.jwtSecret || Buffer.byteLength(this.jwtSecret) < 32) throw new ApiError(503, '登录签名密钥未配置或长度不足');
+    if (this.rootPhoneInvalid) throw new ApiError(503, 'ROOT_PHONE 手机号配置无效，请检查环境变量');
   }
   private issue(user: Row): Row {
     const now = Math.floor(this.now() / 1000), accessSeconds = 7200;
@@ -54,7 +62,8 @@ export class RentalAuth {
     } catch { throw new ApiError(401, '登录已失效，请重新登录'); }
     const user = await this.db.one('SELECT * FROM ar_user WHERE id=? AND appid=?', [claims.uid, this.appId]);
     if (!user || !validIdentity(user.openid)) throw new ApiError(401, '当前微信账号已失效，请重新登录');
-    return { ...user, role: role(user.role) };
+    const current = this.rootPhone ? await initializeRootFromVerifiedPhone(this.db, user, this.appId, this.rootPhone) : user;
+    return { ...current, role: role(current.role) };
   }
   async login(code: unknown): Promise<Row> {
     this.configured();
@@ -83,6 +92,7 @@ export class RentalAuth {
       }
     }
     if (!user) throw new ApiError(503, '微信登录暂时不可用');
+    if (this.rootPhone) user = await initializeRootFromVerifiedPhone(this.db, user, this.appId, this.rootPhone);
     return this.response(user);
   }
   async refresh(value: unknown): Promise<Row> { return this.response(await this.verify(value, 'refresh')); }

@@ -6,10 +6,11 @@ import { ApiError } from '../core/errors';
 import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
 
-/** Console input normalization only; this never establishes ownership. */
+/** Configuration/console formatting only; this never establishes ownership. */
 export function normalizePhoneInput(value: unknown): string {
   if (typeof value !== 'string') throw new ApiError(422, '请输入完整的已验证手机号');
-  const number = /^1[3-9][0-9]{9}$/.test(value) ? '+86' + value : value;
+  const compact = value.replace(/\s+/gu, '');
+  const number = /^1[3-9][0-9]{9}$/.test(compact) ? '+86' + compact : compact;
   if (!/^\+[1-9][0-9]{6,14}$/.test(number) || number.startsWith('+86') && !/^\+861[3-9][0-9]{9}$/.test(number)) throw new ApiError(422, '手机号格式无效，请使用完整国际号码或大陆11位手机号');
   return number;
 }

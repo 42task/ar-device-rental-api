@@ -26,6 +26,7 @@ services:
       JWT_SECRET_PATH: ${JWT_SECRET_PATH:-/run/secrets/jwt-secret}
       JWT_ISSUER: ${JWT_ISSUER:-ar-device-rental-api}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-ar-device-rental-mini-program}
+      ROOT_PHONE: "${ROOT_PHONE:-}"
       WECHAT_APP_ID: wx03dbf50c15cac06f
       WECHAT_APP_SECRET: ${WECHAT_APP_SECRET:-}
       WECHAT_APP_SECRET_PATH: ${WECHAT_APP_SECRET_PATH:-/run/secrets/wechat-app-secret}
