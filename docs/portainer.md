@@ -18,16 +18,20 @@ Stack 设置 `tls=true`，但没有猜测平台的证书解析器名称：若现
 
 Stack 明确设置 `TRUST_PROXY=1`，仅适用于这里已知的单跳 Traefik 拓扑：app 没有发布宿主机端口，外部请求由 Traefik 转发，以客户端 IP 正确限流。不要未经调整就用于直接暴露 app 或增加其他代理层的环境；同一外部 Docker 网络也应仅连接可信服务。本机无反向代理运行时设置 `TRUST_PROXY=0`。
 
-将后端提交推送到 `42task/ar-device-rental-api` 的 `main` 后，查看 GitHub Actions 的 verify / image 结果。镜像标签为：
+将后端提交推送到 `42task/ar-device-rental-api` 的 `main`、`develop` 或 `publish` 后，查看 GitHub Actions 的 verify / image 结果。CI 使用腾讯云香港镜像仓库，分支与标签对应关系为：
 
 ```text
-ghcr.io/42task/ar-device-rental-api:main
-ghcr.io/42task/ar-device-rental-api:sha-完整40位提交号
+main    -> hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api:main
+develop -> hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api:develop
+publish -> hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api:publish
+           hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api:latest
 ```
 
-正式部署优先填写经过验证的 `sha-...` 或镜像 digest，方便确认和回滚。`main` 随后续发布变化。
+仅发布上述四个标签，`latest` 只跟随 `publish`。Actions 需要本仓库的 `TENCENT_DOCKER_USERNAME`、`TENCENT_DOCKER_PASSWORD` 两个 Secrets；使用有目标仓库推送权限的账号，不能复用其他 GitHub 仓库中不可读取的 Secret 值。
 
-在 Portainer 的 Registries 中添加 `ghcr.io`，填写有包读取权限的 GitHub 用户名与 PAT classic（至少 `read:packages`，如组织要求则完成 SSO 授权）。凭据只保存到 Portainer 的 registry 配置，不写入 Git、Stack YAML 或镜像。首次 GHCR 发布默认私有，检查包是否关联正确仓库以及组织是否允许访问。详见 [GitHub 的 GHCR 认证说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
+默认部署标签为 `publish`。正式部署优先使用成功工作流摘要记录的 `hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api@sha256:...`，方便确认和回滚；四个标签都会随对应分支后续发布变化。部署后核对 `/health` 的 `gitCommit` 与该工作流提交号。
+
+在 Portainer 的 Registries 中添加 `hkccr.ccs.tencentyun.com`，填写腾讯云容器镜像仓库的用户名及访问密码，账号须有目标镜像的拉取权限。凭据只保存到 Portainer 的 registry 配置，不写入 Git、Stack YAML 或镜像。确认腾讯云中的 `gdgeek/ar-device-rental-api` 镜像仓库及账号权限可用。香港地址是镜像存储位置；CI 不会自动登录或部署香港 Docker 宿主机，服务仍按下述步骤部署到选定的 Portainer 环境。
 
 ## 2. 准备独立配置与只读密钥
 
@@ -49,7 +53,7 @@ sudo chmod 0400 /srv/ar-device-rental/secrets/wechat-app-secret
 
 | 变量 | 初次非支付部署的值 |
 | --- | --- |
-| `RENTAL_API_IMAGE` | 已验证的 GHCR `sha-...` 镜像 |
+| `RENTAL_API_IMAGE` | 已验证的香港镜像 `@sha256:...`；默认标签 `publish` |
 | `RENTAL_SECRETS_DIR` | `/srv/ar-device-rental/secrets`，宿主机真实绝对路径 |
 | `TRAEFIK_NETWORK` / `TRAEFIK_ENTRYPOINT` | 平台已有网络 / HTTPS entrypoint |
 | `PUBLIC_ORIGIN` | `https://d.4mr.cn` |
@@ -121,7 +125,7 @@ npm run admin -- bootstrap-root --user-id 123
 
 | 现象 | 优先检查 |
 | --- | --- |
-| 私有镜像拉取失败 | Portainer GHCR 凭据、包访问权限、组织 SSO |
+| 私有镜像拉取失败 | Portainer 腾讯云香港 registry 凭据、镜像路径及账号拉取权限 |
 | app 循环重启 | MySQL 就绪、迁移错误、JWT 文件权限、环境变量 |
 | 服务器显示健康但手机请求失败 | 新 App 的 request 域名、HTTPS证书及真机原始网络错误 |
 | 登录失败 | 这个新 AppID 的 AppSecret、微信登录 code、服务端出站访问微信能力 |
