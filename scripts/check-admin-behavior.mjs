@@ -26,7 +26,14 @@ class Element {
       toggle(name, enabled) { const names = new Set(node.className.split(/\s+/).filter(Boolean)); const next = enabled ?? !names.has(name); if (next) names.add(name); else names.delete(name); node.className = [...names].join(' '); return next; },
     };
   }
-  matches(selector) { return selector.startsWith('.') ? this.classList.contains(selector.slice(1)) : selector.startsWith('#') ? this.id === selector.slice(1) : this.tagName === selector.toUpperCase(); }
+  matches(selector) {
+    const parts = selector.trim().split(/\s+/);
+    const simple = (node, value) => value.startsWith('.') ? node.classList.contains(value.slice(1)) : value.startsWith('#') ? node.id === value.slice(1) : node.tagName === value.toUpperCase();
+    if (!simple(this, parts.pop())) return false;
+    let ancestor = this.parent;
+    while (parts.length) { const value = parts.pop(); while (ancestor && !simple(ancestor, value)) ancestor = ancestor.parent; if (!ancestor) return false; ancestor = ancestor.parent; }
+    return true;
+  }
   querySelectorAll(selector) { const selectors = selector.split(',').map(value => value.trim()); const descendants = this.children.flatMap(child => [child, ...child.querySelectorAll('*')]); return selector === '*' ? descendants : descendants.filter(node => selectors.some(value => node.matches(value))); }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
   addEventListener(type, handler, options = {}) { this.listeners.set(type, [...(this.listeners.get(type) || []), { handler, once: !!options.once }]); }
@@ -40,14 +47,24 @@ function fixture(role = 'root') {
   const body = new Element('body'), app = new Element('div'); app.id = 'app'; body.append(app);
   const document = { body, createElement: tag => new Element(tag), createTextNode: text => new Element('#text', text), querySelector: selector => body.querySelector(selector), querySelectorAll: selector => body.querySelectorAll(selector), title: '' };
   const calls = [], replies = [], windowEvents = new Map();
-  const context = vm.createContext({ document, window: { addEventListener: (type, handler) => windowEvents.set(type, handler) }, location: { hash: '#overview', origin: 'https://admin.example.test' }, URL, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, fetch: async (path, options = {}) => { if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; calls.push({ path, ...options }); return { ok: true, json: async () => replies.length ? replies.shift() : path.startsWith('/api/v2/rental/admin/venues') ? { items: [{ id: 11, name: 'Synthetic venue', status: 'active', useFeeCents: 2000, depositCents: 10000, version: 3 }] } : ({ id: 11, role: JSON.parse(options.body || '{}').role }) }; }, pageLoads: 0 });
-  vm.runInContext(source.replace(/\nboot\(\);\s*$/, '') + '\nloadPage = () => { pageLoads++; }; globalThis.spec = { api, merchantDialog, transferDialog, createDeviceDialog, configureDialog, venueDialog, renderVenues, renderToolbar, canManageVenues, canUseAdmin, canManageUsers, assignableRoles, roleLabel, completeLogin, shell, userRow, roleDialog, setContext: (merchant, merchants = []) => { state.merchant = merchant; state.merchantId = merchant?.id || null; state.merchants = merchants; }, setUser: value => { state.user = value; }, getUser: () => state.user, getPage: () => state.page, getUserScope: () => state.filters.users.scope };', context);
+  const location = { origin: 'https://admin.example.test' }; let hash = '#overview';
+  Object.defineProperty(location, 'hash', { get: () => hash, set: value => { hash = '#' + String(value).replace(/^#/, ''); } });
+  const context = vm.createContext({ document, window: { addEventListener: (type, handler) => windowEvents.set(type, handler) }, location, URL, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, fetch: async (path, options = {}) => { if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; calls.push({ path, ...options }); return { ok: true, json: async () => replies.length ? replies.shift() : path.startsWith('/api/v2/rental/admin/venues') ? { items: [{ id: 11, name: 'Synthetic venue', status: 'active', useFeeCents: 2000, depositCents: 10000, version: 3 }] } : ({ id: 11, role: JSON.parse(options.body || '{}').role }) }; }, pageLoads: 0 });
+  vm.runInContext(source.replace(/\nboot\(\);\s*$/, '') + '\nconst originalLoadPage = loadPage; loadPage = () => { pageLoads++; }; globalThis.spec = { loadPage: originalLoadPage, useRealPages: () => { loadPage = originalLoadPage; }, heading, renderMerchants, renderMerchantContext, selectManagementMerchant, openMerchantVenues, refreshMerchants, managementMerchantId, managementMerchant, setPage: page => { state.page = page; }, api, merchantDialog, transferDialog, createDeviceDialog, configureDialog, venueDialog, renderVenues, renderToolbar, canManageVenues, canUseAdmin, canManageUsers, assignableRoles, roleLabel, completeLogin, shell, userRow, roleDialog, setContext: (merchant, merchants = []) => { state.merchantGeneration++; state.merchant = merchant; state.merchantId = merchant?.id || null; state.merchants = merchants; }, setUser: value => { state.user = value; }, getUser: () => state.user, getPage: () => state.page, getUserScope: () => state.filters.users.scope };', context);
   context.spec.setUser({ id: 10, role });
   return { context, spec: context.spec, document, app, calls, replies, windowEvents };
 }
 function controls(fixture) {
   const dialog = fixture.document.querySelector('dialog'), form = dialog.querySelector('form');
   return { dialog, form, select: form.querySelector('select'), reason: form.querySelector('textarea'), checked: form.querySelector('input'), submit: form.querySelectorAll('button').find(button => button.type === 'submit') };
+}
+function merchantField(form, label) {
+  return form.querySelectorAll('label').find(node => node.children[0]?.textContent === label)?.querySelector('input,select,textarea') || null;
+}
+function assertNoEntryControls(form) {
+  for (const label of ['小程序入口', '入口域名', '小程序 AppID', '入口名称', '新用户注册', '小程序 AppSecret']) assert.equal(merchantField(form, label), null, 'Unexpected platform control: ' + label);
+  assert.equal(form.querySelectorAll('input').some(input => input.type === 'url'), false);
+  assert.deepEqual(form.querySelectorAll('input,select,textarea').filter(input => input.required).map(input => input.parent.children[0].textContent), ['商户名称', '商户编号']);
 }
 async function selectRole(controls, role) { controls.select.value = role; await controls.select.emit('change'); controls.checked.checked = true; await controls.checked.emit('change'); controls.reason.value = 'Synthetic role-change test'; }
 
@@ -56,7 +73,11 @@ for (const role of ['manager', 'adminer', 'root']) {
   const f = fixture(role); f.context.location.hash = '#users'; f.spec.shell();
   const navigation = f.app.querySelector('nav').querySelectorAll('a').map(link => link.dataset.page);
   assert.equal(navigation.includes('users'), role !== 'manager');
-  assert.equal(navigation.includes('merchants'), role === 'root');
+  assert.equal(navigation.includes('merchants'), true);
+  const group = f.app.querySelector('.nav-group'); assert.ok(group);
+  assert.equal(group.querySelector('.nav-parent').textContent, role === 'root' ? '商户管理' : '我的商户');
+  assert.equal(group.querySelector('.subnav').querySelector('a').dataset.page, 'venues');
+  assert.equal(f.app.querySelector('nav').children.some(node => node.tagName === 'A' && node.dataset.page === 'venues'), false);
   assert.equal(navigation.includes('venues'), true);
   assert.equal(f.spec.getPage(), role === 'manager' ? 'overview' : 'users');
   assert.equal(f.spec.canUseAdmin(role), true);
@@ -162,40 +183,18 @@ console.log('Four-role sessions, navigation, protected rows and role-change form
   await manager.spec.merchantDialog(); assert.equal(manager.document.querySelector('dialog'), null);
 }
 
-// New merchants use the single platform entry without an independent-entry switch or login credentials.
-{
-  const f = fixture('root');
-  f.spec.setContext({ id: 1, name: 'Platform' }, [{ id: 1, name: 'Platform', miniappOwnerId: null, appId: 'wx03dbf50c15cac06f', origin: 'https://d.4mr.cn' }, { id: 3, name: 'Historical independent entry', miniappOwnerId: null, origin: 'https://d3.4mr.cn', appId: 'wx3333333333333333' }]);
+// Creation never renders platform controls; only business details are required to save.
+for (const merchants of [[], [{ id: 1, name: 'Platform', miniappOwnerId: null, appId: 'wx03dbf50c15cac06f', origin: 'https://d.4mr.cn' }, { id: 3, name: 'Historical entry', miniappOwnerId: null, origin: 'https://d3.4mr.cn', appId: 'wx3333333333333333' }]]) {
+  const f = fixture('root'); f.spec.setContext({ id: 1, name: 'Platform' }, merchants);
   await f.spec.merchantDialog();
   const form = f.document.querySelector('dialog').querySelector('form');
-  const inputs = form.querySelectorAll('input');
-  inputs[0].value = 'Shared merchant'; inputs[1].value = 'shared2'; inputs[4].value = '2000000002';
-  const entry = form.querySelector('select');
-  assert.equal(entry.value, '1'); assert.equal(entry.disabled, true);
-  assert.deepEqual(entry.querySelectorAll('option').map(option => option.value), ['1']);
-  assert.match(form.textContent, /无需新增域名或小程序/);
-  assert.doesNotMatch(form.textContent, /独立小程序及域名/);
-  assert.equal(inputs[2].value, 'https://d.4mr.cn'); assert.equal(inputs[2].disabled, true);
-  assert.equal(inputs[3].value, 'wx03dbf50c15cac06f'); assert.equal(inputs[3].disabled, true);
-  const appSecret = inputs.find(input => input.type === 'password');
-  assert.equal(appSecret.disabled, true); appSecret.value = 'must-not-submit-shared-secret';
-  entry.value = ''; // Even a manipulated UI cannot turn new-merchant creation into an independent entry.
-  f.replies.push({ merchant: { id: 2 } }, { items: [], currentMerchantId: 1 });
-  await form.emit('submit');
+  assertNoEntryControls(form); assert.equal(form.querySelector('select'), null);
+  assert.match(form.textContent, /共用平台小程序及 d\.4mr\.cn，无需配置域名、AppID、AppSecret/);
+  assert.match(form.textContent, /商户自己的收款账户/); assert.doesNotMatch(form.textContent, /独立小程序及域名/);
+  merchantField(form, '商户名称').value = 'Shared merchant'; merchantField(form, '商户编号').value = 'shared2'; merchantField(form, '微信支付商户号').value = '2000000002';
+  f.replies.push({ merchant: { id: 2 } }, { items: [], currentMerchantId: 1 }); await form.emit('submit');
   const saved = JSON.parse(f.calls.find(call => call.method === 'POST').body);
-  assert.equal(saved.miniappOwnerId, 1); assert.equal(saved.mchId, '2000000002');
-  assert.equal(saved.origin, undefined); assert.equal(saved.appId, undefined); assert.equal(saved.credentials, undefined);
-  assert.equal(saved.entryName, undefined); assert.equal(saved.entryStatus, undefined);
-}
-
-// A fresh platform list can still display the unified default entry without asking for a new domain or AppID.
-{
-  const f = fixture('root'); await f.spec.merchantDialog();
-  const form = f.document.querySelector('dialog').querySelector('form');
-  const inputs = form.querySelectorAll('input');
-  assert.equal(inputs[2].value, 'https://d.4mr.cn'); assert.equal(inputs[3].value, 'wx03dbf50c15cac06f');
-  assert.equal(inputs[2].required, false); assert.equal(inputs[3].required, false);
-  assert.equal(inputs.find(input => input.type === 'password').disabled, true);
+  assert.deepEqual(saved, { name: 'Shared merchant', code: 'shared2', miniappOwnerId: 1, mchId: '2000000002', payEnabled: false });
 }
 
 // Editing uses only configuration flags; secret values from a response are never copied into the form.
@@ -217,23 +216,22 @@ console.log('Four-role sessions, navigation, protected rows and role-change form
   assert.equal(saved.entryName, 'Synthetic merchant'); assert.equal(saved.entryStatus, 'active');
 }
 
-// Shared merchant edits retain their owner and cannot reintroduce a private AppSecret.
-{
+// Existing shared merchants have no platform controls and retain their own receiving-account fields.
+for (const ownerId of [1, 3]) {
   const f = fixture('root');
-  f.replies.push({ merchant: { id: 2, code: 'shared2', name: 'Shared merchant', miniappOwnerId: 1, origin: 'https://d.4mr.cn', appId: 'wx03dbf50c15cac06f', mchId: '2000000002', status: 'active', payEnabled: false, configuration: { hasAppSecret: true } } });
+  f.replies.push({ merchant: { id: 2, code: 'shared2', name: 'Shared merchant', miniappOwnerId: ownerId, origin: 'https://d.4mr.cn', appId: 'wx03dbf50c15cac06f', mchId: '2000000002', status: 'active', payEnabled: false, entry: { name: 'Public entry', status: 'paused' }, configuration: { hasAppSecret: true } } });
   await f.spec.merchantDialog(2);
   const form = f.document.querySelector('dialog').querySelector('form');
-  const secret = form.querySelectorAll('input').find(input => input.type === 'password');
-  assert.equal(form.querySelector('select').value, '1'); assert.equal(secret.disabled, true);
-  secret.value = 'must-not-copy-platform-secret';
-  f.replies.push({ merchant: { id: 2 } }, { items: [], currentMerchantId: 1 });
-  await form.emit('submit');
+  assertNoEntryControls(form); assert.equal(form.querySelectorAll('select').length, 1);
+  for (const label of ['微信支付商户号', '商户私钥（PEM）', 'API v3 密钥', '商户证书序列号', '微信支付公钥 ID / 平台证书序列号', '微信支付公钥 / 平台证书（PEM）']) assert.ok(merchantField(form, label), 'Missing receiving-account field: ' + label);
+  merchantField(form, 'API v3 密钥').value = 'synthetic-own-account-key';
+  f.replies.push({ merchant: { id: 2 } }, { items: [], currentMerchantId: 1 }); await form.emit('submit');
   const saved = JSON.parse(f.calls.find(call => call.method === 'PATCH').body);
-  assert.equal(saved.miniappOwnerId, 1); assert.equal(saved.credentials, undefined);
-  assert.equal(saved.origin, undefined); assert.equal(saved.appId, undefined);
+  assert.equal(saved.miniappOwnerId, ownerId); assert.equal(saved.status, 'active'); assert.deepEqual(saved.credentials, { apiV3Key: 'synthetic-own-account-key' });
+  for (const key of ['origin', 'appId', 'entryName', 'entryStatus']) assert.equal(saved[key], undefined);
 }
 
-// Entry settings remain independent of business status and are read-only for shared merchants.
+// Platform owners retain entry settings and AppSecret independently of business status.
 {
   const f = fixture('root');
   f.replies.push({ merchant: { id: 1, code: 'platform', name: 'Business name', origin: 'https://d.4mr.cn', appId: 'wx03dbf50c15cac06f', status: 'paused', entry: { id: 1, name: 'Public entry name', status: 'active' }, configuration: {} } });
@@ -243,32 +241,19 @@ console.log('Four-role sessions, navigation, protected rows and role-change form
   assert.equal(input('入口名称').value, 'Public entry name'); assert.equal(input('新用户注册').value, 'active');
   assert.equal(input('商户经营状态').value, 'paused'); assert.match(form.textContent, /已有身份仍可登录并查看历史/);
   input('入口名称').value = 'Renamed entry'; input('新用户注册').value = 'paused';
+  assert.ok(input('入口域名')); assert.ok(input('小程序 AppID'));
+  input('小程序 AppSecret').value = 'synthetic-owner-app-secret';
   f.replies.push({ merchant: { id: 1 } }, { items: [], currentMerchantId: 1 }); await form.emit('submit');
   const saved = JSON.parse(f.calls.find(call => call.method === 'PATCH').body);
   assert.equal(saved.entryName, 'Renamed entry'); assert.equal(saved.entryStatus, 'paused'); assert.equal(saved.status, 'paused');
+  assert.equal(saved.credentials.appSecret, 'synthetic-owner-app-secret'); assert.equal(saved.miniappOwnerId, null);
 }
-{
-  const f = fixture('root');
-  const owner = { id: 1, name: 'Owner business', origin: 'https://d.4mr.cn', appId: 'wx03dbf50c15cac06f', entry: { id: 1, name: 'Shared public entry', status: 'paused' } };
-  f.spec.setContext(owner, [owner]);
-  f.replies.push({ merchant: { id: 2, code: 'shared', name: 'Shared business', miniappOwnerId: 1, origin: owner.origin, appId: owner.appId, status: 'active', entry: owner.entry, configuration: {} } });
-  await f.spec.merchantDialog(2);
-  const form = f.document.querySelector('dialog').querySelector('form');
-  const input = label => form.querySelectorAll('label').find(node => node.children[0]?.textContent === label).querySelector('input,select');
-  assert.equal(input('入口名称').value, 'Shared public entry'); assert.equal(input('入口名称').disabled, true);
-  assert.equal(input('新用户注册').value, 'paused'); assert.equal(input('新用户注册').disabled, true);
-  input('入口名称').value = 'must-not-write'; input('新用户注册').value = 'active';
-  f.replies.push({ merchant: { id: 2 } }, { items: [], currentMerchantId: 1 }); await form.emit('submit');
-  const saved = JSON.parse(f.calls.find(call => call.method === 'PATCH').body);
-  assert.equal(saved.entryName, undefined); assert.equal(saved.entryStatus, undefined); assert.equal(saved.status, 'active');
-}
-
 // Device registration must not bind to a different root selection after the form opens.
 {
   const f = fixture('root'); f.spec.setContext({ id: 2, name: 'Second merchant' }); await f.spec.createDeviceDialog();
   const form = f.document.querySelector('dialog').querySelector('form');
   const inputs = form.querySelectorAll('input'); inputs[0].value = 'Synthetic device'; inputs[1].value = 'synthetic-device';
-  assert.match(form.textContent, /绑定商户：Second merchant/);
+  assert.match(form.textContent, /所属商户：Second merchant/); assert.match(form.textContent, /商户归属由所选场地继承/);
   f.spec.setContext({ id: 3, name: 'Third merchant' }); await form.emit('submit');
   assert.equal(f.calls.filter(call => call.method).length, 0); assert.match(form.textContent, /绑定商户已变化/);
 }
@@ -352,6 +337,128 @@ const syntheticVenue = { id: 11, merchantId: 2, name: 'Synthetic venue', address
   const form = f.document.querySelector('dialog').querySelector('form'); f.spec.setContext({ id: 3, name: 'Third' }); await form.emit('submit');
   assert.equal(f.calls.length, 0); assert.match(form.textContent, /当前商户已变化/);
 }
+
+// A merchant card locks the header, venue route, breadcrumb and new-venue draft to the same merchant.
+{
+  const f = fixture('root'), first = { id: 1, code: 'first', name: 'First', status: 'active' }, second = { id: 2, code: 'second', name: 'Second', status: 'active' };
+  f.spec.setContext(first, [first, second]); f.context.location.hash = '#merchants';
+  f.context.fetch = async (path, options = {}) => {
+    f.calls.push({ path, ...options });
+    return { ok: true, json: async () => path.endsWith('/admin/merchants') ? { items: [first, second] } : { items: [syntheticVenue] } };
+  };
+  f.spec.shell(); await f.spec.refreshMerchants(); f.spec.useRealPages(); await f.spec.loadPage();
+  const card = f.app.querySelectorAll('article').find(node => node.querySelector('h2').textContent === 'Second');
+  await card.querySelectorAll('button').find(node => node.textContent === '管理场地').emit('click');
+  assert.equal(f.spec.managementMerchantId(), 2); assert.equal(f.app.querySelector('#merchant-context').querySelector('select').value, '2');
+  assert.equal(f.app.querySelector('.nav-merchant-scope').textContent, 'Second · second');
+  assert.equal(f.context.location.hash, '#venues'); await f.windowEvents.get('hashchange')();
+  assert.equal(f.app.querySelector('.breadcrumb').textContent, '商户管理 / Second / 场地');
+  assert.equal(f.app.querySelector('h1').textContent, 'Second / 场地');
+  assert.equal(f.app.querySelector('.nav-parent').classList.contains('active'), true);
+  assert.equal(f.calls.find(call => call.path.endsWith('/admin/venues')).headers['X-Merchant-Id'], '2');
+  f.spec.venueDialog(); const dialog = f.document.querySelector('dialog');
+  assert.match(dialog.textContent, /所属商户：Second（second \/ ID 2）/); dialog.close();
+  await f.app.querySelectorAll('button').find(node => node.textContent === '返回商户列表').emit('click');
+  f.context.location.hash = '#merchants'; await f.windowEvents.get('hashchange')();
+  assert.equal(f.app.querySelector('h1').textContent, '商户管理'); assert.equal(f.app.querySelectorAll('article').length, 2);
+}
+
+// Staff take their scope from managementMerchant and see only their own merchant parent and venues.
+{
+  const f = fixture('adminer'), own = { id: 2, code: 'own', name: 'Own merchant' }, other = { id: 3, code: 'other', name: 'Other merchant' };
+  f.spec.completeLogin({ user: { id: 10, role: 'adminer', merchantId: 99 }, managementMerchant: own, merchant: { id: 1, name: 'Entry legacy alias' } }, () => true);
+  f.spec.setContext(other, [other]); f.spec.renderMerchantContext();
+  assert.equal(f.spec.managementMerchantId(), 2); assert.equal(f.app.querySelector('#merchant-context').querySelector('select'), null);
+  assert.match(f.app.querySelector('#merchant-context').textContent, /Own merchant/);
+  assert.equal(f.app.querySelector('.nav-merchant-scope').textContent, 'Own merchant · own');
+  f.spec.useRealPages(); f.spec.setPage('merchants'); await f.spec.loadPage();
+  assert.equal(f.app.querySelector('h1').textContent, '我的商户'); assert.equal(f.app.querySelectorAll('article').length, 1);
+  assert.equal(f.app.querySelector('article').querySelector('h2').textContent, 'Own merchant');
+  assert.equal(f.spec.selectManagementMerchant(other), false);
+  f.spec.openMerchantVenues(other); assert.equal(f.spec.managementMerchantId(), 2);
+  f.context.location.hash = '#venues'; await f.windowEvents.get('hashchange')();
+  assert.equal(f.calls.find(call => call.path.endsWith('/admin/venues')).headers['X-Merchant-Id'], '2');
+  assert.equal(f.app.querySelector('.breadcrumb').textContent, '我的商户 / Own merchant / 场地');
+  f.spec.venueDialog(); assert.match(f.document.querySelector('dialog').textContent, /所属商户：Own merchant（own \/ ID 2）/);
+  assert.equal(f.calls.some(call => call.path.includes('/rental/admin/merchants')), false);
+  assert.equal(f.app.querySelectorAll('button').some(node => node.textContent === '新建商户' || node.textContent === '编辑配置'), false);
+}
+
+// No selected or assigned merchant means no venue request, no creation button and no dialog.
+for (const role of ['root', 'adminer']) {
+  const f = fixture(role); f.spec.setContext(null); f.context.location.hash = '#venues';
+  f.context.fetch = async (path, options = {}) => { f.calls.push({ path, ...options }); return { ok: true, json: async () => ({ items: [{ id: 1, name: 'Entry' }], currentMerchantId: 1 }) }; };
+  f.spec.shell(); if (role === 'root') await f.spec.refreshMerchants(); f.spec.useRealPages(); await f.spec.loadPage();
+  assert.equal(f.spec.managementMerchantId(), null); assert.equal(f.calls.some(call => call.path.endsWith('/admin/venues')), false);
+  assert.equal(f.app.querySelectorAll('button').some(node => node.textContent === '新建场地'), false);
+  f.spec.venueDialog(); assert.equal(f.document.querySelector('dialog'), null);
+  assert.match(f.app.querySelector('#main-content').textContent, /请先选择所属商户/);
+  f.spec.setPage('overview'); await f.spec.loadPage(); assert.equal(f.calls.some(call => call.path.endsWith('/admin/overview')), false);
+}
+
+// Switching during a delayed protocol preflight invalidates the draft before any POST is dispatched.
+{
+  const f = fixture('root'), first = { id: 2, name: 'First' }, second = { id: 3, name: 'Second' };
+  f.spec.setContext(first, [first, second]); f.spec.venueDialog(); const form = f.document.querySelector('dialog').querySelector('form');
+  merchantField(form, '场地名称').value = 'Draft'; merchantField(form, '每次租金（元）').value = '1'; merchantField(form, '押金（元）').value = '2';
+  let release; const delayed = new Promise(resolve => { release = resolve; });
+  f.context.fetch = async (path, options = {}) => { if (path.endsWith('/rental/capabilities')) { await delayed; return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; } f.calls.push({ path, ...options }); return { ok: true, json: async () => ({}) }; };
+  const pending = form.emit('submit'); f.spec.selectManagementMerchant(second); release(); await pending;
+  assert.equal(f.calls.some(call => call.method === 'POST'), false); assert.equal(f.spec.managementMerchantId(), 3);
+}
+
+// An already dispatched save stays on its captured header, locks duplicates and cannot navigate a new context.
+{
+  const f = fixture('root'), first = { id: 2, name: 'First' }, second = { id: 3, name: 'Second' };
+  f.spec.setContext(first, [first, second]); f.spec.venueDialog(); const form = f.document.querySelector('dialog').querySelector('form');
+  merchantField(form, '场地名称').value = 'Draft'; merchantField(form, '每次租金（元）').value = '1'; merchantField(form, '押金（元）').value = '2';
+  let release, started; const delayed = new Promise(resolve => { release = resolve; }), dispatch = new Promise(resolve => { started = resolve; });
+  f.context.fetch = async (path, options = {}) => {
+    if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) };
+    f.calls.push({ path, ...options }); started(); await delayed; return { ok: true, json: async () => ({ venue: syntheticVenue }) };
+  };
+  const pending = form.emit('submit'); await dispatch; await form.emit('submit');
+  f.spec.selectManagementMerchant(second); f.spec.setPage('merchants'); f.context.location.hash = '#merchants'; release(); await pending;
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].headers['X-Merchant-Id'], '2'); assert.equal(f.calls[0].beforeDispatch, undefined);
+  assert.equal(f.spec.managementMerchantId(), 3); assert.equal(f.context.location.hash, '#merchants'); assert.equal(f.context.pageLoads, 0);
+  assert.match(f.document.querySelector('.toast').textContent, /First的场地已保存/);
+}
+
+// A failed draft cannot be replayed after switching away and back, even if its fields remain available.
+{
+  const f = fixture('root'), first = { id: 2, name: 'First' }, second = { id: 3, name: 'Second' };
+  f.spec.setContext(first, [first, second]); f.spec.venueDialog(); const form = f.document.querySelector('dialog').querySelector('form');
+  merchantField(form, '场地名称').value = 'Draft'; merchantField(form, '每次租金（元）').value = '1'; merchantField(form, '押金（元）').value = '2';
+  f.context.fetch = async (path, options = {}) => { if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; f.calls.push({ path, ...options }); return { ok: false, status: 409, json: async () => ({ message: 'Conflict' }) }; };
+  await form.emit('submit'); assert.match(form.textContent, /场地已被更新/);
+  f.spec.setContext(second, [first, second]); f.spec.setContext(first, [first, second]); await form.emit('submit'); assert.equal(f.calls.length, 1);
+}
+
+// Real page loading ignores old venue/overview responses after a synchronous merchant selection change.
+for (const page of ['venues', 'overview']) {
+  const f = fixture('root'), first = { id: 1, name: 'First' }, second = { id: 2, name: 'Second' };
+  f.spec.setContext(first, [first, second]);
+  f.context.fetch = async () => ({ ok: true, json: async () => ({ items: [first, second] }) });
+  f.spec.shell(); await f.spec.refreshMerchants(); f.spec.setContext(first, [first, second]);
+  let release; const delayed = new Promise(resolve => { release = resolve; });
+  f.context.fetch = async (path, options = {}) => { f.calls.push({ path, ...options }); const old = options.headers['X-Merchant-Id'] === '1'; if (old) await delayed; return { ok: true, json: async () => page === 'venues' ? { items: [{ ...syntheticVenue, name: old ? 'Old venue' : 'Current venue' }] } : { merchant: old ? first : second, devices: {}, orders: {} } }; };
+  f.spec.useRealPages(); f.spec.setPage(page); const pending = f.spec.loadPage();
+  f.spec.selectManagementMerchant(second); await f.spec.loadPage(); release(); await pending;
+  assert.equal(f.spec.managementMerchantId(), 2); assert.equal(f.spec.managementMerchant().name, 'Second');
+  assert.equal(f.app.querySelector('#merchant-context').querySelector('select').value, '2');
+  if (page === 'venues') { assert.match(f.app.querySelector('#main-content').textContent, /Current venue/); assert.doesNotMatch(f.app.querySelector('#main-content').textContent, /Old venue/); }
+}
+
+// Older merchant-list responses cannot replace a newer selected merchant or its visible name.
+{
+  const f = fixture('root'), first = { id: 1, name: 'First' }, second = { id: 2, name: 'Second' };
+  f.spec.setContext(first, [first, second]);
+  let release, count = 0; const delayed = new Promise(resolve => { release = resolve; });
+  f.context.fetch = async () => { const old = ++count === 1; if (old) await delayed; return { ok: true, json: async () => ({ items: [first, { ...second, name: old ? 'Stale name' : 'Fresh name' }] }) }; };
+  const pending = f.spec.refreshMerchants(); f.spec.selectManagementMerchant(second); await f.spec.refreshMerchants(); release(); await pending;
+  assert.equal(f.spec.managementMerchantId(), 2); assert.equal(f.spec.managementMerchant().name, 'Fresh name');
+}
+console.log('Merchant venue hierarchy, fixed draft scopes, no-scope gates and delayed response isolation verified.');
 
 // Registration has no unbound fallback when all venues are unavailable.
 {

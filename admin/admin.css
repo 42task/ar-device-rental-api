@@ -496,3 +496,28 @@ dialog::backdrop { background: #10244766; }
   .merchant-card .details { padding: 20px; grid-template-columns: 86px minmax(0, 1fr); }
   .merchant-actions { padding: 0 20px 20px; }
 }
+
+/* Venues are a child of the selected business merchant. */
+.nav-group { display: grid; gap: 3px; min-width: 0; }
+.nav .subnav { margin: 0 12px 4px 28px; padding-left: 10px; border-left: 1px solid #ffffff55; }
+.nav-merchant-scope { display: block; padding: 4px 10px; color: #d7e5ff; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.nav .subnav a { min-height: 40px; gap: 8px; padding: 8px 12px; font-size: 14px; }
+.nav .subnav .nav-icon { width: 16px; height: 16px; flex-basis: 16px; }
+.nav .nav-unavailable { opacity: .65; }
+.breadcrumb { min-width: 0; overflow-wrap: anywhere; }
+.breadcrumb a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.page-heading-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.venue-owner { margin: 0 0 16px; color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.merchant-actions { flex-wrap: wrap; }
+@media (max-width: 640px) {
+  .nav > .nav-link { flex: 1 0 70px; }
+  .nav-group { display: flex; flex: 1 0 116px; flex-direction: column; }
+  .nav .nav-group .nav-parent { flex: 0 0 auto; min-height: 36px; flex-direction: row; padding: 6px; gap: 5px; border-radius: 5px; }
+  .nav .subnav { margin: 0 8px 3px 20px; padding-left: 8px; }
+  .nav-merchant-scope { max-width: 110px; padding: 1px 6px; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .nav .subnav a { flex: 0 0 auto; flex-direction: row; min-height: 28px; padding: 3px 6px; font-size: 11px; border-radius: 4px; }
+  .nav .nav-group .nav-parent .nav-icon { width: 16px; height: 16px; flex-basis: 16px; }
+  .page-heading-actions { width: 100%; }
+  .page-heading-actions button { flex: 1 1 auto; }
+  .breadcrumb { overflow-wrap: anywhere; }
+}

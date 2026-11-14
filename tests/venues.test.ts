@@ -4,7 +4,8 @@ import type { RentalPrincipal } from '../src/auth';
 import type { Row } from '../src/core/contracts';
 import type { Database } from '../src/core/database';
 import { runWithMerchant, type MerchantRuntime } from '../src/merchants/context';
-import { publicVenue, VenueService } from '../src/venues';
+import { publicVenue, registerVenues, VenueService } from '../src/venues';
+import { ApiRouter } from '../src/core/router';
 
 const opened: DatabaseSync[] = [];
 afterEach(() => { opened.splice(0).forEach(db => db.close()); vi.restoreAllMocks(); });
@@ -35,7 +36,7 @@ async function fixture() {
 describe('venue merchant scope, pricing and management permissions', () => {
   it('takes venue ownership from the authenticated merchant and omits internal fields from public details', async () => {
     const f = await fixture(), adminer = await f.principal(2);
-    const result = await runWithMerchant(f.first, () => f.service.create(adminer, { ...f.input, merchantId: 2, updatedBy: 1 }));
+    const result = await runWithMerchant(f.first, () => f.service.create(adminer, { ...f.input, merchantId: '1', updatedBy: 1 }));
     expect(result.venue).toMatchObject({ merchantId: 1, name: f.input.name, contactPhone: f.input.contactPhone, useFeeCents: 100, depositCents: 2000, status: 'active', version: 1 });
     const row = (await f.db.one('SELECT * FROM ar_venue WHERE id=?', [result.venue.id]))!;
     expect(row).toMatchObject({ merchant_id: 1, updated_by: 2 });
@@ -69,12 +70,38 @@ describe('venue merchant scope, pricing and management permissions', () => {
   it('updates pricing and status with optimistic versions and cannot edit a different merchant venue', async () => {
     const f = await fixture(), adminer = await f.principal(2), root = await f.principal(1);
     const created = await runWithMerchant(f.first, () => f.service.create(adminer, f.input));
-    const updated = await runWithMerchant(f.first, () => f.service.update(adminer, created.venue.id, { version: 1, useFeeCents: 200, depositCents: 3000, status: 'paused', merchantId: 2 }));
+    const updated = await runWithMerchant(f.first, () => f.service.update(adminer, created.venue.id, { version: 1, useFeeCents: 200, depositCents: 3000, status: 'paused', merchant_id: '1' }));
     expect(updated.venue).toMatchObject({ merchantId: 1, useFeeCents: 200, depositCents: 3000, status: 'paused', version: 2 });
     await expect(runWithMerchant(f.first, () => f.service.update(adminer, created.venue.id, { version: 1, useFeeCents: 900 }))).rejects.toMatchObject({ status: 409 });
     await expect(runWithMerchant(f.second, () => f.service.update(root, created.venue.id, { version: 2, status: 'active' }))).rejects.toMatchObject({ status: 404 });
     expect(await runWithMerchant(f.first, () => f.service.list(adminer, { status: 'active' }))).toEqual({ items: [] });
     expect(await runWithMerchant(f.first, () => f.service.list(adminer, { status: 'paused' }))).toMatchObject({ items: [{ id: created.venue.id }] });
+  });
+  it.each([1, 2])('rejects invalid or contradictory owner assertions for authorized actor %s without creating or moving venues', async actorId => {
+    const f = await fixture(), actor = await f.principal(actorId);
+    const claims = [{ merchantId: 2 }, { merchant_id: '2' }, { merchantId: null }, { merchant_id: '' }, { merchantId: 0 }, { merchant_id: -1 },
+      { merchantId: 1.5 }, { merchant_id: true }, { merchantId: ' 1' }, { merchantId: undefined }, { merchantId: 1, merchant_id: 2 }];
+    for (const claim of claims) await expect(runWithMerchant(f.first, () => f.service.create(actor, { ...f.input, ...claim }))).rejects.toMatchObject({ status: 422 });
+    expect(await f.db.query('SELECT * FROM ar_venue')).toHaveLength(0);
+    const created = await runWithMerchant(f.first, () => f.service.create(actor, { ...f.input, merchantId: 1, merchant_id: '1' }));
+    for (const claim of claims) await expect(runWithMerchant(f.first, () => f.service.update(actor, created.venue.id, { version: 1, name: '不能写入的修改', ...claim }))).rejects.toMatchObject({ status: 422 });
+    expect(await f.db.one('SELECT merchant_id,name,version FROM ar_venue WHERE id=?', [created.venue.id])).toEqual({ merchant_id: 1, name: f.input.name, version: 1 });
+    expect((await runWithMerchant(f.first, () => f.service.update(actor, created.venue.id, { version: 1, merchantId: '1', name: '有效修改' }))).venue).toMatchObject({ merchantId: 1, name: '有效修改', version: 2 });
+  });
+  it('requires explicit merchant scope on root HTTP writes while preserving authenticated staff scope', async () => {
+    const f = await fixture(), root = await f.principal(1), adminer = await f.principal(2);
+    let actor = root;
+    const router = new ApiRouter();
+    registerVenues(router, f.db as unknown as Database, { authenticate: async () => actor } as any);
+    const create = router.routes.find(route => route.method === 'POST')!, update = router.routes.find(route => route.method === 'PATCH')!;
+    const context = (body: Row, headers: Row = {}, params: Row = {}) => ({ body, params, query: {}, req: { headers }, res: { setHeader() {} } } as any);
+    await expect(runWithMerchant(f.first, () => create.handler(context({ ...f.input, merchantId: 1 })))).rejects.toMatchObject({ status: 422, message: '请先选择所属商户' });
+    expect(await f.db.query('SELECT * FROM ar_venue')).toHaveLength(0);
+    const created = await runWithMerchant(f.first, () => create.handler(context({ ...f.input, merchantId: '1' }, { 'x-merchant-id': '1' }))) as Row;
+    await expect(runWithMerchant(f.first, () => update.handler(context({ version: 1, name: '未明确选择的修改' }, {}, { id: created.venue.id })))).rejects.toMatchObject({ status: 422, message: '请先选择所属商户' });
+    expect((await f.db.one('SELECT version FROM ar_venue WHERE id=?', [created.venue.id]))!.version).toBe(1);
+    actor = adminer;
+    expect(await runWithMerchant(f.first, () => create.handler(context(f.input)))).toMatchObject({ venue: { merchantId: 1 } });
   });
   it.each([undefined, -1, 1.1, '100', NaN, Infinity, 2147483648])('rejects a non-integer or out-of-range fee: %s', async value => {
     const f = await fixture(), adminer = await f.principal(2);

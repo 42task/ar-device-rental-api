@@ -47,6 +47,15 @@ export class VenueService {
     requireMerchantManagementScope(user);
     if (Number(user.auth_version ?? 0) !== Number(principal.authVersion ?? principal.user.auth_version ?? 0)) throw new ApiError(401, '账号归属已变更，请重新登录');
   }
+  private assertOwner(input: Row, merchantId: number): void {
+    for (const key of ['merchantId', 'merchant_id']) {
+      if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
+      let selected: number;
+      try { selected = positiveId(input[key]); }
+      catch { throw new ApiError(422, '所属商户编号无效，请先选择所属商户'); }
+      if (selected !== merchantId) throw new ApiError(422, '所属商户与当前管理范围不一致，请重新选择');
+    }
+  }
   private values(input: Row, previous?: Row): Row {
     const name = text(input.name ?? previous?.name, '场地名称', 128, true);
     const address = text(input.address ?? previous?.address ?? '', '场地地址', 512);
@@ -73,6 +82,7 @@ export class VenueService {
     const merchantId = this.scope();
     return this.db.transaction(async db => {
       await this.actor(db, principal, true);
+      this.assertOwner(input, merchantId);
       const values = this.values(input), now = this.now();
       const row = await db.insert('ar_venue', { ...values, merchant_id: merchantId, version: 1, created_ms: now, updated_ms: now, updated_by: principal.user.id });
       return { venue: managedVenue(row) };
@@ -82,6 +92,7 @@ export class VenueService {
     const merchantId = this.scope(), id = positiveId(venueId);
     return this.db.transaction(async db => {
       await this.actor(db, principal, true);
+      this.assertOwner(input, merchantId);
       const previous = await db.one('SELECT * FROM ar_venue WHERE id=? AND merchant_id=? FOR UPDATE', [id, merchantId]);
       if (!previous) throw new ApiError(404, '场地不存在');
       if (!Number.isSafeInteger(input.version) || input.version < 1) throw new ApiError(422, '请提供当前场地版本');
@@ -97,7 +108,12 @@ export function registerVenues(router: ApiRouter, db: Database, auth: RentalAuth
   const service = new VenueService(db);
   const route = (method: string, path: string, handler: (ctx: Context, principal: RentalPrincipal) => Promise<Row>) => router.add(method, path, async ctx => {
     ctx.res.setHeader('Cache-Control', 'no-store');
-    return handler(ctx, await auth.authenticate(ctx));
+    const principal = await auth.authenticate(ctx);
+    // Application middleware has already resolved and authorized this header.
+    // A root write must deliberately choose a merchant, including merchant 1.
+    const selected = ctx.req.headers['x-merchant-id'];
+    if (principal.user.role === 'root' && ['POST', 'PATCH'].includes(method) && (typeof selected !== 'string' || !selected.trim())) throw new ApiError(422, '请先选择所属商户');
+    return handler(ctx, principal);
   });
   route('GET', '/v2/rental/admin/venues', (ctx, principal) => service.list(principal, ctx.query));
   route('POST', '/v2/rental/admin/venues', (ctx, principal) => service.create(principal, ctx.body));

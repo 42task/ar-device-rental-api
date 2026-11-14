@@ -131,7 +131,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL venue migration
     const orderAfter = (await f.db.one('SELECT * FROM ar_rental_order'))!;
     expect(orderAfter).toEqual({ ...orderBefore, merchant_id: 1, payment_config_id: 1, venue_id: null, venue_name: null, venue_price_version: null });
     const ready = await setup(db);
-    const edited = await ready.http('patch', `/api/v2/rental/admin/venues/${devices[0].venue_id}`, ready.rootToken).send({ version: 1, useFeeCents: 888 });
+    const edited = await ready.http('patch', `/api/v2/rental/admin/venues/${devices[0].venue_id}`, ready.rootToken, 1).send({ version: 1, useFeeCents: 888 });
     expect(edited.status).toBe(200); expect(edited.body.venue.version).toBe(2);
     expect(await f.db.one('SELECT * FROM ar_rental_order')).toEqual(orderAfter);
   }), 30_000);
@@ -140,7 +140,10 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL venue migration
     const adminer = await f.staff('adminer', 'adminer'), manager = await f.staff('manager', 'manager'), user = await f.staff('user', 'user');
     const other = await f.http('post', '/api/v2/rental/admin/merchants', f.rootToken).send({ code: 'other', name: 'Synthetic other merchant', miniappOwnerId: 1, status: 'active', payEnabled: false });
     expect(other.status).toBe(200); const otherId = other.body.merchant.id;
-    const creation = await f.http('post', '/api/v2/rental/admin/venues', adminer.token).send({ ...f.venueInput, merchantId: otherId, role: 'root' });
+    const conflicting = await f.http('post', '/api/v2/rental/admin/venues', adminer.token).send({ ...f.venueInput, merchantId: otherId, role: 'root' });
+    expect(conflicting.status).toBe(422);
+    expect(Number((await f.db.one('SELECT COUNT(*) AS total FROM ar_venue'))!.total)).toBe(0);
+    const creation = await f.http('post', '/api/v2/rental/admin/venues', adminer.token).send({ ...f.venueInput, merchantId: '1', role: 'root' });
     expect(creation.status).toBe(200); expect(creation.body.venue).toMatchObject({ merchantId: 1, version: 1, useFeeCents: 123, depositCents: 4567 });
     const foreign = await f.http('post', '/api/v2/rental/admin/venues', f.rootToken, otherId).send({ ...f.venueInput, name: 'Other merchant private venue' });
     expect(foreign.status).toBe(200);
@@ -163,10 +166,29 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL venue migration
     expect(Number((await f.db.one('SELECT COUNT(*) AS total FROM ar_venue'))!.total)).toBe(2);
   }), 30_000);
 
+  it('requires explicit root scope and rejects invalid owner assertions without reassigning an existing venue', async () => withFixture(async f => {
+    const missing = await f.http('post', '/api/v2/rental/admin/venues', f.rootToken).send({ ...f.venueInput, merchantId: 1 });
+    expect(missing.status).toBe(422); expect(missing.body.message).toBe('请先选择所属商户');
+    expect(Number((await f.db.one('SELECT COUNT(*) AS total FROM ar_venue'))!.total)).toBe(0);
+    const created = await f.http('post', '/api/v2/rental/admin/venues', f.rootToken, 1).send({ ...f.venueInput, merchantId: '1', merchant_id: 1 });
+    expect(created.status).toBe(200); expect(created.body.venue.merchantId).toBe(1);
+    const venueId = created.body.venue.id;
+    const noScopeEdit = await f.http('patch', `/api/v2/rental/admin/venues/${venueId}`, f.rootToken).send({ version: 1, name: 'Missing explicit scope' });
+    expect(noScopeEdit.status).toBe(422); expect(noScopeEdit.body.message).toBe('请先选择所属商户');
+    for (const claim of [{ merchantId: 2 }, { merchant_id: '2' }, { merchantId: null }, { merchant_id: '' }, { merchantId: 0 }, { merchant_id: -1 }, { merchantId: 1.5 }, { merchant_id: true }, { merchantId: 1, merchant_id: 2 }]) {
+      expect((await f.http('post', '/api/v2/rental/admin/venues', f.rootToken, 1).send({ ...f.venueInput, ...claim })).status).toBe(422);
+      expect((await f.http('patch', `/api/v2/rental/admin/venues/${venueId}`, f.rootToken, 1).send({ version: 1, name: 'Conflicting owner', ...claim })).status).toBe(422);
+    }
+    expect(await f.db.one('SELECT merchant_id,name,version FROM ar_venue WHERE id=?', [venueId])).toEqual({ merchant_id: 1, name: f.venueInput.name, version: 1 });
+    expect(Number((await f.db.one('SELECT COUNT(*) AS total FROM ar_venue'))!.total)).toBe(1);
+    const ownEdit = await f.http('patch', `/api/v2/rental/admin/venues/${venueId}`, f.rootToken, 1).send({ version: 1, merchant_id: '1', name: 'Explicit own-scope edit' });
+    expect(ownEdit.status).toBe(200); expect(ownEdit.body.venue).toMatchObject({ merchantId: 1, version: 2, name: 'Explicit own-scope edit' });
+  }), 30_000);
+
   it('serializes concurrent venue revisions and enforces non-null same-merchant device binding in MySQL', async () => withFixture(async f => {
-    const creation = await f.http('post', '/api/v2/rental/admin/venues', f.rootToken).send(f.venueInput);
+    const creation = await f.http('post', '/api/v2/rental/admin/venues', f.rootToken, 1).send(f.venueInput);
     expect(creation.status).toBe(200); const venueId = creation.body.venue.id;
-    const revisions = await Promise.all([200, 300].map(useFeeCents => f.http('patch', `/api/v2/rental/admin/venues/${venueId}`, f.rootToken).send({ version: 1, useFeeCents })));
+    const revisions = await Promise.all([200, 300].map(useFeeCents => f.http('patch', `/api/v2/rental/admin/venues/${venueId}`, f.rootToken, 1).send({ version: 1, useFeeCents })));
     expect(revisions.map(row => row.status).sort()).toEqual([200, 409]);
     const updated = (await f.db.one('SELECT * FROM ar_venue WHERE id=?', [venueId]))!;
     expect(updated.version).toBe(2); expect([200, 300]).toContain(updated.use_fee_cents);
@@ -185,7 +207,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL venue migration
     expect(context.status).toBe(200);
     expect(context.body.venue).toEqual({ id: venueId, name: f.venueInput.name, address: f.venueInput.address, description: f.venueInput.description });
     expect(JSON.stringify(context.body.venue)).not.toContain('contactPhone');
-    const paused = await f.http('patch', `/api/v2/rental/admin/venues/${venueId}`, f.rootToken).send({ version: 2, status: 'paused' });
+    const paused = await f.http('patch', `/api/v2/rental/admin/venues/${venueId}`, f.rootToken, 1).send({ version: 2, status: 'paused' });
     expect(paused.status).toBe(200); expect(paused.body.venue).toMatchObject({ status: 'paused', version: 3 });
   }), 30_000);
 });
