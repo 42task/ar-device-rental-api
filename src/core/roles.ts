@@ -1,22 +1,22 @@
 import type { Row } from './contracts';
 import { ApiError } from './errors';
 
-export type UserRole = 'user' | 'manager' | 'admin' | 'root';
+export type UserRole = 'user' | 'manager' | 'adminer' | 'root';
 export type AssignableRole = Exclude<UserRole, 'root'>;
 export function userRole(user: Row): UserRole {
-  return user.role === 'root' || user.role === 'admin' || user.role === 'manager' ? user.role : 'user';
+  return user.role === 'root' || user.role === 'adminer' || user.role === 'manager' ? user.role : 'user';
 }
 export function hasDeviceManagement(user: Row): boolean {
-  return ['manager', 'admin', 'root'].includes(userRole(user));
+  return ['manager', 'adminer', 'root'].includes(userRole(user));
 }
 export function canManageUsers(user: Row): boolean {
-  return ['admin', 'root'].includes(userRole(user));
+  return ['adminer', 'root'].includes(userRole(user));
 }
 /** A role hierarchy grants business capabilities, never the actor's own role. */
 export function assignableRoles(actor: Row, target: Row): AssignableRole[] {
   if (Number(actor.id) === Number(target.id) || userRole(target) === 'root') return [];
-  if (userRole(actor) === 'root') return ['user', 'manager', 'admin'];
-  if (userRole(actor) === 'admin' && ['user', 'manager'].includes(userRole(target))) return ['user', 'manager'];
+  if (userRole(actor) === 'root') return ['user', 'manager', 'adminer'];
+  if (userRole(actor) === 'adminer' && ['user', 'manager'].includes(userRole(target))) return ['user', 'manager'];
   return [];
 }
 export function requireManager(user: Row): void {

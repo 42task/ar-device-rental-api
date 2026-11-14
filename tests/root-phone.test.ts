@@ -81,9 +81,9 @@ describe('ROOT_PHONE verified initial root configuration', () => {
     expect((await f.auth.login('one')).user.role).toBe('root');
     expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(1);
   });
-  it('keeps admin on ordinary verified-phone login and does not infer elevated roles from client fields', async () => {
-    const f = fixture(''); await f.db.execute("UPDATE ar_user SET role='admin' WHERE id=2");
-    expect((await f.auth.login('two')).user.role).toBe('admin');
+  it('keeps adminer on ordinary verified-phone login and does not infer elevated roles from client fields', async () => {
+    const f = fixture(''); await f.db.execute("UPDATE ar_user SET role='adminer' WHERE id=2");
+    expect((await f.auth.login('two')).user.role).toBe('adminer');
     f.client.codeSession.mockResolvedValueOnce({ openid: 'one', phone: number, role: 'root' } as any);
     expect((await f.auth.login('client-claims')).user.role).toBe('user');
     expect(await f.db.query("SELECT id FROM ar_user WHERE role='root'")).toEqual([]);

@@ -21,7 +21,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       await migrate(db); await migrate(db);
       expect(Number((await db.one('SELECT version FROM ar_schema_meta'))!.version)).toBe(SCHEMA_VERSION);
       const appId = 'wx03dbf50c15cac06f', origin = 'https://admin.integration.test';
-      for (const [id, role] of [[1, 'manager'], [2, 'user'], [3, 'root'], [4, 'admin'], [5, 'admin']] as const) await db.insert('ar_user', { id, role, appid: appId, openid: 'synthetic-admin-' + id });
+      for (const [id, role] of [[1, 'manager'], [2, 'user'], [3, 'root'], [4, 'adminer'], [5, 'adminer']] as const) await db.insert('ar_user', { id, role, appid: appId, openid: 'synthetic-admin-' + id });
       for (const [id, phone] of [[1, '+8613800138000'], [3, '+8613900139000'], [4, '+8613600136000'], [5, '+8613500135000']] as const) await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [id, appId, phone, '86', Date.now(), String(id).repeat(64)]);
       let providerCalls = 0;
       const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
@@ -73,7 +73,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       await nodes[0].call('POST', '/challenges/:id/scan', { id: adminChallenge.id, token: adminToken });
       await nodes[1].call('POST', '/challenges/:id/confirm', { id: adminChallenge.id, token: adminToken, body: { approved: true } });
       const consumeAdminCtx = context({ id: adminChallenge.id, cookie: adminBrowserCookie });
-      expect(await nodes[1].route('POST', '/challenges/:id/consume')(consumeAdminCtx)).toMatchObject({ user: { id: 4, role: 'admin' } });
+      expect(await nodes[1].route('POST', '/challenges/:id/consume')(consumeAdminCtx)).toMatchObject({ user: { id: 4, role: 'adminer' } });
       const adminSessionCookie = consumeAdminCtx.res.append.mock.calls[0][1].split(';')[0];
       const userList = await nodes[0].users({ cookie: adminSessionCookie });
       expect(userList.items.find((user: Row) => user.id === 2).allowedRoles).toEqual(['user', 'manager']);
@@ -81,13 +81,13 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       expect(userList.items.find((user: Row) => user.id === 5).allowedRoles).toEqual([]);
       expect(await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'manager' } })).toMatchObject({ role: 'manager' });
       expect((await nodes[1].auth.authenticateBearer(context({ token: userToken }))).user.role).toBe('manager');
-      for (const [id, role] of [['4', 'user'], ['5', 'manager'], ['3', 'user'], ['2', 'admin']]) await expect(nodes[1].changeRole({ cookie: adminSessionCookie, id, body: { role } })).rejects.toMatchObject({ status: 403 });
+      for (const [id, role] of [['4', 'user'], ['5', 'manager'], ['3', 'user'], ['2', 'adminer']]) await expect(nodes[1].changeRole({ cookie: adminSessionCookie, id, body: { role } })).rejects.toMatchObject({ status: 403 });
       await expect(nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'root' } })).rejects.toMatchObject({ status: 422 });
       await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'user' } });
-      // Only root can grant admin or demote an existing admin. Previously issued
+      // Only root can grant adminer or demote an existing adminer. Previously issued
       // browser cookies and JWTs immediately observe the lower current role.
-      await nodes[0].changeRole({ token: tokens[1], id: '2', body: { role: 'admin' } });
-      expect((await nodes[0].auth.authenticateBearer(context({ token: userToken }))).user.role).toBe('admin');
+      await nodes[0].changeRole({ token: tokens[1], id: '2', body: { role: 'adminer' } });
+      expect((await nodes[0].auth.authenticateBearer(context({ token: userToken }))).user.role).toBe('adminer');
       await nodes[0].changeRole({ token: tokens[1], id: '4', body: { role: 'manager' } });
       expect((await nodes[1].call('GET', '/session', { cookie: adminSessionCookie })).user.role).toBe('manager');
       await expect(nodes[0].users({ cookie: adminSessionCookie })).rejects.toMatchObject({ status: 403 });

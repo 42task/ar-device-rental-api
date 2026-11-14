@@ -1,8 +1,10 @@
 node_modules/
+/node_modules
 dist/
 coverage/
 .env*
 !.env.example
+!.env.local.example
 secrets/
 backups/
 mysql_data/

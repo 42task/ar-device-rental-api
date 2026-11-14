@@ -15,6 +15,7 @@ it.each([
 it.each([
   null, undefined, '', 'NULL', '1',
   "CASE WHEN role='admin' THEN 1 ELSE NULL END",
+  "CASE WHEN role='adminer' THEN 1 ELSE NULL END",
   "CASE WHEN role='root_ascii' THEN 1 ELSE NULL END",
   "CASE WHEN role='r o o t' THEN 1 ELSE NULL END",
   "CASE WHEN role=_binary'ROOT' THEN 1 ELSE NULL END",

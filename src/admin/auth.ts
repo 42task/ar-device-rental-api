@@ -7,6 +7,9 @@ import { requireManager, userRole } from '../core/roles';
 import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
 import { requireVerifiedPhone } from '../auth/phone';
+import { currentMerchant, entryMerchant } from '../merchants/context';
+import { findIdentityUser, requireAccountScope } from '../auth/identity';
+import { publicMerchant, publicUser } from '../auth';
 
 const BASE = '/v2/rental/admin/auth';
 const BROWSER_COOKIE = 'ar_admin_browser', SESSION_COOKIE = 'ar_admin_session';
@@ -14,7 +17,6 @@ const CHALLENGE_MS = 5 * 60_000, SESSION_MS = 8 * 60 * 60_000;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const same = (left: string, right: string) => left.length === right.length && timingSafeEqual(Buffer.from(left), Buffer.from(right));
 const iso = (ms: unknown) => new Date(Number(ms)).toISOString();
-const publicUser = (user: Row): Row => ({ id: Number(user.id), role: userRole(user), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.tel ?? null });
 const loopback = (address: string | undefined) => !!address && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
 
 export interface AdminAuthOptions { publicOrigin?: string; envVersion?: 'release' | 'trial' | 'develop'; now?: () => number }
@@ -24,13 +26,27 @@ export class AdminAuth {
   private readonly now: () => number;
   private readonly publicOrigin: string;
   private readonly envVersion: string;
-  constructor(private readonly db: Database, private readonly client: WeChatClient, private readonly auth: RentalAuth, options: AdminAuthOptions = {}) {
+  constructor(private readonly db: Database, private readonly defaultClient: WeChatClient, private readonly auth: RentalAuth, options: AdminAuthOptions = {}) {
     this.now = options.now ?? Date.now;
     this.publicOrigin = options.publicOrigin ?? process.env.PUBLIC_ORIGIN ?? '';
     this.envVersion = options.envVersion ?? process.env.ADMIN_LOGIN_ENV_VERSION ?? 'release';
   }
+  private get client(): WeChatClient { return entryMerchant()?.client ?? this.defaultClient; }
   private origin(ctx: Context): string {
-    const configured = this.publicOrigin;
+    const entry = entryMerchant();
+    let configured = entry?.origin ?? this.publicOrigin;
+    if (entry && loopback(ctx.req.socket?.remoteAddress) && !ctx.req.headers['x-forwarded-host'] && !ctx.req.headers['x-forwarded-for'] && !ctx.req.headers['x-forwarded-proto']) {
+      try {
+        const local = new URL(`${ctx.req.protocol}://${ctx.req.headers.host}`);
+        if (['localhost', '127.0.0.1', '[::1]'].includes(local.hostname)) {
+          configured = '';
+          if (this.publicOrigin) {
+            const explicit = new URL(this.publicOrigin);
+            if (['localhost', '127.0.0.1', '[::1]'].includes(explicit.hostname)) configured = this.publicOrigin;
+          }
+        }
+      } catch { /* The configured merchant origin remains authoritative. */ }
+    }
     if (configured) {
       try {
         const url = new URL(configured);
@@ -69,6 +85,8 @@ export class AdminAuth {
   private async challenge(db: Database, ctx: Context, browser: boolean, lock = false): Promise<Row> {
     const row = await db.one(`SELECT * FROM ar_admin_login_challenge WHERE id=?${lock ? ' FOR UPDATE' : ''}`, [this.challengeId(ctx)]);
     if (!row) throw new ApiError(404, '登录二维码不存在');
+    const entry = entryMerchant();
+    if (entry && (Number(row.merchant_id) !== entry.id || row.appid && row.appid !== entry.appId)) throw new ApiError(404, '登录二维码不属于当前商户');
     if (browser) {
       const secret = this.cookie(ctx, BROWSER_COOKIE);
       if (!secret || !same(hash(secret), row.browser_hash) || row.origin !== this.origin(ctx)) throw new ApiError(401, '请在生成二维码的浏览器继续登录');
@@ -89,7 +107,9 @@ export class AdminAuth {
     // Retain terminal login status briefly; bound cleanup work on every new code.
     await this.db.execute('DELETE FROM ar_admin_login_challenge WHERE expires_ms<? LIMIT 100', [now - 86_400_000]);
     await this.db.execute('DELETE FROM ar_admin_session WHERE expires_ms<? LIMIT 100', [now - 86_400_000]);
-    await this.db.execute('INSERT INTO ar_admin_login_challenge (id,browser_hash,origin,confirmation_code,status,created_ms,expires_ms) VALUES (?,?,?,?,?,?,?)', [id, hash(browserSecret), origin, confirmationCode, 'pending', now, now + CHALLENGE_MS]);
+    const entry = entryMerchant();
+    if (entry) await this.db.execute('INSERT INTO ar_admin_login_challenge (id,browser_hash,origin,confirmation_code,status,created_ms,expires_ms,merchant_id,appid) VALUES (?,?,?,?,?,?,?,?,?)', [id, hash(browserSecret), origin, confirmationCode, 'pending', now, now + CHALLENGE_MS, entry.id, entry.appId]);
+    else await this.db.execute('INSERT INTO ar_admin_login_challenge (id,browser_hash,origin,confirmation_code,status,created_ms,expires_ms) VALUES (?,?,?,?,?,?,?)', [id, hash(browserSecret), origin, confirmationCode, 'pending', now, now + CHALLENGE_MS]);
     this.setCookie(ctx, BROWSER_COOKIE, browserSecret, CHALLENGE_MS);
     return { id, expiresAt: iso(now + CHALLENGE_MS), confirmationCode, qrcodeUrl: `/api${BASE}/challenges/${id}/qrcode` };
   }
@@ -100,7 +120,8 @@ export class AdminAuth {
       const row = await this.challenge(db, ctx, false, true);
       if (row.scanned_user_id && Number(row.scanned_user_id) !== Number(principal.user.id)) throw new ApiError(409, '该二维码已由其他管理员扫描，请刷新后重试');
       if (row.status === 'pending') {
-        await db.execute("UPDATE ar_admin_login_challenge SET status='scanned',scanned_user_id=? WHERE id=?", [principal.user.id, row.id]);
+        if (entryMerchant()) await db.execute("UPDATE ar_admin_login_challenge SET status='scanned',scanned_user_id=?,auth_version=? WHERE id=?", [principal.user.id, principal.authVersion, row.id]);
+        else await db.execute("UPDATE ar_admin_login_challenge SET status='scanned',scanned_user_id=? WHERE id=?", [principal.user.id, row.id]);
         row.status = 'scanned';
       }
       return this.status(row, true);
@@ -115,8 +136,9 @@ export class AdminAuth {
       if (Number(row.scanned_user_id) !== Number(principal.user.id)) throw new ApiError(403, '请由扫描二维码的管理员确认');
       const desired = ctx.body.approved ? 'confirmed' : 'cancelled';
       if (row.status === 'scanned') {
-        const user = await db.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [principal.user.id, this.auth.appId]);
+        const user = entryMerchant() ? await findIdentityUser(db, Number(principal.user.id), this.auth.appId, principal.identityId, true) : await db.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [principal.user.id, this.auth.appId]);
         if (!user) throw new ApiError(401, '当前微信账号已失效，请重新登录');
+        if (entryMerchant()) { requireAccountScope(user); if (Number(user.auth_version) !== Number(row.auth_version) || Number(user.auth_version) !== principal.authVersion) throw new ApiError(401, '账号归属已变更，请重新扫码'); }
         requireManager(user);
         await requireVerifiedPhone(db, { ...principal, user });
         await db.execute('UPDATE ar_admin_login_challenge SET status=? WHERE id=?', [desired, row.id]);
@@ -132,15 +154,17 @@ export class AdminAuth {
       const row = await this.challenge(db, ctx, true, true);
       if (row.status === 'expired') throw new ApiError(410, '登录二维码已过期，请刷新');
       if (row.status !== 'confirmed') throw new ApiError(409, row.status === 'consumed' ? '登录二维码已经使用，请重新扫码' : '请先在微信中确认登录');
-      const user = await db.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [row.scanned_user_id, this.auth.appId]);
+      const user = entryMerchant() ? await findIdentityUser(db, Number(row.scanned_user_id), this.auth.appId, undefined, true) : await db.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [row.scanned_user_id, this.auth.appId]);
       if (!user || typeof user.openid !== 'string' || !user.openid) throw new ApiError(401, '当前微信账号已失效，请重新登录');
+      if (entryMerchant()) { requireAccountScope(user); if (Number(user.auth_version) !== Number(row.auth_version)) throw new ApiError(401, '账号归属已变更，请重新扫码'); }
       requireManager(user);
-      await requireVerifiedPhone(db, { user, appid: this.auth.appId, openid: user.openid });
-      await db.execute('INSERT INTO ar_admin_session (id,user_id,appid,created_ms,expires_ms) VALUES (?,?,?,?,?)', [hash(token), user.id, this.auth.appId, now, now + SESSION_MS]);
+      await requireVerifiedPhone(db, { user, appid: this.auth.appId, openid: user.openid, ...(entryMerchant() ? { identityId: Number(user.identity_id) } : {}) });
+      if (entryMerchant()) await db.execute('INSERT INTO ar_admin_session (id,user_id,appid,created_ms,expires_ms,merchant_id,identity_id,auth_version,origin) VALUES (?,?,?,?,?,?,?,?,?)', [hash(token), user.id, this.auth.appId, now, now + SESSION_MS, userRole(user) === 'root' ? null : Number(user.merchant_id), Number(user.identity_id), Number(user.auth_version), this.origin(ctx)]);
+      else await db.execute('INSERT INTO ar_admin_session (id,user_id,appid,created_ms,expires_ms) VALUES (?,?,?,?,?)', [hash(token), user.id, this.auth.appId, now, now + SESSION_MS]);
       await db.execute("UPDATE ar_admin_login_challenge SET status='consumed',consumed_ms=? WHERE id=?", [now, row.id]);
       const previous = this.cookie(ctx, SESSION_COOKIE);
       if (previous) await db.execute('UPDATE ar_admin_session SET revoked_ms=? WHERE id=? AND revoked_ms IS NULL', [now, hash(previous)]);
-      return { user: publicUser(user), expiresAt: iso(now + SESSION_MS) };
+      return { user: publicUser(user), expiresAt: iso(now + SESSION_MS), ...(entryMerchant() ? { merchant: publicMerchant() } : {}) };
     });
     this.setCookie(ctx, SESSION_COOKIE, token, SESSION_MS);
     return result;
@@ -150,11 +174,19 @@ export class AdminAuth {
     if (!token) throw new ApiError(401, '请扫码登录管理后台');
     const row = await this.db.one('SELECT * FROM ar_admin_session WHERE id=? AND appid=? AND revoked_ms IS NULL AND expires_ms>?', [hash(token), this.auth.appId, this.now()]);
     if (!row) throw new ApiError(401, '后台登录已失效，请重新扫码');
-    const user = await this.db.one('SELECT * FROM ar_user WHERE id=? AND appid=?', [row.user_id, this.auth.appId]);
+    const entry = entryMerchant();
+    const user = entry ? await findIdentityUser(this.db, Number(row.user_id), this.auth.appId, row.identity_id === null ? undefined : Number(row.identity_id)) : await this.db.one('SELECT * FROM ar_user WHERE id=? AND appid=?', [row.user_id, this.auth.appId]);
     if (!user || typeof user.openid !== 'string' || !user.openid) throw new ApiError(401, '当前微信账号已失效，请重新登录');
+    if (entry) {
+      requireAccountScope(user);
+      if (Number(row.auth_version ?? 0) !== Number(user.auth_version ?? 0) || row.origin && row.origin !== this.origin(ctx)
+        || !row.origin && (entry.id !== 1 || Number(user.auth_version) !== 0)
+        || userRole(user) !== 'root' && Number(row.merchant_id) !== Number(user.merchant_id)) throw new ApiError(401, '账号归属或后台来源已变化，请重新扫码');
+    }
     requireManager(user);
-    await requireVerifiedPhone(this.db, { user, appid: this.auth.appId, openid: user.openid });
-    return { principal: { user, appid: this.auth.appId, openid: user.openid }, row };
+    const principal: RentalPrincipal = { user, appid: this.auth.appId, openid: user.openid, ...(entry ? { merchantId: (currentMerchant() ?? entry).id, authVersion: Number(user.auth_version ?? 0), identityId: Number(user.identity_id) } : {}) };
+    await requireVerifiedPhone(this.db, principal);
+    return { principal, row };
   }
   readonly authenticate = async (ctx: Context): Promise<RentalPrincipal> => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(ctx.req.method)) this.requireOrigin(ctx);
@@ -183,7 +215,7 @@ export class AdminAuth {
     route('POST', '/challenges/:id/scan', ctx => this.scan(ctx));
     route('POST', '/challenges/:id/confirm', ctx => this.confirm(ctx));
     route('POST', '/challenges/:id/consume', ctx => this.consume(ctx));
-    route('GET', '/session', async ctx => { const { principal, row } = await this.session(ctx); return { user: publicUser(principal.user), expiresAt: iso(row.expires_ms) }; });
+    route('GET', '/session', async ctx => { const { principal, row } = await this.session(ctx); return { user: publicUser(principal.user), expiresAt: iso(row.expires_ms), ...(entryMerchant() ? { merchant: publicMerchant() } : {}) }; });
     route('POST', '/logout', async ctx => {
       this.requireOrigin(ctx);
       const token = this.cookie(ctx, SESSION_COOKIE);

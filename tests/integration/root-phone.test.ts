@@ -39,7 +39,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL ROOT_PHONE init
         return audits[0];
       };
       expect(await assertSingleAudit()).toMatchObject({ source: 'env-root-bootstrap', previous_role: 'user', next_role: 'root' });
-      const resetSyntheticRoles = async () => { await db!.execute("UPDATE ar_user SET role='user'"); await db!.execute('DELETE FROM ar_role_audit'); };
+      const resetSyntheticRoles = async () => { await db!.execute("UPDATE ar_user SET role='user',merchant_id=1"); await db!.execute('DELETE FROM ar_role_audit'); };
 
       await resetSyntheticRoles();
       const nodes = [makeAuth(phone1), makeAuth('13800138000')];

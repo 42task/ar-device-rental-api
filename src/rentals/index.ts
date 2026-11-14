@@ -33,6 +33,8 @@ export function registerRentals(router: ApiRouter, services: Services, options: 
   route('POST', '/v2/rentals/:id/retry-refund', async ctx => service.retryRefund(await identity(ctx), ctx.params.id));
   route('POST', '/v2/rental/payment-notify', ctx => service.paymentNotification(ctx));
   route('POST', '/v2/rental/refund-notify', ctx => service.refundNotification(ctx));
+  route('POST', '/v2/rental/payment-notify/:configId', ctx => service.paymentNotification(ctx));
+  route('POST', '/v2/rental/refund-notify/:configId', ctx => service.refundNotification(ctx));
   return service;
 }
 

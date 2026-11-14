@@ -2,7 +2,7 @@
 
 独立的 Node.js 24 / TypeScript / Express 5 后端，为原生微信小程序 **AR设备租赁**（`wx03dbf50c15cac06f`）提供登录、设备、租赁、微信支付与退款接口。使用全新 MySQL 8.4 数据库，所有业务表以 `ar_` 开头，不连接旧 `wechat` 服务或旧数据库，也不需要 Redis。
 
-公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://d.4mr.cn/d?i=UUID&t=rs2`；扫码入口与 API 域名分别配置。前端源码在 [ar-device-rental-mp](https://github.com/42task/ar-device-rental-mp)。
+公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://d.4mr.cn/d?i=UUID&t=rs2`；扫码入口与 API 域名分别配置。小程序源码位于独立仓库 [ar-device-rental-mp](https://github.com/42task/ar-device-rental-mp)。多商户接入、归属、设备和人员调拨、密钥轮换见[多商户运行说明](docs/multi-merchant.md)。
 
 ## 部署
 
@@ -19,21 +19,23 @@
 需要 Node.js 24 和全新的专用 MySQL 数据库。
 
 ```sh
-npm ci
-cp .env.example .env
-# 按 docs/portainer.md 配置专用数据库、JWT 和 AppSecret；本机路径不能使用容器路径。
+npm ci --ignore-scripts
+cp .env.local.example .env
+# 按 docs/portainer.md 配置本机专用数据库、JWT 和 AppSecret。
 npm run build
 npm run migrate
 npm start
 ```
 
+本文中的命令均在本仓库根目录执行；数据库迁移文件和 `.env` 从当前目录读取。
+
 本机数据库应使用 `MYSQL_HOST=127.0.0.1` 及实际端口；从文件加载密钥时，`*_PATH` 也须改为本机文件路径。`RENTAL_API_IMAGE`、`TRAEFIK_*`、`RENTAL_SECRETS_DIR` 和 `MYSQL_ROOT_PASSWORD` 由部署文件使用，不是应用连接旧数据库的入口。
 
-首次小程序登录会创建普通用户。首个 root 可通过环境变量 `ROOT_PHONE` 初始化：在 Portainer Stack 的环境变量区域填写目标管理员的手机号，点击 **Update the stack** 重新部署；本机则在 `.env` 中设置并重启 API。支持 `+86 <你的11位手机号>` 或 `<你的11位手机号>`，会忽略空格。Portainer 的值直接填号码；`.env` 中带空格的值须用双引号包围。占位文字须替换为真实号码，真实配置不要提交 Git。
+首次小程序登录会创建普通用户。首个 root 可通过环境变量 `ROOT_PHONE` 初始化：在 Portainer Stack 的环境变量区域填写目标管理员的手机号，点击 **Update the stack** 重新部署；本机则在 `.env` 中设置并重启 API。支持 `+86 <你的11位手机号>` 或 `<你的11位手机号>`，会忽略空格。Portainer 的值直接填号码；`.env` 中带空格的值须用双引号包围。示例中的占位文字必须替换为真实号码，真实配置不要提交 Git。
 
 目标账号须先在当前小程序完成微信原生手机号授权。服务端只核对当前 AppID 的已验证绑定；匹配配置且系统尚无 root 时，在之后的登录、令牌刷新或身份校验中自动初始化首个 root，并记录 `env-root-bootstrap` 审计。旧 `tel` 字段、手填号码或仅完成微信登录都不能取得该权限。
 
-`ROOT_PHONE` 留空时关闭自动初始化。已有 root 时不会新增、替换或撤销 root，修改或清空该变量也不会迁移既有权限；身份按 root > admin > manager > user 继承；admin 可管理其他 user、manager，仅 root 可管理 admin；数据库保证全库最多一个 root。非空号码配置无效时，登录与身份校验返回安全的 503 配置错误，不回显号码。
+`ROOT_PHONE` 留空时关闭自动初始化。已有 root 时不会新增、替换或撤销 root，修改或清空该变量也不会迁移既有权限；身份按 `root > adminer > manager > user` 继承，adminer 可管理其他 user、manager，仅 root 可管理 adminer；数据库保证全库最多一个 root。非空号码配置无效时，登录与身份校验返回安全的 503 配置错误，不回显号码。
 
 也可保留受控控制台的人工初始化方式，先用已验证手机号核对账号：
 
@@ -80,31 +82,18 @@ Portainer 单独配置同一香港 registry 的拉取凭据；默认使用 `publ
 | `POST /api/v2/rental/auth/refresh` | 刷新身份令牌 |
 | `/api/v2/rental/devices` | 设备识别、登记及费用配置 |
 | `/api/v2/rentals` | 租赁记录、支付、结束及退款查询 |
-| `/api/v2/rental/admin` | 管理员设备列表与 admin/root 分级身份管理 |
-| `POST /api/v2/rental/payment-notify` | 微信支付通知 |
-| `POST /api/v2/rental/refund-notify` | 微信退款通知 |
+| `/api/v2/rental/admin` | 管理员设备列表与 adminer/root 分级身份管理 |
+| `/api/v2/rental/admin/auth` | 网页扫码挑战、小程序确认及独立浏览器会话 |
+| `GET /api/v2/rental/admin/overview` | 管理总览 |
+| `GET /api/v2/rental/admin/orders` | 当前 AppID 下所有用户的订单搜索与分页 |
+| `GET /admin/` | 同源网页管理后台，见 [使用说明](docs/admin.md) |
+| `POST /api/v2/rental/payment-notify` | 默认商户原配置的微信支付通知 |
+| `POST /api/v2/rental/payment-notify/:configId` | 按原支付配置处理通知 |
+| `POST /api/v2/rental/refund-notify` | 默认商户原配置的微信退款通知 |
+| `POST /api/v2/rental/refund-notify/:configId` | 按原支付配置处理退款通知 |
+| `/api/v2/rental/admin/merchants` | root 管理商户与独立微信配置 |
 
 金额均使用整数分；支付与退款状态以经过服务端校验的微信结果为准。配置不完整时不会提供支付就绪状态。业务写入、设备占用与结算由数据库事务、唯一约束及幂等标识保护。
-
-## 网页后台扫码登录
-
-网页管理后台由独立的 `42task/ar-device-rental-admin` 仓库部署，入口保持 `https://d.4mr.cn/admin/`。本服务提供同源 `/api/v2/rental/admin/auth` 扫码会话、管理员总览及全量订单查询；不包含前端静态文件。部署及联调要求见 [后台登录说明](docs/admin.md)。
-
-
-## 已验证手机号与后台登录
-
-后台扫码确认前，小程序使用微信原生手机号授权；服务端仅接收专用授权 code，在当前 AppID 下兑换并校验号码。`GET /api/v2/rental/auth/phone` 查询本人绑定状态，`POST` 同路径仅接受 `{code}`，两者都要求小程序 Bearer。返回掩码号码，不返回完整号码。
-
-验证记录单独存于 `ar_user_phone`，schema 为 3。旧 `ar_user.tel` 不作为已验证身份；绑定手机号后，仅配置了 `ROOT_PHONE` 且通过上述首个 root 校验的账号会自动初始化角色。已绑定号码不能由此接口转移或更换。root 用户管理支持按已验证手机号搜索，列表返回掩码及验证标记。
-
-首个管理员可在受控容器 Console 用已验证手机号核对，程序要求从标准输入接收号码，TTY 输入不回显，不把号码放入命令参数、日志或角色审计原因：
-
-```sh
-npm run admin -- find-user-by-phone --phone-stdin
-npm run admin -- bootstrap-root --phone-stdin
-```
-
-初始化仍要求系统没有 root，并在事务中重新核对当前 AppID 的已验证绑定；已有 root 时须沿用现有管理员授权流程。管理员身份和手机授权须分别确认。
 
 ## 设备型号
 

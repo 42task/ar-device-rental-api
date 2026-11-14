@@ -21,7 +21,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
         const schema = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(sql => sql.trim()).filter(Boolean);
         for (const statement of schema) await db.execute(statement);
       }
-      for (const [userId, role] of [[1, 'user'], [2, 'user'], [10, 'manager'], [11, 'root'], [12, 'admin']] as const) {
+      for (const [userId, role] of [[1, 'user'], [2, 'user'], [10, 'manager'], [11, 'root'], [12, 'adminer']] as const) {
         await db.insert('ar_user', { id: userId, role, appid: 'wx-rental-test', openid: 'payer-' + userId });
       }
       const device = await db.insert('ar_device', { uuid: 'rental-concurrent-device', name: '并发设备' });
@@ -47,7 +47,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
         },
       };
       const principal = (id: number, role: string): RentalPrincipal => ({ user: { id, role }, appid: 'wx-rental-test', openid: 'payer-' + id });
-      const manager = principal(10, 'manager'), root = principal(11, 'root'), systemAdmin = principal(12, 'admin');
+      const manager = principal(10, 'manager'), root = principal(11, 'root'), systemAdmin = principal(12, 'adminer');
       const options = { appId: 'wx-rental-test', authenticate: async () => manager, payment: payment as any };
       const services = { db } as Services;
       const service = new RentalService(services, options);
@@ -77,7 +77,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [systemAdmin.user.id]);
       expect((await service.context(systemAdmin, device.uuid)).actions.canEndRental).toBe(false);
       await expect(service.end(systemAdmin, stored.id, { refundMode: 'full', reason: '系统管理权限已撤销', idempotencyKey: 'revoked-system-admin-end' })).rejects.toMatchObject({ status: 403 });
-      await db.execute("UPDATE ar_user SET role='admin' WHERE id=?", [systemAdmin.user.id]);
+      await db.execute("UPDATE ar_user SET role='adminer' WHERE id=?", [systemAdmin.user.id]);
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [manager.user.id]);
       expect((await service.context(manager, device.uuid)).actions.canEndRental).toBe(false);
       await expect(service.end(manager, stored.id, { refundMode: 'deposit', reason: '权限已撤销', idempotencyKey: 'revoked-manager-end' })).rejects.toMatchObject({ status: 403 });

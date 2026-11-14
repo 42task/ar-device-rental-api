@@ -14,7 +14,7 @@ const build = () => {
   const db = fakeDb();
   const client = new WeChatClient({ appId, appSecret: '', payEnabled: false });
   const auth = new RentalAuth(db, client, { jwtSecret: 'unit-test-signing-key-with-32-bytes-minimum' });
-  return createApplication({ db, client, auth });
+  return createApplication({ db, client, auth, merchants: false });
 };
 
 describe('standalone API HTTP boundary', () => {
@@ -36,10 +36,15 @@ describe('standalone API HTTP boundary', () => {
     expect((await request(app).get('/api/v2/root/managers')).status).toBe(404);
     expect((await request(app).post('/api/v2/rental/payment-notify').send({})).status).not.toBe(200);
   });
-  it('protects management reads and leaves static admin hosting to the separate frontend', async () => {
+  it('serves the same-origin admin with restrictive browser headers and protected data', async () => {
     const { app } = build();
-    expect((await request(app).get('/admin/')).status).toBe(404);
-    expect((await request(app).get('/api/v2/rental/admin/auth/session')).status).toBe(401);
+    expect((await request(app).get('/admin')).headers.location).toBe('/admin/');
+    const page = await request(app).get('/admin/');
+    expect(page.status).toBe(200);
+    expect(page.type).toBe('text/html');
+    expect(page.headers['content-security-policy']).toContain("frame-ancestors 'none'");
+    expect(page.headers['cache-control']).toBe('no-store');
+    expect((await request(app).get('/admin/admin.js')).type).toMatch(/javascript/);
     expect((await request(app).get('/api/v2/rental/admin/overview')).status).toBe(401);
     expect((await request(app).get('/api/v2/rental/admin/orders')).status).toBe(401);
   });

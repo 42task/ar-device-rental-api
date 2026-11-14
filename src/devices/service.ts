@@ -2,6 +2,7 @@ import type { Row, Services } from '../core/contracts';
 import { ApiError } from '../core/errors';
 import { requireManager } from '../core/roles';
 import { DEFAULT_DEVICE_TYPE, resolveDeviceType } from './types';
+import { currentMerchant } from '../merchants/context';
 
 export { DEFAULT_DEVICE_TYPE } from './types';
 
@@ -39,24 +40,33 @@ export class DeviceService {
 
   async create(user: Row, input: Row): Promise<Row> {
     requireManager(user);
+    const merchant = currentMerchant();
+    const checkOwnership = (row: Row): void => {
+      if (merchant && Number(row.merchant_id) !== merchant.id) throw new ApiError(409, '设备属于其他商户，请使用对应小程序', 'MERCHANT_MISMATCH');
+    };
     const uuid = deviceUuid(input.uuid);
     const device_type = deviceType(input.type ?? input.device_type);
     const name = deviceName(input.name, uuid);
     let result: { row: Row; created: boolean };
     try {
       result = await this.services.db.transaction(async db => {
-        const currentUser = await db.one('SELECT role FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [user.id, user.appid ?? '']);
+        const currentUser = merchant
+          ? await db.one('SELECT role,merchant_id,auth_version FROM ar_user WHERE id=? FOR UPDATE', [user.id])
+          : await db.one('SELECT role FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [user.id, user.appid ?? '']);
         if (!currentUser) throw new ApiError(403, '设备管理权限已变更，请重新登录');
         requireManager(currentUser);
+        if (merchant && (Number(currentUser.auth_version) !== Number(user.auth_version)
+          || currentUser.role !== 'root' && Number(currentUser.merchant_id) !== merchant.id)) throw new ApiError(403, '设备管理权限已变更，请重新登录');
         const existing = await db.one('SELECT * FROM ar_device WHERE uuid = ?', [uuid]);
-        if (existing) return { row: existing, created: false };
-        return { row: await db.insert('ar_device', { uuid, name, device_type }), created: true };
+        if (existing) { checkOwnership(existing); return { row: existing, created: false }; }
+        return { row: await db.insert('ar_device', { uuid, name, device_type, ...(merchant ? { merchant_id: merchant.id } : {}) }), created: true };
       });
     } catch (error: any) {
       // The binary UUID unique index resolves concurrent confirmations.
       if (error?.code !== 'ER_DUP_ENTRY') throw error;
       const existing = await this.services.db.one('SELECT * FROM ar_device WHERE uuid = ?', [uuid]);
       if (!existing) throw error;
+      checkOwnership(existing);
       result = { row: existing, created: false };
     }
     // No rental configuration is written here, so new devices remain disabled.

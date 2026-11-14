@@ -7,6 +7,9 @@ import { ApiRouter } from '../src/core/router';
 import type { Context, Row, Services } from '../src/core/contracts';
 import type { RentalPrincipal } from '../src/rentals/types';
 import { DeviceService } from '../src/devices/service';
+import { withMerchant, type MerchantRuntime } from '../src/merchants/context';
+import { ApiError } from '../src/core/errors';
+import { registerManagement } from '../src/admin/management';
 
 const opened: RentalDb[] = [];
 class RentalDb {
@@ -15,7 +18,7 @@ class RentalDb {
     opened.push(this);
     this.sqlite.exec(`PRAGMA foreign_keys=ON;
       CREATE TABLE ar_user(id INTEGER PRIMARY KEY,role TEXT,appid TEXT DEFAULT 'wx-rental-test');
-      INSERT INTO ar_user(id,role) VALUES(1,'user'),(2,'manager'),(3,'user'),(4,'root'),(5,'admin');
+      INSERT INTO ar_user(id,role) VALUES(1,'user'),(2,'manager'),(3,'user'),(4,'root'),(5,'adminer');
       CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
       INSERT INTO ar_device(id,uuid,device_type,name) VALUES(7,'camera-7','rokid','AR眼镜'),(8,'camera-8','ios','设备8');`);
     const mysql = readFileSync(resolve('database/002-rentals.sql'), 'utf8');
@@ -51,22 +54,21 @@ class RentalDb {
 }
 afterEach(() => { for (const db of opened.splice(0)) db.sqlite.close(); vi.restoreAllMocks(); });
 
-function fixture() {
+function fixture(appid = 'wx-rental-test', mchId = 'merchant-rental') {
   const db = new RentalDb();
   let now = 1794542400000;
-  const appid = 'wx-rental-test';
   const user: RentalPrincipal = { user: { id: 1, role: 'user' }, appid, openid: 'payer-1' };
   const other: RentalPrincipal = { user: { id: 3, role: 'user' }, appid, openid: 'payer-3' };
   const manager: RentalPrincipal = { user: { id: 2, role: 'manager' }, appid, openid: 'payer-2' };
   const root: RentalPrincipal = { user: { id: 4, role: 'root' }, appid, openid: 'payer-4' };
-  const admin: RentalPrincipal = { user: { id: 5, role: 'admin' }, appid, openid: 'payer-5' };
+  const adminer: RentalPrincipal = { user: { id: 5, role: 'adminer' }, appid, openid: 'payer-5' };
   const orders = new Map<string, Row>(), refunds = new Map<string, Row>();
   const payment = {
-    config: { appId: appid, mchId: 'merchant-rental', privateKey: 'test-private', serialNo: 'test-serial', apiV3Key: 'test-api-key', platformKeys: { test: 'test-public' } },
+    config: { appId: appid, mchId, privateKey: 'test-private', serialNo: 'test-serial', apiV3Key: 'test-api-key', platformKeys: { test: 'test-public' } },
     assertPaymentApplication: vi.fn(),
     isPaymentReady: vi.fn(function(this: any) { return !!this.config.privateKey; }),
     order: vi.fn(async (input: Row) => {
-      orders.set(input.out_trade_no, { out_trade_no: input.out_trade_no, appid, mchid: 'merchant-rental', payer: { openid: input.openid }, amount: { total: input.amount, currency: 'CNY' }, trade_state: 'NOTPAY', transaction_id: 'transaction-' + input.out_trade_no });
+      orders.set(input.out_trade_no, { out_trade_no: input.out_trade_no, appid, mchid: mchId, payer: { openid: input.openid }, amount: { total: input.amount, currency: 'CNY' }, trade_state: 'NOTPAY', transaction_id: 'transaction-' + input.out_trade_no });
       return { appId: appid, timeStamp: '1794542400', nonceStr: 'test-nonce', package: 'prepay_id=' + input.out_trade_no, signType: 'RSA', paySign: 'test-signature' };
     }),
     payment: vi.fn(async (method: string, path: string, body?: Row): Promise<Row> => {
@@ -104,11 +106,11 @@ function fixture() {
     const active = await service.syncPayment(principal, row.id);
     return { row, rental: active.rental, provider };
   };
-  return { db, service, options, services, payment, orders, refunds, user, other, manager, admin, root, configure, create, pay, advance: (milliseconds: number) => { now += milliseconds; } };
+  return { db, service, options, services, payment, orders, refunds, user, other, manager, adminer, root, configure, create, pay, advance: (milliseconds: number) => { now += milliseconds; } };
 }
 
 describe('independent AR rental lifecycle', () => {
-  it.each(['manager', 'admin', 'root'] as const)('inherits device operations for %s without trusting a forged client role', async role => {
+  it.each(['manager', 'adminer', 'root'] as const)('inherits device operations for %s without trusting a forged client role', async role => {
     const f = fixture(); const actor = f[role];
     expect((await f.service.context(actor, 'role-device-' + role)).actions.canCreate).toBe(true);
     const created = await f.service.createDevice(actor, { uuid: 'role-device-' + role });
@@ -122,9 +124,9 @@ describe('independent AR rental lifecycle', () => {
   });
   it('retains device capabilities when a system administrator is demoted to device manager', async () => {
     const f = fixture(); await f.configure(); const paid = await f.pay();
-    await f.db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [f.admin.user.id]);
-    expect((await f.service.context(f.admin, 'camera-7')).actions).toMatchObject({ canConfigure: true, canEndRental: true });
-    expect((await f.service.end(f.admin, paid.row.id, { refundMode: 'deposit', reason: '设备已归还', idempotencyKey: 'demoted-admin-to-manager' })).rental).toMatchObject({ status: 'ENDED', refundAmountCents: 20000, refundStatus: 'PROCESSING' });
+    await f.db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [f.adminer.user.id]);
+    expect((await f.service.context(f.adminer, 'camera-7')).actions).toMatchObject({ canConfigure: true, canEndRental: true });
+    expect((await f.service.end(f.adminer, paid.row.id, { refundMode: 'deposit', reason: '设备已归还', idempotencyKey: 'demoted-admin-to-manager' })).rental).toMatchObject({ status: 'ENDED', refundAmountCents: 20000, refundStatus: 'PROCESSING' });
     expect((await f.service.context(f.user, 'camera-7')).state).toBe('SETTLING');
   });
   it('defaults omitted device types while preserving explicit and existing types', async () => {
@@ -264,7 +266,7 @@ describe('independent AR rental lifecycle', () => {
     await expect(f.service.get(f.other, row.id)).rejects.toMatchObject({ status: 403 });
   });
   it('normally charges every management role when they rent for themselves', async () => {
-    for (const role of ['manager', 'admin', 'root'] as const) {
+    for (const role of ['manager', 'adminer', 'root'] as const) {
       const f = fixture(); await f.configure(); const actor = f[role];
       const result = await f.create(actor);
       expect(result.rental).toMatchObject({ totalCents: 22000, mine: true, paymentStatus: 'NOTPAY' });
@@ -278,7 +280,7 @@ describe('independent AR rental lifecycle', () => {
     }
     await expect(f.service.syncRefund(f.user, paid.row.id)).rejects.toMatchObject({ status: 403 });
     await expect(f.service.retryRefund(f.user, paid.row.id)).rejects.toMatchObject({ status: 403 });
-    for (const role of ['manager', 'admin', 'root']) {
+    for (const role of ['manager', 'adminer', 'root']) {
       const forgedManager = { ...f.user, user: { ...f.user.user, role } };
       await expect(f.service.end(forgedManager, paid.row.id, { refundMode: 'deposit', reason: '伪造身份', idempotencyKey: 'forged-' + role + '-end' })).rejects.toMatchObject({ status: 403 });
     }
@@ -290,7 +292,7 @@ describe('independent AR rental lifecycle', () => {
     expect(f.refunds.size).toBe(0);
     expect(await f.db.query("SELECT * FROM ar_rental_event WHERE event='RENTAL_ENDED'")).toEqual([]);
   });
-  it.each(['manager', 'admin', 'root'] as const)('allows a current %s who is also the payer to settle only with management permission', async role => {
+  it.each(['manager', 'adminer', 'root'] as const)('allows a current %s who is also the payer to settle only with management permission', async role => {
     const f = fixture(); await f.configure(); const actor = f[role];
     const paid = await f.pay(actor);
     expect((await f.service.get(actor, paid.row.id)).actions.canEndRental).toBe(true);
@@ -299,7 +301,7 @@ describe('independent AR rental lifecycle', () => {
     expect([...f.refunds.values()][0].amount).toEqual({ refund: 22000, total: 22000, currency: 'CNY' });
     expect((await f.service.context(actor, 'camera-7')).state).toBe('SETTLING');
   });
-  it.each(['manager', 'admin'] as const)('rechecks the current %s inside the settlement transaction after a role revocation', async role => {
+  it.each(['manager', 'adminer'] as const)('rechecks the current %s inside the settlement transaction after a role revocation', async role => {
     const f = fixture(); await f.configure(); const paid = await f.pay(); const actor = f[role];
     const originalOne = f.db.one.bind(f.db);
     let revoked = false;
@@ -325,7 +327,7 @@ describe('independent AR rental lifecycle', () => {
     expect(f.payment.payment).not.toHaveBeenCalled();
     expect(f.refunds.size).toBe(0);
   });
-  it.each(['manager', 'admin'] as const)('keeps an approved timed-out refund occupied and retries the same refund only for a current %s', async role => {
+  it.each(['manager', 'adminer'] as const)('keeps an approved timed-out refund occupied and retries the same refund only for a current %s', async role => {
     const f = fixture(); await f.configure(); const paid = await f.pay(); const actor = f[role];
     f.payment.payment.mockRejectedValueOnce(new Error('refund request timed out'));
     const ended = await f.service.end(actor, paid.row.id, { refundMode: 'deposit', reason: '现场确认归还', idempotencyKey: 'timeout-end-request' });
@@ -452,5 +454,201 @@ describe('independent AR rental lifecycle', () => {
     await f.service.refundNotification(context);
     expect(await f.db.query("SELECT * FROM ar_rental_event WHERE event='REFUND_SUCCESS'")).toHaveLength(1);
     expect((await f.service.context(f.other, 'camera-7')).state).toBe('AVAILABLE');
+  });
+});
+
+function merchantFixture() {
+  const first = fixture(), second = fixture('wx-second-rental', 'second-merchant');
+  const db = first.db;
+  db.sqlite.exec(`ALTER TABLE ar_user ADD COLUMN merchant_id INTEGER DEFAULT 1;
+    ALTER TABLE ar_user ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1;
+    UPDATE ar_user SET merchant_id=NULL WHERE role='root';
+    INSERT INTO ar_user(id,role,appid,merchant_id) VALUES(11,'user','wx-second-rental',2),(12,'manager','wx-second-rental',2);
+    ALTER TABLE ar_device ADD COLUMN merchant_id INTEGER NOT NULL DEFAULT 1;
+    INSERT INTO ar_device(id,uuid,device_type,name,merchant_id) VALUES(9,'second-device','rokid','第二商户设备',2);
+    ALTER TABLE ar_rental_order ADD COLUMN payment_config_id INTEGER DEFAULT 1;`);
+  for (const table of ['ar_rental_config', 'ar_rental_order', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job']) db.sqlite.exec(`ALTER TABLE ${table} ADD COLUMN merchant_id INTEGER NOT NULL DEFAULT 1`);
+  const scoped = (identity: RentalPrincipal, merchantId: number): RentalPrincipal => ({ ...identity, merchantId, authVersion: 1, user: { ...identity.user, merchant_id: identity.user.role === 'root' ? null : merchantId, auth_version: 1 } });
+  const user = scoped(first.user, 1), manager = scoped(first.manager, 1), root = scoped(first.root, 1);
+  const userB = scoped({ user: { id: 11, role: 'user' }, appid: second.user.appid, openid: 'payer-11' }, 2);
+  const managerB = scoped({ user: { id: 12, role: 'manager' }, appid: second.user.appid, openid: 'payer-12' }, 2);
+  const merchantA: MerchantRuntime = { id: 1, code: 'first', name: '第一商户', status: 'active', origin: 'https://first.example', appId: first.user.appid, client: first.payment as any, configId: 1 };
+  const merchantB: MerchantRuntime = { id: 2, code: 'second', name: '第二商户', status: 'active', origin: 'https://second.example', appId: second.user.appid, client: second.payment as any, configId: 2 };
+  const clients = new Map<number, any>([[1, first.payment], [2, second.payment]]);
+  const resolvePaymentConfig = vi.fn(async (id: number) => {
+    const client = clients.get(id);
+    if (!client) throw new ApiError(503, '原订单支付配置不可用');
+    return client;
+  });
+  const resolvePaymentForOrder = vi.fn(async (row: Row) => resolvePaymentConfig(Number(row.payment_config_id)));
+  const options = { ...first.options, resolvePaymentForOrder, resolvePaymentConfig };
+  const service = new RentalService(first.services, options);
+  const a = <T>(operation: () => T) => withMerchant({ entry: merchantA, merchant: merchantA }, operation);
+  const b = <T>(operation: () => T) => withMerchant({ entry: merchantB, merchant: merchantB }, operation);
+  const configure = () => a(() => service.configure(manager, 7, { enabled: true, useFeeCents: 2000, depositCents: 8000, version: 0 }));
+  const configureB = () => b(() => service.configure(managerB, 9, { enabled: true, useFeeCents: 3000, depositCents: 9000, version: 0 }));
+  const create = () => a(() => service.create(user, { deviceId: 7, priceVersion: 1, idempotencyKey: 'merchant-a-rental' }));
+  const createB = () => b(() => service.create(userB, { deviceId: 9, priceVersion: 1, idempotencyKey: 'merchant-b-rental' }));
+  const providerSuccess = (order: Row, provider: typeof first) => {
+    const payment = provider.orders.get(order.out_trade_no)!;
+    payment.trade_state = 'SUCCESS';
+    return payment;
+  };
+  return { first, second, db, service, options, a, b, user, manager, root, userB, managerB, merchantA, merchantB, clients, resolvePaymentForOrder, configure, configureB, create, createB, providerSuccess };
+}
+
+describe('merchant-scoped rentals and original payment accounts', () => {
+  it('scopes platform totals and order searches to the selected merchant AppID, including root', async () => {
+    const f = merchantFixture(); await f.configure(); await f.configureB();
+    await f.create(); const second = await f.createB();
+    const row = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [second.rental.id]))!;
+    await f.db.insert('ar_rental_order', { ...row, id: undefined, appid: 'wx-invalid-legacy', out_trade_no: 'different-app-synthetic', idempotency_key: 'different-app-synthetic' });
+    let actor = { ...f.root, merchantId: 2 };
+    const router = new ApiRouter();
+    registerManagement(router, f.db as any, { authenticate: async () => actor } as any, f.service);
+    const overview = router.routes.find(route => route.path === '/v2/rental/admin/overview')!;
+    const orders = router.routes.find(route => route.path === '/v2/rental/admin/orders')!;
+    expect(await f.b(() => overview.handler({} as any))).toMatchObject({ devices: { total: 1 }, orders: { total: 1 } });
+    expect(await f.b(() => orders.handler({ query: { search: 'second-device', merchantId: 1 } } as any))).toMatchObject({ total: 1, items: [{ id: second.rental.id }] });
+    expect(await f.b(() => orders.handler({ query: { search: 'camera-7' } } as any))).toMatchObject({ total: 0, items: [] });
+    actor = f.userB;
+    await expect(f.b(() => overview.handler({} as any))).rejects.toMatchObject({ status: 403 });
+  });
+
+  it('isolates every device entry and order read, including forged manager scope', async () => {
+    const f = merchantFixture(); await f.configure(); await f.configureB();
+    const created = await f.create();
+    expect(await f.a(() => f.service.devices(f.manager, {}))).toMatchObject({ total: 2 });
+    expect(await f.b(() => f.service.devices(f.managerB, {}))).toMatchObject({ total: 1, items: [{ device: { id: 9 } }] });
+    await expect(f.a(() => f.service.context(f.user, 'second-device'))).rejects.toMatchObject({ status: 409, code: 'MERCHANT_MISMATCH' });
+    await expect(f.b(() => f.service.get(f.managerB, created.rental.id))).rejects.toMatchObject({ status: 404 });
+    await expect(f.b(() => f.service.configure(f.managerB, 7, { enabled: false, useFeeCents: 0, depositCents: 0, version: 1 }))).rejects.toMatchObject({ status: 404 });
+    await expect(f.b(() => f.service.create(f.userB, { deviceId: 7, priceVersion: 1, idempotencyKey: 'wrong-merchant-device' }))).rejects.toMatchObject({ status: 409, code: 'MERCHANT_MISMATCH' });
+    await expect(f.b(() => f.service.createDevice(f.managerB, { uuid: 'camera-7' }))).rejects.toMatchObject({ status: 409, code: 'MERCHANT_MISMATCH' });
+    const forged = { ...f.managerB, appid: f.user.appid, merchantId: 1, user: { ...f.managerB.user, merchant_id: 1 } };
+    await expect(f.a(() => f.service.configure(forged, 7, { enabled: false, useFeeCents: 0, depositCents: 0, version: 1 }))).rejects.toMatchObject({ status: 403 });
+    expect(f.first.payment.order).not.toHaveBeenCalled(); expect(f.second.payment.order).not.toHaveBeenCalled();
+  });
+
+  it('lets root manage the selected merchant while rejecting its other-app payer identity', async () => {
+    const f = merchantFixture(); await f.configureB();
+    const selectedRoot = { ...f.root, merchantId: 2 };
+    expect(await f.b(() => f.service.devices(selectedRoot, {}))).toMatchObject({ total: 1 });
+    expect((await f.b(() => f.service.context(selectedRoot, 'second-device'))).actions.canConfigure).toBe(true);
+    await expect(f.b(() => f.service.create(selectedRoot, { deviceId: 9, priceVersion: 1, idempotencyKey: 'root-other-app-payer' }))).rejects.toMatchObject({ status: 403 });
+    const registered = await f.b(() => f.service.createDevice(selectedRoot, { uuid: 'root-created-for-second' }));
+    expect((await f.db.one('SELECT merchant_id FROM ar_device WHERE id=?', [registered.device.id]))!.merchant_id).toBe(2);
+    const created = await f.createB();
+    await expect(f.b(() => f.service.payment(selectedRoot, created.rental.id))).rejects.toMatchObject({ status: 403 });
+  });
+
+  it('rechecks account assignment and version under the new-rental transaction', async () => {
+    const f = merchantFixture(); await f.configure();
+    await f.db.execute('UPDATE ar_user SET merchant_id=2,auth_version=2 WHERE id=?', [f.user.user.id]);
+    await expect(f.create()).rejects.toMatchObject({ status: 403 });
+    expect(await f.db.query('SELECT * FROM ar_rental_order')).toEqual([]);
+    expect(await f.db.query('SELECT * FROM ar_rental_slot')).toEqual([]);
+    await f.db.execute('UPDATE ar_user SET auth_version=2 WHERE id=?', [f.manager.user.id]);
+    expect((await f.a(() => f.service.context(f.manager, 'camera-7'))).actions.canConfigure).toBe(false);
+    await expect(f.a(() => f.service.createDevice(f.manager, { uuid: 'stale-manager-device' }))).rejects.toMatchObject({ status: 403 });
+  });
+
+  it('snapshots merchant/config ownership on orders, configurations, slots, events and jobs', async () => {
+    const f = merchantFixture(); await f.configureB(); const created = await f.createB();
+    const order = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [created.rental.id]))!;
+    expect(order).toMatchObject({ merchant_id: 2, payment_config_id: 2, appid: f.userB.appid, mch_id: 'second-merchant', total_cents: 12000 });
+    for (const table of ['ar_rental_config', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job']) expect((await f.db.query('SELECT * FROM ' + table)).map(row => row.merchant_id)).toEqual([2]);
+    await f.b(() => f.service.payment(f.userB, order.id));
+    expect(f.second.payment.order.mock.calls[0][1]).toBe('https://d.4mr.cn/api/v2/rental/payment-notify/2');
+    expect(f.first.payment.order).not.toHaveBeenCalled();
+  });
+
+  it('rejects missing or mismatched original credentials without borrowing a current client', async () => {
+    const f = merchantFixture(); await f.configureB(); const created = await f.createB();
+    f.clients.delete(2);
+    await expect(f.b(() => f.service.payment(f.userB, created.rental.id))).rejects.toMatchObject({ status: 503 });
+    f.clients.set(2, f.first.payment);
+    await expect(f.b(() => f.service.payment(f.userB, created.rental.id))).rejects.toMatchObject({ status: 503 });
+    expect(f.first.payment.order).not.toHaveBeenCalled(); expect(f.second.payment.order).not.toHaveBeenCalled();
+    expect((await f.b(() => f.service.context(f.userB, 'second-device'))).state).toBe('RESERVED');
+  });
+
+  it('keeps previous config versions for existing orders and binds callbacks to that version', async () => {
+    const f = merchantFixture(); await f.configureB(); const created = await f.createB();
+    const original = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [created.rental.id]))!;
+    const rotated = fixture(f.userB.appid, 'second-merchant');
+    f.clients.set(3, rotated.payment); f.merchantB.client = rotated.payment as any; f.merchantB.configId = 3;
+    await f.b(() => f.service.payment(f.userB, original.id));
+    f.providerSuccess(original, f.second);
+    const rawBody = Buffer.from(JSON.stringify({ event_type: 'TRANSACTION.SUCCESS', resource: { out_trade_no: original.out_trade_no } }));
+    await expect(f.service.paymentNotification({ params: { configId: '3' }, req: { rawBody, headers: {} } } as any)).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.paymentNotification({ params: {}, req: { rawBody, headers: {} } } as any)).rejects.toMatchObject({ status: 403 });
+    await f.service.paymentNotification({ params: { configId: '2' }, req: { rawBody, headers: {} } } as any);
+    await f.service.paymentNotification({ params: { configId: '2' }, req: { rawBody, headers: {} } } as any);
+    expect((await f.b(() => f.service.get(f.userB, original.id))).rental.status).toBe('ACTIVE');
+    expect(await f.db.query("SELECT * FROM ar_rental_event WHERE event='PAYMENT_CONFIRMED'")).toHaveLength(1);
+    expect(rotated.payment.order).not.toHaveBeenCalled(); expect(rotated.payment.payment).not.toHaveBeenCalled();
+    expect(f.first.payment.payment).not.toHaveBeenCalled();
+  });
+
+  it('processes both merchants outside request context and settles refunds while paused', async () => {
+    const f = merchantFixture(); await f.configure(); await f.configureB();
+    const a = await f.create(), b = await f.createB();
+    await f.a(() => f.service.payment(f.user, a.rental.id)); await f.b(() => f.service.payment(f.userB, b.rental.id));
+    const orderA = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [a.rental.id]))!;
+    const orderB = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [b.rental.id]))!;
+    f.providerSuccess(orderA, f.first); f.providerSuccess(orderB, f.second);
+    f.first.advance(30001); await f.service.processJobs();
+    expect((await f.db.query('SELECT status FROM ar_rental_order')).map(row => row.status)).toEqual(['ACTIVE', 'ACTIVE']);
+    f.merchantA.status = 'paused'; f.merchantB.status = 'draft';
+    expect((await f.b(() => f.service.context(f.userB, 'second-device'))).paymentReady).toBe(false);
+    await expect(f.createB()).rejects.toMatchObject({ status: 503 });
+    await expect(f.b(() => f.service.payment(f.userB, orderB.id))).rejects.toMatchObject({ status: 503 });
+    await f.a(() => f.service.end(f.manager, orderA.id, { refundMode: 'deposit', reason: '现场归还', idempotencyKey: 'merchant-a-refund' }));
+    await f.b(() => f.service.end({ ...f.root, merchantId: 2 }, orderB.id, { refundMode: 'deposit', reason: 'root代为归还', idempotencyKey: 'merchant-b-refund' }));
+    expect([...f.first.refunds.values()][0].amount.refund).toBe(8000);
+    expect([...f.second.refunds.values()][0].amount.refund).toBe(9000);
+    [...f.first.refunds.values()][0].status = 'SUCCESS'; [...f.second.refunds.values()][0].status = 'SUCCESS';
+    f.first.advance(30001); await f.service.processJobs();
+    expect(await f.db.query('SELECT * FROM ar_rental_slot')).toEqual([]);
+    expect((await f.db.query('SELECT refund_status FROM ar_rental_order')).map(row => row.refund_status)).toEqual(['SUCCESS', 'SUCCESS']);
+  });
+
+  it('compensates a pre-transfer late payment through the original account without releasing the new rental', async () => {
+    const f = merchantFixture(); await f.configure(); const created = await f.create();
+    await f.a(() => f.service.payment(f.user, created.rental.id));
+    const old = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [created.rental.id]))!;
+    await f.a(() => f.service.cancel(f.user, old.id));
+    await f.db.execute('UPDATE ar_device SET merchant_id=2 WHERE id=7');
+    await f.db.execute('UPDATE ar_rental_config SET merchant_id=2 WHERE device_id=7');
+    const current = await f.b(() => f.service.create(f.userB, { deviceId: 7, priceVersion: 1, idempotencyKey: 'post-transfer-rental' }));
+    await f.b(() => f.service.payment(f.userB, current.rental.id));
+    const next = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [current.rental.id]))!;
+    f.providerSuccess(next, f.second); await f.b(() => f.service.syncPayment(f.userB, next.id));
+    f.providerSuccess(old, f.first);
+    expect((await f.a(() => f.service.syncPayment(f.user, old.id))).rental.status).toBe('COMPENSATING');
+    await f.service.processJobs();
+    expect([...f.first.refunds.values()][0].amount.refund).toBe(10000);
+    expect(f.second.refunds.size).toBe(0);
+    [...f.first.refunds.values()][0].status = 'SUCCESS'; await f.a(() => f.service.syncRefund(f.manager, old.id));
+    expect(await f.b(() => f.service.context(f.userB, 'camera-7'))).toMatchObject({ state: 'RENTED', rental: { id: next.id }, relation: 'mine' });
+    await expect(f.a(() => f.service.context(f.manager, 'camera-7'))).rejects.toMatchObject({ code: 'MERCHANT_MISMATCH' });
+  });
+
+  it('rejects another config callback before querying or releasing a merchant refund', async () => {
+    const f = merchantFixture(); await f.configureB(); const created = await f.createB();
+    const order = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [created.rental.id]))!;
+    await f.b(() => f.service.payment(f.userB, order.id)); f.providerSuccess(order, f.second);
+    await f.b(() => f.service.syncPayment(f.userB, order.id));
+    await f.b(() => f.service.end(f.managerB, order.id, { refundMode: 'deposit', reason: '已归还', idempotencyKey: 'second-refund-callback' }));
+    const refund = [...f.second.refunds.values()][0]; refund.status = 'SUCCESS';
+    const rawBody = Buffer.from(JSON.stringify({ event_type: 'REFUND.SUCCESS', resource: { out_refund_no: refund.out_refund_no } }));
+    f.first.payment.payment.mockClear(); f.second.payment.payment.mockClear();
+    await expect(f.service.refundNotification({ params: { configId: '1' }, req: { rawBody, headers: {} } } as any)).rejects.toMatchObject({ status: 403 });
+    expect(f.first.payment.payment).not.toHaveBeenCalled(); expect(f.second.payment.payment).not.toHaveBeenCalled();
+    expect((await f.b(() => f.service.context(f.userB, 'second-device'))).state).toBe('SETTLING');
+    await f.service.refundNotification({ params: { configId: '2' }, req: { rawBody, headers: {} } } as any);
+    expect((await f.b(() => f.service.context(f.userB, 'second-device'))).state).toBe('AVAILABLE');
+    expect(await f.db.query("SELECT * FROM ar_rental_event WHERE event='REFUND_SUCCESS' AND merchant_id=2")).toHaveLength(1);
   });
 });
