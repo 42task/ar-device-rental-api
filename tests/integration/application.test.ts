@@ -1,12 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import mysql from 'mysql2/promise';
-import request from 'supertest';
+import request from '../http-client';
 import { describe, expect, it } from 'vitest';
 import { createApplication } from '../../src/application';
 import { Database } from '../../src/core/database';
 import { migrate } from '../../src/core/migrations';
 import { RentalAuth, bootstrapRoot } from '../../src/auth';
 import { WeChatClient } from '../../src/payments/wechat';
+import { seedVenue } from './venue-fixtures';
 
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complete non-payment HTTP integration', () => {
   it('migrates twice, logs in, explicitly bootstraps root and manages a device without the old backend', async () => {
@@ -21,7 +22,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       await migrate(db);
       await migrate(db);
       const appId = 'wx03dbf50c15cac06f';
-      const client = new WeChatClient({ appId, appSecret: 'synthetic-test-only', payEnabled: false, fetch: async input => {
+      const client = new WeChatClient({ appId, appSecret: 'synthetic-test-only', payEnabled: false, allowEnvironmentFallback: false, fetch: async input => {
         const url = new URL(String(input));
         expect(url.origin).toBe('https://api.weixin.qq.com');
         const code = url.searchParams.get('js_code');
@@ -42,27 +43,34 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       await expect(bootstrapRoot(db, owner.user.id, appId, rootPhone)).rejects.toMatchObject({ status: 409 });
       const manager = await login('manager');
       const ordinary = await login('ordinary');
-      const ownerToken = 'Bearer ' + owner.token.accessToken, managerToken = 'Bearer ' + manager.token.accessToken, ordinaryToken = 'Bearer ' + ordinary.token.accessToken;
+      const ownerToken = 'Bearer ' + owner.token.accessToken, ordinaryToken = 'Bearer ' + ordinary.token.accessToken;
       const promoted = await request(app).put(`/api/v2/rental/admin/users/${manager.user.id}/role`).set('Authorization', ownerToken).send({ role: 'manager' });
       expect(promoted.status).toBe(200);
       expect(promoted.body).toMatchObject({ id: manager.user.id, role: 'manager' });
+      expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', 'Bearer ' + manager.token.accessToken)).status).toBe(401);
+      const managerToken = 'Bearer ' + (await login('manager')).token.accessToken;
       const users = await request(app).get('/api/v2/rental/admin/users').set('Authorization', ownerToken);
       expect(users.status).toBe(200);
-      expect(users.body.items).toHaveLength(2);
+      expect(users.body.items).toHaveLength(1);
+      expect(users.body.items[0]).toMatchObject({ id: manager.user.id, role: 'manager' });
+      const platform = await request(app).get('/api/v2/rental/admin/users').query({ scope: 'platform' }).set('Authorization', ownerToken);
+      expect(platform.status).toBe(200); expect(platform.body.items).toHaveLength(1);
+      expect(platform.body.items[0]).toMatchObject({ id: ordinary.user.id, role: 'user', merchantId: null });
       expect(JSON.stringify(users.body)).not.toContain('test-openid');
       const uuid = 'http-device-test';
+      const venue = await seedVenue(db);
       const missing = await request(app).get('/api/v2/rental/devices/context').query({ uuid }).set('Authorization', ordinaryToken);
       expect(missing.body).toMatchObject({ state: 'UNREGISTERED', actions: { canCreate: false } });
       expect((await request(app).post('/api/v2/rental/devices').set('Authorization', ordinaryToken).send({ uuid })).status).toBe(403);
-      const registered = await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid, type: 'rokid' });
+      const registered = await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid, type: 'rokid', venueId: venue.id });
       expect(registered.status).toBe(200);
       const deviceId = registered.body.device.id;
       expect(registered.body.device).toMatchObject({ uuid, type: 'rokid' });
-      const configured = await request(app).patch(`/api/v2/rental/devices/${deviceId}/config`).set('Authorization', managerToken).send({ enabled: true, useFeeCents: 100, depositCents: 5000, version: 0 });
+      const configured = await request(app).patch(`/api/v2/rental/devices/${deviceId}/config`).set('Authorization', managerToken).send({ enabled: true, venueId: venue.id, version: 0 });
       expect(configured.status).toBe(200);
       const context = await request(app).get('/api/v2/rental/devices/context').query({ uuid }).set('Authorization', ordinaryToken);
       expect(context.body).toMatchObject({ state: 'AVAILABLE', paymentReady: false, pricing: { useFeeCents: 100, depositCents: 5000, totalCents: 5100 }, actions: { canRent: false } });
-      const disabledPayment = await request(app).post('/api/v2/rentals').set('Authorization', ordinaryToken).send({ deviceId, priceVersion: 1, idempotencyKey: 'payment-disabled-test' });
+      const disabledPayment = await request(app).post('/api/v2/rentals').set('Authorization', ordinaryToken).send({ deviceId, priceVersion: 1, venuePriceVersion: venue.version, idempotencyKey: 'payment-disabled-test' });
       expect(disabledPayment.status).toBe(503);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_order'))!.total)).toBe(0);
       expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', managerToken)).body).toMatchObject({ devices: { total: 1, available: 1, disabled: 0 }, orders: { total: 0, active: 0, refunding: 0 }, paymentsEnabled: false });
@@ -81,7 +89,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.refreshToken })).status).toBe(200);
       expect((await request(app).get('/api/v2/rentals').set('Authorization', 'Bearer ' + ordinary.token.refreshToken)).status).toBe(401);
       expect((await request(app).put(`/api/v2/rental/admin/users/${manager.user.id}/role`).set('Authorization', ownerToken).send({ role: 'user' })).status).toBe(200);
-      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid: 'forbidden-device' })).status).toBe(403);
+      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid: 'forbidden-device' })).status).toBe(401);
+      const demotedToken = 'Bearer ' + (await login('manager')).token.accessToken;
+      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', demotedToken).send({ uuid: 'forbidden-device' })).status).toBe(403);
       await migrate(db);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_device'))!.total)).toBe(1);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_user'))!.total)).toBe(3);

@@ -2,12 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import mysql from 'mysql2/promise';
-import request from 'supertest';
+import request from '../http-client';
 import { describe, expect, it } from 'vitest';
 import { createApplication } from '../../src/application';
 import { RentalAuth } from '../../src/auth';
 import { Database } from '../../src/core/database';
 import { migrate, SCHEMA_VERSION } from '../../src/core/migrations';
+import { WeChatClient } from '../../src/payments/wechat';
+import { seedVenue } from './venue-fixtures';
 
 async function withTestDatabase(check: (db: Database) => Promise<void>): Promise<void> {
   if (!['127.0.0.1', 'localhost'].includes(process.env.MYSQL_HOST || '') || process.env.MYSQL_DATABASE !== 'ar_rental_test') throw new Error('Use the dedicated localhost AR rental test environment.');
@@ -44,7 +46,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device type def
       expect(Number((await db.one('SELECT version FROM ar_schema_meta WHERE name=?', ['ar-device-rental-api']))!.version)).toBe(SCHEMA_VERSION);
       expect(await sqlDefault(db)).toBe('Rokid Studio2');
       expect(await db.query('SELECT uuid,device_type FROM ar_device ORDER BY uuid')).toEqual([{ uuid: 'legacy-ios', device_type: 'ios' }, { uuid: 'legacy-rokid', device_type: 'rokid' }, { uuid: 'legacy-studio', device_type: 'rokid studio2' }]);
-      await db.execute('INSERT INTO ar_device (uuid,name) VALUES (?,?)', ['sql-default', 'Synthetic SQL default device']);
+      const venue = await seedVenue(db);
+      await db.execute('INSERT INTO ar_device (uuid,name,venue_id) VALUES (?,?,?)', ['sql-default', 'Synthetic SQL default device', venue.id]);
       await migrate(db);
       expect(await sqlDefault(db)).toBe('Rokid Studio2');
       expect(await db.query('SELECT uuid,device_type FROM ar_device ORDER BY uuid')).toEqual([{ uuid: 'legacy-ios', device_type: 'ios' }, { uuid: 'legacy-rokid', device_type: 'rokid' }, { uuid: 'legacy-studio', device_type: 'rokid studio2' }, { uuid: 'sql-default', device_type: 'Rokid Studio2' }]);
@@ -57,21 +60,27 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device type def
       expect(await sqlDefault(db)).toBe('Rokid Studio2');
       expect((await db.one("SELECT DATA_TYPE AS type FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='ar_device' AND COLUMN_NAME='device_type'"))!.type).toBe('varchar');
       const appId = 'wx03dbf50c15cac06f', openid = 'synthetic-device-default-manager';
-      await db.insert('ar_user', { appid: appId, openid, role: 'manager' });
-      const client = { config: { appId }, codeSession: async () => ({ openid }), isPaymentReady: () => false };
-      const auth = new RentalAuth(db, client as any, { jwtSecret: 'synthetic-default-type-signing-key-at-least-32-bytes', rootPhone: '' });
-      const { app } = createApplication({ db, client: client as any, auth });
-      const bearer = 'Bearer ' + (await auth.login('synthetic-login-code')).token.accessToken;
+      const manager = await db.insert('ar_user', { appid: appId, openid, role: 'manager', merchant_id: 1, auth_version: 1 });
+      await db.insert('ar_merchant_membership', { user_id: manager.id, merchant_id: 1, role: 'manager', status: 'active', authorization_version: 1, updated_ms: Date.now() });
+      const client = new WeChatClient({ appId, appSecret: 'synthetic-device-default-secret', payEnabled: false, allowEnvironmentFallback: false,
+        fetch: async () => { throw Error('Device default integration must not contact WeChat.'); } });
+      client.codeSession = async () => ({ openid });
+      const auth = new RentalAuth(db, client, { jwtSecret: 'synthetic-default-type-signing-key-at-least-32-bytes', rootPhone: '' });
+      const { app } = createApplication({ db, client: client, auth });
+      const login = await request(app).post('/api/v2/rental/auth/login').send({ code: 'synthetic-login-code' });
+      expect(login.status).toBe(200);
+      const bearer = 'Bearer ' + login.body.data.token.accessToken;
+      const venue = await seedVenue(db);
       const cases = [['http-default', undefined, 'Rokid Studio2'], ['http-explicit-ios', 'ios', 'ios'], ['http-explicit-rokid', 'rokid', 'rokid'], ['http-short-studio', 'rs2', 'Rokid Studio2'], ['http-canonical-studio', 'Rokid Studio', 'Rokid Studio'], ['http-lower-studio', 'rokid studio2', 'Rokid Studio2'], ['http-canonical-studio3', 'Rokid Studio3', 'Rokid Studio3'], ['http-short-studio1', 'RS', 'Rokid Studio'], ['http-short-studio3', 'rs3', 'Rokid Studio3'], ['http-custom', 'Custom Glasses', 'Custom Glasses']] as const;
       for (const [uuid, type, expected] of cases) {
-        const result = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid, ...(type === undefined ? {} : { type }) });
+        const result = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid, venueId: venue.id, ...(type === undefined ? {} : { type }) });
         expect(result.status).toBe(200);
         expect(result.body).toMatchObject({ created: true, device: { uuid, type: expected } });
       }
-      const duplicate = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: 'http-explicit-ios', type: 'rs2' });
+      const duplicate = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: 'http-explicit-ios', type: 'rs2', venueId: venue.id });
       expect(duplicate.status).toBe(200);
       expect(duplicate.body).toMatchObject({ created: false, device: { uuid: 'http-explicit-ios', type: 'ios' } });
-      const concurrent = await Promise.all(Array.from({ length: 2 }, () => request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: 'http-concurrent-studio', type: 'rs2' })));
+      const concurrent = await Promise.all(Array.from({ length: 2 }, () => request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: 'http-concurrent-studio', type: 'rs2', venueId: venue.id })));
       expect(concurrent.map(result => result.status)).toEqual([200, 200]);
       expect(concurrent.map(result => result.body.created).sort()).toEqual([false, true]);
       expect(concurrent[0].body.device).toEqual(concurrent[1].body.device);

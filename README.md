@@ -2,11 +2,13 @@
 
 独立的 Node.js 24 / TypeScript / Express 5 后端，为原生微信小程序 **AR设备租赁**（`wx03dbf50c15cac06f`）提供登录、设备、租赁、微信支付与退款接口。使用全新 MySQL 8.4 数据库，所有业务表以 `ar_` 开头，不连接旧 `wechat` 服务或旧数据库，也不需要 Redis。
 
-公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://d.4mr.cn/d?i=UUID&t=rs2`；扫码入口与 API 域名分别配置。小程序源码位于独立仓库 [ar-device-rental-mp](https://github.com/42task/ar-device-rental-mp)。多商户接入、归属、设备和人员调拨、密钥轮换见[多商户运行说明](docs/multi-merchant.md)。
+公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://d.4mr.cn/d?i=UUID&t=rs2`；扫码入口与 API 域名分别配置。同一工程的小程序源码位于 [apps/miniprogram](../miniprogram)。
+
+所有当前商户通过同一个小程序及 `d.4mr.cn` 总入口接入，新建商户默认共享入口 1，不单独填写 AppID、域名或 AppSecret。商户 adminer 仅维护本商户的文旅场地及其租金、押金，每台设备必须绑定有效商户和本商户场地。服务端从设备归属选择支付配置，从场地读取费用，订单固定原费用、场地和收款账户，后续查单、退款沿用原快照。共享小程序的消费者统一登录且没有商户管理归属，员工权限由独立成员关系决定。当前 schema 13，入口与支付凭据分开，旧设备金额已归档；迁移与接入说明见 [多商户运行说明](../../docs/multi-merchant.md)。
 
 ## 部署
 
-使用 [Portainer 部署步骤](docs/portainer.md) 在 `port.f.01xr.com` 的目标 Docker Standalone 环境自行部署，Stack 文件为 [compose.portainer.yml](compose.portainer.yml)。它包含独立 MySQL、持久卷及 API；数据库仅加入内部网络，不发布宿主机端口。API 通过现有 Traefik 网络提供 `d.4mr.cn` 的 HTTPS 服务。
+使用 [Portainer 部署步骤](../../docs/portainer.md) 在 `port.f.01xr.com` 的目标 Docker Standalone 环境自行部署，Stack 文件为 [compose.portainer.yml](../../compose.portainer.yml)。它包含独立 MySQL、持久卷及 API；数据库仅加入内部网络，不发布宿主机端口。API 通过现有 Traefik 网络提供 `d.4mr.cn` 的 HTTPS 服务。
 
 [.env.example](.env.example) 只含占位配置，不包含可用密钥。JWT、微信 AppSecret、商户私钥和平台公钥可通过只读文件提供。首次启动显式执行迁移，再启动应用；应用自身不会静默迁移旧数据库或导入旧用户。
 
@@ -19,19 +21,21 @@
 需要 Node.js 24 和全新的专用 MySQL 数据库。
 
 ```sh
+# 从工程根目录进入后端目录
+cd apps/api
 npm ci --ignore-scripts
 cp .env.local.example .env
-# 按 docs/portainer.md 配置本机专用数据库、JWT 和 AppSecret。
+# 按 ../../docs/development.md 配置本机专用数据库、JWT 和 AppSecret。
 npm run build
 npm run migrate
 npm start
 ```
 
-本文中的命令均在本仓库根目录执行；数据库迁移文件和 `.env` 从当前目录读取。
+本文中的后端命令均在 `apps/api` 目录执行；数据库迁移文件和 `.env` 从这个目录读取。工程根目录的统一命令会切换到该目录后再执行。
 
 本机数据库应使用 `MYSQL_HOST=127.0.0.1` 及实际端口；从文件加载密钥时，`*_PATH` 也须改为本机文件路径。`RENTAL_API_IMAGE`、`TRAEFIK_*`、`RENTAL_SECRETS_DIR` 和 `MYSQL_ROOT_PASSWORD` 由部署文件使用，不是应用连接旧数据库的入口。
 
-首次小程序登录会创建普通用户。首个 root 可通过环境变量 `ROOT_PHONE` 初始化：在 Portainer Stack 的环境变量区域填写目标管理员的手机号，点击 **Update the stack** 重新部署；本机则在 `.env` 中设置并重启 API。支持 `+86 <你的11位手机号>` 或 `<你的11位手机号>`，会忽略空格。Portainer 的值直接填号码；`.env` 中带空格的值须用双引号包围。示例中的占位文字必须替换为真实号码，真实配置不要提交 Git。
+首次小程序登录会创建普通用户。首个 root 可通过环境变量 `ROOT_PHONE` 初始化：在 Portainer Stack 的环境变量区域填写目标管理员的手机号，点击 **Update the stack** 重新部署；本机则在 `apps/api/.env` 中设置并重启 API。支持 `+86 <你的11位手机号>` 或 `<你的11位手机号>`，会忽略空格。Portainer 的值直接填号码；`.env` 中带空格的值须用双引号包围。示例中的占位文字必须替换为真实号码，真实配置不要提交 Git。
 
 目标账号须先在当前小程序完成微信原生手机号授权。服务端只核对当前 AppID 的已验证绑定；匹配配置且系统尚无 root 时，在之后的登录、令牌刷新或身份校验中自动初始化首个 root，并记录 `env-root-bootstrap` 审计。旧 `tel` 字段、手填号码或仅完成微信登录都不能取得该权限。
 
@@ -59,41 +63,31 @@ MySQL 集成测试另外使用隔离的本机测试实例，要求 `MYSQL_HOST=1
 npm run test:integration
 ```
 
-CI 在 `main`、`develop`、`publish` 三个分支运行测试、TypeScript 构建及 MySQL 并发测试。验证通过后，构建 Linux amd64 镜像并推送到腾讯云香港镜像仓库 `hkccr.ccs.tencentyun.com/gdgeek/ar-device-rental-api`。沿用参考 CI 已验证的单架构 Docker schema2 格式，关闭 provenance/SBOM 附加清单。
+工程根目录的 CI 会运行小程序测试与上传校验，以及后端测试、TypeScript 构建和 MySQL 并发测试。`main` 分支验证通过后，使用仓库的 `GITHUB_TOKEN` 发布 `ghcr.io/42task/ar-device-rental:main` 和 `:sha-完整提交号` 两个标签，构建 Linux amd64 / arm64 镜像。工作流不部署 Portainer，也不需要 TCR 或生产数据库 secrets。
 
-| Git 分支 | 镜像标签 |
-| --- | --- |
-| `main` | `main` |
-| `develop` | `develop` |
-| `publish` | `publish`、`latest` |
-
-仅发布上述四个标签，`latest` 只由 `publish` 更新。拉取请求只校验，不登录镜像仓库或推送镜像；手动运行也仅允许这三个分支发布。每个分支的工作流串行执行，发布前核对远端分支提交。发布后重新查询每个远端标签的 digest，并拉取不可变镜像核对 OCI revision。镜像保留 `/health` 的 `gitCommit`，Actions 摘要记录镜像 digest，部署与回滚使用 `镜像仓库@sha256:...` 固定版本。
-
-在本仓库的 **Settings → Secrets and variables → Actions** 配置 `TENCENT_DOCKER_USERNAME` 和 `TENCENT_DOCKER_PASSWORD`，账号须有香港目标镜像仓库的推送权限。参考仓库的 Secrets 不会自动共享给本仓库；凭据缺失时发布任务会明确失败。不要把真实凭据写入源码、镜像或聊天记录。
-
-Portainer 单独配置同一香港 registry 的拉取凭据；默认使用 `publish` 标签。CI 负责测试和镜像发布，运行服务仍由 Portainer 部署并核对健康检查，详见 [部署文档](docs/portainer.md)。CI 无需生产数据库或微信支付密钥。
+GHCR 首次发布默认是私有包；管理员仍需检查组织包权限。Portainer 拉取私有镜像需另配有该包读取权限的账号及 `read:packages` 凭据，不能使用工作流中短期有效的 `GITHUB_TOKEN`。配置方法见 [部署文档](../../docs/portainer.md)，权限依据见 [GitHub Container registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
 
 ## 接口
 
 | 入口 | 用途 |
 | --- | --- |
 | `GET /health` | 数据库及迁移就绪状态、构建 `gitCommit` |
+| `GET /api/v2/rental/capabilities` | 最低客户端协议和场地、员工、报价能力 |
 | `POST /api/v2/rental/auth/login` | 微信 `code` 换取本服务身份令牌 |
 | `POST /api/v2/rental/auth/refresh` | 刷新身份令牌 |
-| `/api/v2/rental/devices` | 设备识别、登记及费用配置 |
+| `/api/v2/rental/devices` | 设备识别、登记、场地绑定及开放配置 |
 | `/api/v2/rentals` | 租赁记录、支付、结束及退款查询 |
 | `/api/v2/rental/admin` | 管理员设备列表与 adminer/root 分级身份管理 |
 | `/api/v2/rental/admin/auth` | 网页扫码挑战、小程序确认及独立浏览器会话 |
 | `GET /api/v2/rental/admin/overview` | 管理总览 |
-| `GET /api/v2/rental/admin/orders` | 当前 AppID 下所有用户的订单搜索与分页 |
-| `GET /admin/` | 同源网页管理后台，见 [使用说明](docs/admin.md) |
-| `POST /api/v2/rental/payment-notify` | 默认商户原配置的微信支付通知 |
-| `POST /api/v2/rental/payment-notify/:configId` | 按原支付配置处理通知 |
-| `POST /api/v2/rental/refund-notify` | 默认商户原配置的微信退款通知 |
-| `POST /api/v2/rental/refund-notify/:configId` | 按原支付配置处理退款通知 |
-| `/api/v2/rental/admin/merchants` | root 管理商户与独立微信配置 |
+| `GET /api/v2/rental/admin/orders` | 当前管理商户的订单搜索与分页 |
+| `GET /admin/` | 同源网页管理后台，见 [使用说明](../../docs/admin.md) |
+| `POST /api/v2/rental/payment-notify` | 微信支付通知 |
+| `POST /api/v2/rental/refund-notify` | 微信退款通知 |
 
 金额均使用整数分；支付与退款状态以经过服务端校验的微信结果为准。配置不完整时不会提供支付就绪状态。业务写入、设备占用与结算由数据库事务、唯一约束及幂等标识保护。
+
+业务写入要求 `X-Client-Protocol: 2`，不兼容返回 426 `CLIENT_UPGRADE_REQUIRED`；认证、历史读取和签名资金通知不受该升级门槛阻断。响应中的 `entry` 表示小程序入口，`managementMerchant` 表示员工所属管理商户，消费者后者为 null。完整权限和客户端发布约束见 [工程说明](../../docs/engineering.md)。
 
 ## 设备型号
 

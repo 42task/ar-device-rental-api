@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import mysql from 'mysql2/promise';
-import request from 'supertest';
+import request from '../http-client';
 import { describe, expect, it, vi } from 'vitest';
 import { createApplication } from '../../src/application';
 import { PhoneBinding } from '../../src/auth/phone';
@@ -27,6 +27,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL verified phone 
       expect(Number((await db.one('SELECT version FROM ar_schema_meta'))!.version)).toBe(SCHEMA_VERSION);
       const appId = 'wx03dbf50c15cac06f';
       for (const id of [1, 2, 3, 4, 5]) await db.insert('ar_user', { id, appid: appId, openid: 'synthetic-phone-user-' + id, role: id === 3 ? 'manager' : 'user', tel: id === 5 ? '+8613700137000' : null });
+      await db.insert('ar_merchant_membership', { user_id: 3, merchant_id: 1, role: 'manager', status: 'active', authorization_version: 1, updated_ms: Date.now() });
       const principals = await Promise.all([1, 2, 3, 4, 5].map(async id => ({ user: (await db!.one('SELECT * FROM ar_user WHERE id=?', [id]))!, appid: appId, openid: 'synthetic-phone-user-' + id } as RentalPrincipal)));
       const providerCalls: string[] = [];
       const client = { config: { appId }, codeSession: async (code: string) => ({ openid: 'synthetic-phone-user-' + code }), isPaymentReady: () => false, phoneNumber: async (code: string) => {

@@ -13,7 +13,9 @@ import { PhoneBinding } from './auth/phone';
 import { MerchantRegistry, merchantId } from './merchants/registry';
 import { publicMerchant, withMerchant } from './merchants/context';
 import { registerMerchants } from './merchants/management';
-import { requireRoot } from './core/roles';
+import { requireManager } from './core/roles';
+import { registerVenues } from './venues';
+import { clientCapabilities, requireClientProtocol } from './core/client-protocol';
 
 interface ApplicationOptions { db?: Database; client?: WeChatClient; auth?: RentalAuth; merchants?: MerchantRegistry | false }
 
@@ -59,6 +61,8 @@ export function createApplication(options: ApplicationOptions = {}) {
   app.use('/api/v2/rental/auth', limitAuthentication('mini', () => 30));
   app.use('/api/v2/rental/admin/auth', limitAuthentication('admin', req => req.method === 'GET' ? 180 : 30));
   const router = new ApiRouter();
+  app.use('/api/v2', requireClientProtocol);
+  router.add('GET', '/v2/rental/capabilities', () => clientCapabilities());
   if (merchants) {
     app.use('/api/v2', async (req, res, next) => {
       try {
@@ -66,14 +70,18 @@ export function createApplication(options: ApplicationOptions = {}) {
         const directLoopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote) && !req.headers['x-forwarded-host'];
         // Host is accepted only after lookup in the merchant allowlist. Forwarded host is never used.
         const entry = await merchants.resolveHost(req.headers.host || '', directLoopback);
-        await withMerchant({ entry, merchant: entry }, async () => {
+        const entryMerchant = await merchants.runtime(entry.legacyMerchantId);
+        await withMerchant({ entry, merchant: entryMerchant }, async () => {
           const selected = req.headers['x-merchant-id'];
-          let merchant = entry;
+          let merchant = entryMerchant;
           if (selected !== undefined) {
             if (typeof selected !== 'string') throw new ApiError(422, '商户编号无效');
             const principal = await auth.authenticate({ req, res, body: req.body || {}, query: req.query, params: req.params as Record<string, string> });
-            requireRoot(principal.user);
             merchant = await merchants.runtime(merchantId(selected));
+            if (principal.user.role !== 'root') {
+              requireManager(principal.user);
+              if (Number(principal.user.merchant_id) !== merchant.id || merchant.appId !== entry.appId) throw new ApiError(403, '不可切换到其他商户的管理范围');
+            }
           }
           withMerchant({ entry, merchant }, () => next());
         });
@@ -88,8 +96,9 @@ export function createApplication(options: ApplicationOptions = {}) {
   auth.registerAuth(router);
   phone.register(router);
   admin.register(router);
+  registerVenues(router, db, auth);
   const rentals = registerRentals(router, { db }, { appId: client.config.appId || '', payment: client, authenticate: auth.authenticate,
-    ...(merchants ? { resolvePaymentForOrder: (row: import('./core/contracts').Row) => merchants.paymentForOrder(row), resolvePaymentConfig: (id: number) => merchants.clientForConfig(id) } : {}) });
+    ...(merchants ? { resolveMerchant: (id: number) => merchants.runtime(id), resolvePaymentForOrder: (row: import('./core/contracts').Row) => merchants.paymentForOrder(row), resolvePaymentConfig: (id: number) => merchants.clientForConfig(id) } : {}) });
   registerManagement(router, db, auth, rentals);
   router.mount(app);
   app.get(/^\/admin$/, (_req, res) => res.redirect(302, '/admin/'));

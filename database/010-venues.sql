@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS ar_venue (
+  id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  merchant_id int NOT NULL,
+  name varchar(128) NOT NULL,
+  address varchar(512) NOT NULL DEFAULT '',
+  contact_name varchar(64) NOT NULL DEFAULT '',
+  contact_phone varchar(64) NOT NULL DEFAULT '',
+  description varchar(2000) NOT NULL DEFAULT '',
+  status varchar(16) NOT NULL DEFAULT 'active',
+  use_fee_cents int unsigned NOT NULL DEFAULT 0,
+  deposit_cents int unsigned NOT NULL DEFAULT 0,
+  version int unsigned NOT NULL DEFAULT 1,
+  created_ms bigint NOT NULL,
+  updated_ms bigint NOT NULL,
+  updated_by int NULL,
+  legacy_device_id int NULL,
+  UNIQUE KEY uq_ar_venue_merchant (id,merchant_id),
+  UNIQUE KEY uq_ar_venue_legacy_device (legacy_device_id),
+  KEY ix_ar_venue_owner (merchant_id,status,id),
+  CONSTRAINT fk_ar_venue_merchant FOREIGN KEY (merchant_id) REFERENCES ar_merchant(id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

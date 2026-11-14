@@ -9,7 +9,7 @@ import type { RentalPrincipal } from '../../src/rentals/types';
 import { runWithMerchant, type MerchantRuntime } from '../../src/merchants/context';
 
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental concurrency', () => {
-  it('isolates competing reservations and recovers original-account refunds without releasing occupied devices early', async () => {
+  it.each([false, true])('isolates competing reservations and recovers original-account refunds without releasing occupied devices early (shared AppID: %s)', async shared => {
     if (!['127.0.0.1', 'localhost'].includes(process.env.MYSQL_HOST || '') || process.env.MYSQL_DATABASE !== 'ar_rental_test') throw Error('Use the dedicated localhost rental test instance.');
     const database = 'ar_merchant_rentals_' + randomBytes(8).toString('hex');
     const settings = { host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT), user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD };
@@ -23,14 +23,23 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
         for (const statement of sql) await db.execute(statement);
       }
       await db.execute('ALTER TABLE ar_user ADD COLUMN merchant_id int NULL DEFAULT 1, ADD COLUMN auth_version int NOT NULL DEFAULT 0');
+      await db.execute("CREATE TABLE ar_merchant_membership (user_id int PRIMARY KEY,merchant_id int NOT NULL,role varchar(16) NOT NULL,status varchar(16) NOT NULL DEFAULT 'active',authorization_version int NOT NULL DEFAULT 1)");
       for (const table of ['ar_device', 'ar_rental_config', 'ar_rental_order', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job']) await db.execute(`ALTER TABLE ${table} ADD COLUMN merchant_id int NOT NULL DEFAULT 1`);
       await db.execute('ALTER TABLE ar_rental_order ADD COLUMN payment_config_id int NULL DEFAULT 1');
-      const appA = 'wx03dbf50c15cac06f', appB = 'wx1111111111111111';
+      await db.execute('CREATE TABLE ar_merchant (id int PRIMARY KEY,name varchar(128) NOT NULL)');
+      await db.execute("INSERT INTO ar_merchant VALUES (1,'第一商户'),(2,'第二商户')");
+      for (const statement of (await readFile('database/010-venues.sql', 'utf8')).split(';').map(sql => sql.trim()).filter(Boolean)) await db.execute(statement);
+      await db.insert('ar_venue', { id: 1, merchant_id: 1, name: '商户一场地', use_fee_cents: 2000, deposit_cents: 8000, version: 1, created_ms: 0, updated_ms: 0 });
+      await db.insert('ar_venue', { id: 2, merchant_id: 2, name: '商户二场地', use_fee_cents: 3000, deposit_cents: 9000, version: 1, created_ms: 0, updated_ms: 0 });
+      await db.execute('ALTER TABLE ar_device ADD COLUMN venue_id int NOT NULL, ADD CONSTRAINT fk_test_device_venue FOREIGN KEY(venue_id,merchant_id) REFERENCES ar_venue(id,merchant_id)');
+      await db.execute('ALTER TABLE ar_rental_order ADD COLUMN venue_id int NULL, ADD COLUMN venue_name varchar(128) NULL, ADD COLUMN venue_price_version int NULL');
+      const appA = 'wx03dbf50c15cac06f', appB = shared ? appA : 'wx1111111111111111';
       for (const [id, role, merchantId, appid] of [[1, 'user', 1, appA], [2, 'user', 1, appA], [3, 'manager', 1, appA], [11, 'user', 2, appB], [13, 'manager', 2, appB], [20, 'root', null, appA]] as const) {
         await db.insert('ar_user', { id, role, appid, merchant_id: merchantId, openid: 'synthetic-payer-' + id });
+        if (role === 'manager') await db.insert('ar_merchant_membership', { user_id: id, merchant_id: merchantId, role, status: 'active', authorization_version: 1 });
       }
-      const deviceA = await db.insert('ar_device', { uuid: 'first-merchant-device', merchant_id: 1 });
-      const deviceB = await db.insert('ar_device', { uuid: 'second-merchant-device', merchant_id: 2 });
+      const deviceA = await db.insert('ar_device', { uuid: 'first-merchant-device', merchant_id: 1, venue_id: 1 });
+      const deviceB = await db.insert('ar_device', { uuid: 'second-merchant-device', merchant_id: 2, venue_id: 2 });
       const provider = (appId: string, mchId: string) => {
         const orders = new Map<string, Row>(), refunds = new Map<string, Row>();
         let failRefund = false;
@@ -67,28 +76,39 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
       const managerA = principal(3, 'manager', merchantA), managerB = principal(13, 'manager', merchantB), payerB = principal(11, 'user', merchantB);
       let now = Date.now();
       const options = { appId: appA, payment: first.client as any, authenticate: async () => managerA, now: () => now,
+        resolveMerchant: async (id: number) => {
+          if (id === 1) return merchantA;
+          if (id === 2) return merchantB;
+          throw Error('unknown merchant');
+        },
         resolvePaymentForOrder: async (row: Row) => {
           if (Number(row.payment_config_id) === 1 && Number(row.merchant_id) === 1) return first.client as any;
           if (Number(row.payment_config_id) === 2 && Number(row.merchant_id) === 2) return second.client as any;
           throw Error('wrong original merchant');
         } };
       const service = new RentalService({ db } as Services, options);
-      await runWithMerchant(merchantA, () => service.configure(managerA, deviceA.id, { enabled: true, useFeeCents: 2000, depositCents: 8000, version: 0 }));
-      await runWithMerchant(merchantB, () => service.configure(managerB, deviceB.id, { enabled: true, useFeeCents: 3000, depositCents: 9000, version: 0 }));
-      const competing = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => runWithMerchant(merchantA, () => service.create(principal(index % 2 + 1, 'user', merchantA), { deviceId: deviceA.id, priceVersion: 1, idempotencyKey: 'merchant-concurrent-' + index }))));
+      await runWithMerchant(merchantA, () => service.configure(managerA, deviceA.id, { enabled: true, version: 0 }));
+      await runWithMerchant(merchantB, () => service.configure(managerB, deviceB.id, { enabled: true, version: 0 }));
+      const competing = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => runWithMerchant(merchantA, () => service.create(principal(index % 2 + 1, 'user', merchantA), { deviceId: deviceA.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'merchant-concurrent-' + index }))));
       expect(competing.some(result => result.status === 'fulfilled')).toBe(true);
       expect(competing.some(result => result.status === 'rejected')).toBe(true);
       for (const result of competing) if (result.status === 'rejected') expect(result.reason).toMatchObject({ status: 409 });
       const orderA = (await db.one('SELECT * FROM ar_rental_order WHERE merchant_id=1'))!;
       const payerA = principal(Number(orderA.user_id), 'user', merchantA);
-      const createdB = await runWithMerchant(merchantB, () => service.create(payerB, { deviceId: deviceB.id, priceVersion: 1, idempotencyKey: 'independent-merchant-b' }));
+      const secondPayer = shared ? payerA : payerB;
+      const entryB = shared ? merchantA : merchantB;
+      const createdB = await runWithMerchant(entryB, () => service.create(secondPayer, { deviceId: deviceB.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'independent-merchant-b', merchantId: 1, mchid: 'forged-account', paymentConfigId: 1 }));
       const orderB = (await db.one('SELECT * FROM ar_rental_order WHERE id=?', [createdB.rental.id]))!;
+      expect(orderB).toMatchObject({ merchant_id: 2, payment_config_id: 2, appid: appB, mch_id: 'synthetic-merchant-b' });
+      if (shared) expect(await runWithMerchant(merchantA, () => service.list(payerA, {}))).toMatchObject({ total: 2, items: [{ merchantId: 2, merchantName: '第二商户' }, { merchantId: 1, merchantName: '第一商户' }] });
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_slot'))!.total)).toBe(2);
-      await expect(runWithMerchant(merchantB, () => service.get(managerB, orderA.id))).rejects.toMatchObject({ status: 404 });
-      await expect(runWithMerchant(merchantB, () => service.create(payerB, { deviceId: deviceA.id, priceVersion: 1, idempotencyKey: 'wrong-merchant-reserve' }))).rejects.toMatchObject({ status: 409, code: 'MERCHANT_MISMATCH' });
+      await expect(runWithMerchant(merchantB, () => service.get(managerB, orderA.id))).rejects.toMatchObject({ status: shared ? 403 : 404 });
+      await expect(runWithMerchant(merchantB, () => service.create(payerB, { deviceId: deviceA.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'wrong-merchant-reserve' }))).rejects.toMatchObject(shared ? { status: 409 } : { status: 409, code: 'MERCHANT_MISMATCH' });
       await runWithMerchant(merchantA, () => service.payment(payerA, orderA.id));
-      await runWithMerchant(merchantB, () => service.payment(payerB, orderB.id));
-      await Promise.all([runWithMerchant(merchantA, () => service.syncPayment(payerA, orderA.id)), runWithMerchant(merchantB, () => service.syncPayment(payerB, orderB.id))]);
+      await runWithMerchant(entryB, () => service.payment(secondPayer, orderB.id));
+      await Promise.all([runWithMerchant(merchantA, () => service.syncPayment(payerA, orderA.id)), runWithMerchant(entryB, () => service.syncPayment(secondPayer, orderB.id))]);
+      const replacement = provider(appB, 'synthetic-replacement-merchant');
+      if (shared) { merchantB.client = replacement.client as any; merchantB.configId = 3; }
       first.timeoutNextRefund();
       const settlement = { refundMode: 'deposit', reason: '合成并发归还', idempotencyKey: 'merchant-a-settlement' };
       const endings = await Promise.allSettled([
@@ -103,6 +123,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
       expect(first.refunds.size).toBe(1);
       await runWithMerchant(merchantB, () => service.end(managerB, orderB.id, { ...settlement, idempotencyKey: 'merchant-b-settlement' }));
       expect(second.refunds.size).toBe(1);
+      expect(replacement.refunds.size).toBe(0);
       expect([...second.refunds.values()][0].amount).toEqual({ refund: 9000, total: 12000, currency: 'CNY' });
       merchantA.status = 'paused'; merchantB.status = 'paused';
       for (const refund of [...first.refunds.values(), ...second.refunds.values()]) refund.status = 'SUCCESS';
@@ -111,6 +132,34 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_slot'))!.total)).toBe(0);
       expect(Number((await db.one("SELECT COUNT(*) AS total FROM ar_rental_event WHERE event='REFUND_SUCCESS'"))!.total)).toBe(2);
       expect((await db.query('SELECT merchant_id,refund_status FROM ar_rental_order ORDER BY merchant_id')).map(row => ({ merchantId: Number(row.merchant_id), refund: row.refund_status }))).toEqual([{ merchantId: 1, refund: 'SUCCESS' }, { merchantId: 2, refund: 'SUCCESS' }]);
+      if (shared) {
+        merchantA.status = 'active'; merchantB.status = 'active';
+        const sameKey = await Promise.allSettled([deviceA, deviceB].map(device => runWithMerchant(merchantA, () => service.create(principal(1, 'user', merchantA), { deviceId: device.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'same-key-across-merchants' }))));
+        expect(sameKey.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+        for (const result of sameKey) if (result.status === 'rejected') expect(result.reason).toMatchObject({ status: 409 });
+        expect(Number((await db.one("SELECT COUNT(*) AS total FROM ar_rental_order WHERE idempotency_key='same-key-across-merchants'"))!.total)).toBe(1);
+        const reserved = (sameKey.find(result => result.status === 'fulfilled') as PromiseFulfilledResult<Row>).value;
+        const customer = principal(1, 'user', merchantA);
+        await runWithMerchant(merchantA, () => service.cancel(customer, reserved.rental.id));
+        merchantB.client = second.client as any; merchantB.configId = 2;
+        const active: Row[] = [];
+        for (const device of [deviceA, deviceB]) {
+          const created = await runWithMerchant(merchantA, () => service.create(customer, { deviceId: device.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'end-key-competition-device-' + device.id }));
+          await runWithMerchant(merchantA, () => service.payment(customer, created.rental.id));
+          await runWithMerchant(merchantA, () => service.syncPayment(customer, created.rental.id));
+          active.push((await db.one('SELECT * FROM ar_rental_order WHERE id=?', [created.rental.id]))!);
+        }
+        const root = principal(20, 'root', merchantA);
+        const endKey = 'same-root-end-key-across-merchants';
+        const closing = await Promise.allSettled(active.map(row => runWithMerchant(merchantA, () => service.end(root, row.id, { refundMode: 'deposit', reason: '合成跨商户并发归还', idempotencyKey: endKey }))));
+        expect(closing.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+        for (const result of closing) if (result.status === 'rejected') expect(result.reason).toMatchObject({ status: 409 });
+        expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_order WHERE ended_by=? AND end_key=?', [root.user.id, endKey]))!.total)).toBe(1);
+        expect(first.refunds.size + second.refunds.size).toBe(3);
+        const stillActive = (await db.one("SELECT * FROM ar_rental_order WHERE id IN (?,?) AND status='ACTIVE'", active.map(row => row.id)))!;
+        expect(stillActive.out_refund_no).toBeNull();
+        expect((await db.one('SELECT state FROM ar_rental_slot WHERE rental_id=?', [stillActive.id]))!.state).toBe('RENTED');
+      }
     } finally {
       await db?.close();
       await admin.query(`DROP DATABASE IF EXISTS ${database}`);

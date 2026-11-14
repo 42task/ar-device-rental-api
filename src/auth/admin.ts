@@ -2,6 +2,7 @@ import type { Database } from '../core/database';
 import type { Row } from '../core/contracts';
 import { ApiError } from '../core/errors';
 import { maskedPhone, normalizePhoneInput } from './phone';
+import { legacyAccountAdapter, loadAccountPermissions } from './identity';
 
 export async function bootstrapRoot(db: Database, userId: number, appId: string, expectedVerifiedPhone?: string): Promise<void> {
   if (!Number.isSafeInteger(userId) || userId < 1 || !/^wx[0-9a-f]{16}$/i.test(appId)) throw new ApiError(422, '用户编号或 AppID 无效');
@@ -14,10 +15,12 @@ export async function bootstrapRoot(db: Database, userId: number, appId: string,
     if (root) throw new ApiError(409, '系统已有 root，请由现有 root 管理权限');
     const user = await tx.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [userId, appId]);
     if (!user) throw new ApiError(404, '当前小程序用户不存在，请先登录小程序');
-    if ('merchant_id' in user && Number(user.merchant_id) !== 1) throw new ApiError(403, '最高管理员仅能从默认商户的已验证身份初始化');
+    const permissions = await loadAccountPermissions(tx, user);
+    if (permissions.merchant_id != null && Number(permissions.merchant_id) !== 1) throw new ApiError(403, '最高管理员仅能从平台已验证身份初始化');
     if (!await tx.one('SELECT user_id FROM ar_user_phone WHERE user_id=? AND appid=? AND phone_e164=? AND verified_ms>0 FOR UPDATE', [userId, appId, phone])) throw new ApiError(409, '已验证手机号绑定发生变化，请重新核实');
     await tx.execute(`UPDATE ar_user SET role='root',${'merchant_id' in user ? 'merchant_id=NULL,' : ''}updated_at=CURRENT_TIMESTAMP(3) WHERE id=?`, [userId]);
-    await tx.insert('ar_role_audit', { actor_user_id: null, target_user_id: userId, previous_role: user.role, next_role: 'root', source: 'console-bootstrap', reason: 'Explicit initial root bootstrap from server console' });
+    if (!legacyAccountAdapter(user)) await tx.execute("UPDATE ar_merchant_membership SET status='revoked',authorization_version=authorization_version+1,updated_ms=? WHERE user_id=? AND status='active'", [Date.now(), userId]);
+    await tx.insert('ar_role_audit', { actor_user_id: null, target_user_id: userId, previous_role: permissions.role, next_role: 'root', source: 'console-bootstrap', reason: 'Explicit initial root bootstrap from server console' });
   });
 }
 
@@ -25,9 +28,10 @@ export async function bootstrapRoot(db: Database, userId: number, appId: string,
 export async function findUserByVerifiedPhone(db: Database, phone: string, appId: string): Promise<{ userId: number; maskedNumber: string; role: string }> {
   if (!/^wx[0-9a-f]{16}$/i.test(appId)) throw new ApiError(422, 'AppID 无效');
   const normalized = normalizePhoneInput(phone);
-  const row = await db.one('SELECT p.user_id,p.phone_e164,p.country_code,u.role FROM ar_user_phone p INNER JOIN ar_user u ON u.id=p.user_id AND u.appid=p.appid WHERE p.appid=? AND p.phone_e164=? AND p.verified_ms>0', [appId, normalized]);
+  const row = await db.one('SELECT u.*,p.user_id,p.phone_e164,p.country_code FROM ar_user_phone p INNER JOIN ar_user u ON u.id=p.user_id WHERE p.appid=? AND p.phone_e164=? AND p.verified_ms>0', [appId, normalized]);
   if (!row) throw new ApiError(404, '未找到当前小程序中已授权验证该手机号的账号，请先在小程序完成手机号授权');
-  return { userId: Number(row.user_id), maskedNumber: maskedPhone(row.phone_e164, row.country_code), role: row.role };
+  const permissions = await loadAccountPermissions(db, row, Number(row.user_id));
+  return { userId: Number(row.user_id), maskedNumber: maskedPhone(row.phone_e164, row.country_code), role: permissions.role };
 }
 
 export async function bootstrapRootByPhone(db: Database, phone: string, appId: string): Promise<{ maskedNumber: string; role: 'root' }> {
@@ -41,7 +45,7 @@ export async function bootstrapRootByPhone(db: Database, phone: string, appId: s
 /** ROOT_PHONE authorizes only a server-verified binding, and only the first root. */
 export async function initializeRootFromVerifiedPhone(db: Database, user: Row, appId: string, configuredPhone: string): Promise<Row> {
   if (user.role === 'root' || !configuredPhone) return user;
-  if ('merchant_id' in user && Number(user.merchant_id) !== 1) return user;
+  if (user.merchant_id != null && Number(user.merchant_id) !== 1) return user;
   if (!await db.one('SELECT user_id FROM ar_user_phone WHERE user_id=? AND appid=? AND phone_e164=? AND verified_ms>0', [user.id, appId, configuredPhone])) return user;
   const existingRoot = await db.one("SELECT id FROM ar_user WHERE role='root' LIMIT 1");
   if (existingRoot) return Number(existingRoot.id) === Number(user.id) ? { ...user, role: 'root' } : user;
@@ -52,9 +56,12 @@ export async function initializeRootFromVerifiedPhone(db: Database, user: Row, a
     if (root) return Number(root.id) === Number(user.id) ? { ...user, role: 'root' } : user;
     const current = await tx.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [user.id, appId]);
     if (!current) throw new ApiError(401, '当前微信账号已失效，请重新登录');
+    const permissions = await loadAccountPermissions(tx, current);
+    if (permissions.merchant_id != null && Number(permissions.merchant_id) !== 1) return permissions;
     if (!await tx.one('SELECT user_id FROM ar_user_phone WHERE user_id=? AND appid=? AND phone_e164=? AND verified_ms>0 FOR UPDATE', [current.id, appId, configuredPhone])) return current;
     await tx.execute(`UPDATE ar_user SET role='root',${'merchant_id' in current ? 'merchant_id=NULL,' : ''}updated_at=CURRENT_TIMESTAMP(3) WHERE id=?`, [current.id]);
-    await tx.insert('ar_role_audit', { actor_user_id: null, target_user_id: current.id, previous_role: current.role, next_role: 'root', source: 'env-root-bootstrap', reason: 'Initial root bootstrap from verified phone matched against ROOT_PHONE' });
+    if (!legacyAccountAdapter(current)) await tx.execute("UPDATE ar_merchant_membership SET status='revoked',authorization_version=authorization_version+1,updated_ms=? WHERE user_id=? AND status='active'", [Date.now(), current.id]);
+    await tx.insert('ar_role_audit', { actor_user_id: null, target_user_id: current.id, previous_role: permissions.role, next_role: 'root', source: 'env-root-bootstrap', reason: 'Initial root bootstrap from verified phone matched against ROOT_PHONE' });
     return { ...user, role: 'root', ...('merchant_id' in current ? { merchant_id: null } : {}) };
   });
 }

@@ -86,7 +86,7 @@ export class AdminAuth {
     const row = await db.one(`SELECT * FROM ar_admin_login_challenge WHERE id=?${lock ? ' FOR UPDATE' : ''}`, [this.challengeId(ctx)]);
     if (!row) throw new ApiError(404, '登录二维码不存在');
     const entry = entryMerchant();
-    if (entry && (Number(row.merchant_id) !== entry.id || row.appid && row.appid !== entry.appId)) throw new ApiError(404, '登录二维码不属于当前商户');
+    if (entry && ((row.application_id != null ? Number(row.application_id) !== entry.id : Number(row.merchant_id) !== Number((entry as any).legacyMerchantId ?? entry.id)) || row.appid && row.appid !== entry.appId)) throw new ApiError(404, '登录二维码不属于当前小程序入口');
     if (browser) {
       const secret = this.cookie(ctx, BROWSER_COOKIE);
       if (!secret || !same(hash(secret), row.browser_hash) || row.origin !== this.origin(ctx)) throw new ApiError(401, '请在生成二维码的浏览器继续登录');
@@ -100,6 +100,14 @@ export class AdminAuth {
   private status(row: Row, details = false): Row {
     return { status: row.status, expiresAt: iso(row.expires_ms), ...(details ? { confirmationCode: row.confirmation_code, origin: row.origin } : {}) };
   }
+  private async managementMerchant(db: Database, user: Row): Promise<Row | undefined> {
+    const entry = entryMerchant(), selected = currentMerchant() ?? entry;
+    if (!entry || userRole(user) === 'root' || Number(user.merchant_id) === selected?.id) return publicMerchant();
+    const row = await db.one('SELECT * FROM ar_merchant WHERE id=?', [user.merchant_id]);
+    if (!row || row.app_id !== entry.appId) throw new ApiError(403, '所属商户未关联当前小程序');
+    return { id: Number(row.id), code: row.code, name: row.name, status: row.status, origin: row.origin, appId: row.app_id,
+      ...(row.active_config_id ? { configId: Number(row.active_config_id) } : {}) };
+  }
   private async create(ctx: Context): Promise<Row> {
     const origin = this.requireOrigin(ctx), id = randomBytes(16).toString('hex');
     const browserSecret = this.cookie(ctx, BROWSER_COOKIE) || randomBytes(32).toString('hex');
@@ -108,7 +116,7 @@ export class AdminAuth {
     await this.db.execute('DELETE FROM ar_admin_login_challenge WHERE expires_ms<? LIMIT 100', [now - 86_400_000]);
     await this.db.execute('DELETE FROM ar_admin_session WHERE expires_ms<? LIMIT 100', [now - 86_400_000]);
     const entry = entryMerchant();
-    if (entry) await this.db.execute('INSERT INTO ar_admin_login_challenge (id,browser_hash,origin,confirmation_code,status,created_ms,expires_ms,merchant_id,appid) VALUES (?,?,?,?,?,?,?,?,?)', [id, hash(browserSecret), origin, confirmationCode, 'pending', now, now + CHALLENGE_MS, entry.id, entry.appId]);
+    if (entry) await this.db.execute('INSERT INTO ar_admin_login_challenge (id,browser_hash,origin,confirmation_code,status,created_ms,expires_ms,merchant_id,appid,application_id) VALUES (?,?,?,?,?,?,?,?,?,?)', [id, hash(browserSecret), origin, confirmationCode, 'pending', now, now + CHALLENGE_MS, Number((entry as any).legacyMerchantId ?? entry.id), entry.appId, entry.id]);
     else await this.db.execute('INSERT INTO ar_admin_login_challenge (id,browser_hash,origin,confirmation_code,status,created_ms,expires_ms) VALUES (?,?,?,?,?,?,?)', [id, hash(browserSecret), origin, confirmationCode, 'pending', now, now + CHALLENGE_MS]);
     this.setCookie(ctx, BROWSER_COOKIE, browserSecret, CHALLENGE_MS);
     return { id, expiresAt: iso(now + CHALLENGE_MS), confirmationCode, qrcodeUrl: `/api${BASE}/challenges/${id}/qrcode` };
@@ -159,12 +167,13 @@ export class AdminAuth {
       if (entryMerchant()) { requireAccountScope(user); if (Number(user.auth_version) !== Number(row.auth_version)) throw new ApiError(401, '账号归属已变更，请重新扫码'); }
       requireManager(user);
       await requireVerifiedPhone(db, { user, appid: this.auth.appId, openid: user.openid, ...(entryMerchant() ? { identityId: Number(user.identity_id) } : {}) });
-      if (entryMerchant()) await db.execute('INSERT INTO ar_admin_session (id,user_id,appid,created_ms,expires_ms,merchant_id,identity_id,auth_version,origin) VALUES (?,?,?,?,?,?,?,?,?)', [hash(token), user.id, this.auth.appId, now, now + SESSION_MS, userRole(user) === 'root' ? null : Number(user.merchant_id), Number(user.identity_id), Number(user.auth_version), this.origin(ctx)]);
+      if (entryMerchant()) await db.execute('INSERT INTO ar_admin_session (id,user_id,appid,created_ms,expires_ms,merchant_id,identity_id,auth_version,origin,application_id) VALUES (?,?,?,?,?,?,?,?,?,?)', [hash(token), user.id, this.auth.appId, now, now + SESSION_MS, userRole(user) === 'root' ? null : Number(user.merchant_id), Number(user.identity_id), Number(user.auth_version), this.origin(ctx), entryMerchant()!.id]);
       else await db.execute('INSERT INTO ar_admin_session (id,user_id,appid,created_ms,expires_ms) VALUES (?,?,?,?,?)', [hash(token), user.id, this.auth.appId, now, now + SESSION_MS]);
       await db.execute("UPDATE ar_admin_login_challenge SET status='consumed',consumed_ms=? WHERE id=?", [now, row.id]);
       const previous = this.cookie(ctx, SESSION_COOKIE);
       if (previous) await db.execute('UPDATE ar_admin_session SET revoked_ms=? WHERE id=? AND revoked_ms IS NULL', [now, hash(previous)]);
-      return { user: publicUser(user), expiresAt: iso(now + SESSION_MS), ...(entryMerchant() ? { merchant: publicMerchant() } : {}) };
+      const managementMerchant = userRole(user) === 'root' ? null : await this.managementMerchant(db, user);
+      return { user: publicUser(user), expiresAt: iso(now + SESSION_MS), ...(entryMerchant() ? { entry: this.auth.publicEntry(), managementMerchant, merchant: managementMerchant ?? publicMerchant() } : {}) };
     });
     this.setCookie(ctx, SESSION_COOKIE, token, SESSION_MS);
     return result;
@@ -179,8 +188,8 @@ export class AdminAuth {
     if (!user || typeof user.openid !== 'string' || !user.openid) throw new ApiError(401, '当前微信账号已失效，请重新登录');
     if (entry) {
       requireAccountScope(user);
-      if (Number(row.auth_version ?? 0) !== Number(user.auth_version ?? 0) || row.origin && row.origin !== this.origin(ctx)
-        || !row.origin && (entry.id !== 1 || Number(user.auth_version) !== 0)
+      if (row.application_id != null && Number(row.application_id) !== entry.id || Number(row.auth_version ?? 0) !== Number(user.auth_version ?? 0) || row.origin && row.origin !== this.origin(ctx)
+        || !row.origin && (Number((entry as any).legacyMerchantId ?? entry.id) !== 1 || Number(user.auth_version) !== 0)
         || userRole(user) !== 'root' && Number(row.merchant_id) !== Number(user.merchant_id)) throw new ApiError(401, '账号归属或后台来源已变化，请重新扫码');
     }
     requireManager(user);
@@ -215,7 +224,11 @@ export class AdminAuth {
     route('POST', '/challenges/:id/scan', ctx => this.scan(ctx));
     route('POST', '/challenges/:id/confirm', ctx => this.confirm(ctx));
     route('POST', '/challenges/:id/consume', ctx => this.consume(ctx));
-    route('GET', '/session', async ctx => { const { principal, row } = await this.session(ctx); return { user: publicUser(principal.user), expiresAt: iso(row.expires_ms), ...(entryMerchant() ? { merchant: publicMerchant() } : {}) }; });
+    route('GET', '/session', async ctx => {
+      const { principal, row } = await this.session(ctx);
+      const managementMerchant = userRole(principal.user) === 'root' ? null : await this.managementMerchant(this.db, principal.user);
+      return { user: publicUser(principal.user), expiresAt: iso(row.expires_ms), ...(entryMerchant() ? { entry: this.auth.publicEntry(), managementMerchant, merchant: managementMerchant ?? publicMerchant() } : {}) };
+    });
     route('POST', '/logout', async ctx => {
       this.requireOrigin(ctx);
       const token = this.cookie(ctx, SESSION_COOKIE);

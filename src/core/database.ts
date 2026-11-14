@@ -15,7 +15,7 @@ export function identifier(value: string): string {
 export class Database {
   readonly pool: Pool;
   private readonly schema = new Map<string, Column[]>();
-  constructor(pool?: Pool, private readonly connection?: PoolConnection) {
+  constructor(pool?: Pool, private readonly connection?: PoolConnection, private readonly transactionBound = false) {
     this.pool = pool ?? mysql.createPool({
       host: process.env.MYSQL_HOST || '127.0.0.1',
       port: Number(process.env.MYSQL_PORT || 3306),
@@ -74,20 +74,22 @@ export class Database {
   }
   async transaction<T>(operation: (db: Database) => Promise<T>): Promise<T> {
     const existing = this.active();
-    if (existing) {
+    const ambient = transactions.getStore();
+    const nested = !!existing && (this.transactionBound || ambient?.pool === this.pool && ambient.connection === existing);
+    if (existing && nested) {
       const name = `ar_tx_${++savepoint}`;
       await existing.query(`SAVEPOINT ${name}`);
-      try { const value = await operation(new Database(this.pool, existing)); await existing.query(`RELEASE SAVEPOINT ${name}`); return value; }
+      try { const value = await operation(new Database(this.pool, existing, true)); await existing.query(`RELEASE SAVEPOINT ${name}`); return value; }
       catch (error) { await existing.query(`ROLLBACK TO SAVEPOINT ${name}`); await existing.query(`RELEASE SAVEPOINT ${name}`); throw error; }
     }
-    const connection = await this.pool.getConnection();
+    const connection = existing ?? await this.pool.getConnection();
     try {
       await connection.beginTransaction();
-      const value = await transactions.run({ pool: this.pool, connection }, () => operation(new Database(this.pool, connection)));
+      const value = await transactions.run({ pool: this.pool, connection }, () => operation(new Database(this.pool, connection, true)));
       await connection.commit();
       return value;
     } catch (error) { await connection.rollback(); throw error; }
-    finally { connection.release(); }
+    finally { if (!existing) connection.release(); }
   }
   async withConnection<T>(operation: (db: Database) => Promise<T>): Promise<T> {
     const connection = await this.pool.getConnection();

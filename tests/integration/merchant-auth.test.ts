@@ -7,6 +7,7 @@ import { ApiRouter } from '../../src/core/router';
 import { migrate } from '../../src/core/migrations';
 import type { Row } from '../../src/core/contracts';
 import { runWithMerchant, type MerchantRuntime } from '../../src/merchants/context';
+import { seedVenue } from './venue-fixtures';
 
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL explicit merchant account assignment', () => {
   it('consumes a transfer once across nodes and checks unfinished orders without locking their rows', async () => {
@@ -23,6 +24,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL explicit mercha
       await db.insert('ar_merchant', { id: 2, code: 'second', name: 'Synthetic second merchant', status: 'active', origin: 'https://d1.example.test', hostname: 'd1.example.test', app_id: appB, created_ms: Date.now(), updated_ms: Date.now() });
       await db.insert('ar_user', { id: 1, appid: appA, openid: 'root', role: 'root', merchant_id: null });
       for (const id of [2, 3]) await db.insert('ar_user', { id, appid: appA, openid: 'target-' + id, role: 'manager', merchant_id: 1 });
+      for (const id of [2, 3]) await db.insert('ar_merchant_membership', { user_id: id, merchant_id: 1, role: 'manager', status: 'active', authorization_version: 1, updated_ms: Date.now() });
       const client = (appId: string) => ({ config: { appId }, codeSession: async (code: string) => ({ openid: code }) });
       const a = client(appA), b = client(appB);
       const runtime = (id: number, appId: string, payment: any): MerchantRuntime => ({ id, code: id === 1 ? 'default' : 'second', name: '商户' + id, origin: id === 1 ? 'https://d.4mr.cn' : 'https://d1.example.test', appId, status: 'active', configId: id, client: payment });
@@ -52,9 +54,11 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL explicit mercha
 
       // An order return can hold order -> user locks. Assignment holds the user
       // lock, so its conservative unfinished-business read must not lock order.
+      await runWithMerchant(first, () => nodes[0].login('target-3'));
       const blocked = await assign(3);
       await confirm(3, blocked);
-      const device = await db.insert('ar_device', { uuid: 'synthetic-merchant-auth-device', name: 'Synthetic device', device_type: 'ios', merchant_id: 1 });
+      const venue = await seedVenue(db);
+      const device = await db.insert('ar_device', { uuid: 'synthetic-merchant-auth-device', name: 'Synthetic device', device_type: 'ios', merchant_id: 1, venue_id: venue.id });
       const now = Date.now();
       const order = await db.insert('ar_rental_order', { device_id: device.id, device_uuid: device.uuid, device_name: device.name, user_id: 3, appid: appA, payer_openid: 'target-3', mch_id: '1234567890',
         use_fee_cents: 20, deposit_cents: 80, total_cents: 100, price_version: 1, status: 'ACTIVE', payment_status: 'SUCCESS', out_trade_no: randomBytes(16).toString('hex'), idempotency_key: 'synthetic-integration', expires_ms: now + 60000, created_ms: now, updated_ms: now, merchant_id: 1, payment_config_id: 1 });

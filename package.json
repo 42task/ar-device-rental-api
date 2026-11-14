@@ -6,12 +6,13 @@
   "engines": { "node": ">=24 <25" },
   "scripts": {
     "dev": "tsx watch src/main.ts",
-    "build": "node --check admin/admin.js && tsc -p tsconfig.json",
+    "check:admin": "node scripts/check-admin.mjs",
+    "build": "npm run check:admin && tsc -p tsconfig.json",
     "start": "node dist/src/main.js",
     "migrate": "node dist/scripts/migrate.js",
     "admin": "node dist/scripts/admin.js",
     "test": "vitest run",
-    "test:integration": "RUN_INTEGRATION=1 vitest run tests/integration"
+    "test:integration": "RUN_INTEGRATION=1 vitest run tests/integration --no-file-parallelism"
   },
   "dependencies": {
     "dotenv": "17.4.2",

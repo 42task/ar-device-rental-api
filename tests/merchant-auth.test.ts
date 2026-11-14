@@ -18,26 +18,28 @@ async function fixture() {
   sqlite.exec(`CREATE TABLE ar_user(id INTEGER PRIMARY KEY AUTOINCREMENT,appid TEXT,openid TEXT,unionid TEXT,nickname TEXT,avatar TEXT,tel TEXT,role TEXT DEFAULT 'user',merchant_id INTEGER DEFAULT 1,auth_version INTEGER DEFAULT 0,updated_at TEXT,UNIQUE(appid,openid));
     INSERT INTO ar_user(id,appid,openid,role,merchant_id) VALUES(1,'${appA}','root','root',NULL),(2,'${appA}','target','manager',1),(3,'${appB}','occupied','user',2);
     CREATE UNIQUE INDEX uq_root ON ar_user((CASE WHEN role='root' THEN 1 ELSE NULL END));
+    CREATE TABLE ar_merchant_membership(user_id INTEGER PRIMARY KEY,merchant_id INTEGER,role TEXT,status TEXT,authorization_version INTEGER,updated_ms INTEGER);
+    INSERT INTO ar_merchant_membership VALUES(2,1,'manager','active',1,1800000000000);
     CREATE TABLE ar_user_wechat_identity(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,appid TEXT,openid TEXT,unionid TEXT,status TEXT DEFAULT 'active',UNIQUE(appid,openid));
     INSERT INTO ar_user_wechat_identity(id,user_id,appid,openid) SELECT id,id,appid,openid FROM ar_user;
     CREATE TABLE ar_merchant(id INTEGER PRIMARY KEY,code TEXT,name TEXT,status TEXT,origin TEXT,app_id TEXT);
-    INSERT INTO ar_merchant VALUES(1,'default','商户一','active','https://d.example.test','${appA}'),(2,'second','商户二','active','https://d1.example.test','${appB}');
+    INSERT INTO ar_merchant VALUES(1,'default','商户一','active','https://d.example.test','${appA}'),(2,'second','商户二','active','https://d1.example.test','${appB}'),(3,'shared','共享小程序商户','active','https://d.example.test','${appA}');
     CREATE TABLE ar_admin_guard(id INTEGER PRIMARY KEY); INSERT INTO ar_admin_guard VALUES(1);
     CREATE TABLE ar_role_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_user_id INTEGER,target_user_id INTEGER,previous_role TEXT,next_role TEXT,source TEXT,reason TEXT,merchant_id INTEGER);
     CREATE TABLE ar_merchant_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_user_id INTEGER,merchant_id INTEGER,previous_merchant_id INTEGER,target_id INTEGER,action TEXT,reason TEXT,created_ms INTEGER);
     CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT UNIQUE,identity_id INTEGER,UNIQUE(appid,phone_e164));
     INSERT INTO ar_user_phone VALUES(1,'${appA}','+8613700137000','86',1800000000000,'${'a'.repeat(64)}',1),(2,'${appA}','+8613800138000','86',1800000000000,'${'b'.repeat(64)}',2);
     CREATE TABLE ar_user_phone_history(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,identity_id INTEGER,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT,archived_ms INTEGER);
-    CREATE TABLE ar_user_merchant_binding(id TEXT PRIMARY KEY,user_id INTEGER,source_merchant_id INTEGER,target_merchant_id INTEGER,target_role TEXT,created_by INTEGER,reason TEXT,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,source_confirmed_ms INTEGER);
+    CREATE TABLE ar_user_merchant_binding(id TEXT PRIMARY KEY,user_id INTEGER,source_merchant_id INTEGER,source_appid TEXT,source_auth_version INTEGER,target_merchant_id INTEGER,target_role TEXT,created_by INTEGER,reason TEXT,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,source_confirmed_ms INTEGER);
     CREATE TABLE ar_rental_order(id INTEGER PRIMARY KEY,user_id INTEGER,status TEXT,refund_amount_cents INTEGER DEFAULT 0,refund_status TEXT,merchant_id INTEGER,appid TEXT,payer_openid TEXT,mch_id TEXT);
-    CREATE TABLE ar_admin_login_challenge(id TEXT PRIMARY KEY,browser_hash TEXT,origin TEXT,confirmation_code TEXT,status TEXT,scanned_user_id INTEGER,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,qrcode_image BLOB,merchant_id INTEGER DEFAULT 1,appid TEXT,auth_version INTEGER);
-    CREATE TABLE ar_admin_session(id TEXT PRIMARY KEY,user_id INTEGER,appid TEXT,created_ms INTEGER,expires_ms INTEGER,revoked_ms INTEGER,merchant_id INTEGER DEFAULT 1,identity_id INTEGER,auth_version INTEGER DEFAULT 0,origin TEXT);`);
+    CREATE TABLE ar_admin_login_challenge(id TEXT PRIMARY KEY,browser_hash TEXT,origin TEXT,confirmation_code TEXT,status TEXT,scanned_user_id INTEGER,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,qrcode_image BLOB,merchant_id INTEGER DEFAULT 1,appid TEXT,auth_version INTEGER,application_id INTEGER);
+    CREATE TABLE ar_admin_session(id TEXT PRIMARY KEY,user_id INTEGER,appid TEXT,created_ms INTEGER,expires_ms INTEGER,revoked_ms INTEGER,merchant_id INTEGER DEFAULT 1,identity_id INTEGER,auth_version INTEGER DEFAULT 0,origin TEXT,application_id INTEGER);`);
   const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/CURRENT_TIMESTAMP\(3\)/g, 'CURRENT_TIMESTAMP').replace(/CAST\((u\.)?id AS CHAR\)/g, 'CAST($1id AS TEXT)').replace(/^(DELETE FROM .*?) LIMIT 100$/, '$1');
   const db = {
     async query(query: string, values: any[] = []) { return sqlite.prepare(sql(query)).all(...values) as Row[]; },
     async one(query: string, values: any[] = []) { return (await this.query(query, values))[0] ?? null; },
     async execute(query: string, values: any[] = []) { const result = sqlite.prepare(sql(query)).run(...values); return { affectedRows: Number(result.changes), insertId: Number(result.lastInsertRowid) }; },
-    async insert(table: string, data: Row) { const entries = Object.entries(data); const result = await this.execute(`INSERT INTO ${table} (${entries.map(([name]) => name)}) VALUES (${entries.map(() => '?')})`, entries.map(([, value]) => value)); return (await this.one(`SELECT * FROM ${table} WHERE id=?`, [data.id ?? result.insertId]))!; },
+    async insert(table: string, data: Row) { const entries = Object.entries(data); const result = await this.execute(`INSERT INTO ${table} (${entries.map(([name]) => name)}) VALUES (${entries.map(() => '?')})`, entries.map(([, value]) => value)); const primary = table === 'ar_merchant_membership' ? 'user_id' : 'id'; return (await this.one(`SELECT * FROM ${table} WHERE ${primary}=?`, [data[primary] ?? result.insertId]))!; },
     async transaction<T>(operation: (tx: any) => Promise<T>): Promise<T> { sqlite.exec('BEGIN'); try { const result = await operation(this); sqlite.exec('COMMIT'); return result; } catch (error) { sqlite.exec('ROLLBACK'); throw error; } },
   };
   let now = 1_800_000_000_000;
@@ -45,6 +47,7 @@ async function fixture() {
   const a = client(appA), b = client(appB);
   const merchant = (id: number, appId: string, origin: string, payment: any): MerchantRuntime => ({ id, code: id === 1 ? 'default' : 'second', name: '商户' + id, status: 'active', appId, origin, client: payment, configId: id });
   const first = merchant(1, appA, 'https://d.example.test', a), second = merchant(2, appB, 'https://d1.example.test', b);
+  const shared: MerchantRuntime = { ...first, id: 3, code: 'shared', name: '共享小程序商户', configId: 3 };
   const auth = new RentalAuth(db as unknown as Database, a as any, { jwtSecret: key, now: () => now });
   const admin = new AdminAuth(db as unknown as Database, a as any, auth, { now: () => now }); auth.webAuthenticate = admin.authenticate;
   const phone = new PhoneBinding(db as unknown as Database, a as any, auth, () => now), router = new ApiRouter(); auth.registerAuth(router); admin.register(router);
@@ -60,7 +63,7 @@ async function fixture() {
     return request;
   };
   const login = async (runtime: MerchantRuntime, code: string, bindToken?: unknown) => {
-    const result = await runWithMerchant(runtime, () => auth.login(code, bindToken));
+    const result = await withMerchant({ entry: { ...runtime, legacyMerchantId: runtime.id, status: 'active' }, merchant: runtime }, () => auth.login(code, bindToken));
     if (result.user.id === 2) { sourceToken = result.token.accessToken; sourceRuntime = runtime; }
     return result;
   };
@@ -74,17 +77,154 @@ async function fixture() {
     const session = await route('POST', 'admin/auth/challenges/:id/consume')(consumeCtx) as Row;
     return { session, cookie: cookie(consumeCtx, 'ar_admin_session'), challenge };
   });
-  return { db, auth, admin, phone, a, b, first, second, root, target, ctx, route, assign, confirmBinding, login, authenticate, adminLogin, advance(ms: number) { now += ms; } };
+  const member = async (userId: number, merchantId: number, role = 'manager') => {
+    await db.execute('INSERT INTO ar_merchant_membership(user_id,merchant_id,role,status,authorization_version,updated_ms) VALUES(?,?,?,?,?,?)', [userId, merchantId, role, 'active', 1, now]);
+    await db.execute('UPDATE ar_user SET role=?,merchant_id=? WHERE id=?', [role, merchantId, userId]);
+  };
+  return { db, auth, admin, phone, a, b, first, second, shared, root, target, ctx, route, assign, confirmBinding, login, authenticate, adminLogin, member, advance(ms: number) { now += ms; } };
 }
 
 describe('merchant account identities and explicit assignment', () => {
+  it('takes staff authority from membership rather than compatibility role and ownership fields', async () => {
+    const f = await fixture(), consumer = await f.login(f.first, 'projection-only');
+    await f.db.execute("UPDATE ar_user SET role='adminer',merchant_id=1 WHERE id=?", [consumer.user.id]);
+    expect((await f.authenticate(f.first, consumer.token.accessToken)).user).toMatchObject({ role: 'user', merchant_id: null });
+    await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, consumer.token.accessToken)))).rejects.toMatchObject({ status: 403 });
+    await f.db.execute("UPDATE ar_user SET role='user',merchant_id=NULL WHERE id=2");
+    expect((await f.authenticate(f.first, f.target.token.accessToken)).user).toMatchObject({ role: 'manager', merchant_id: 1 });
+    await f.db.execute("UPDATE ar_merchant_membership SET status='revoked',authorization_version=2 WHERE user_id=2");
+    expect((await f.authenticate(f.first, f.target.token.accessToken)).user).toMatchObject({ role: 'user', merchant_id: null });
+  });
+  it('separates platform consumers from merchant employee lists and restricts first staff grants to root', async () => {
+    const f = await fixture(), consumer = await f.login(f.first, 'platform-consumer');
+    const employeeList = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, f.root.token.accessToken))) as Row;
+    expect(employeeList).toMatchObject({ scope: 'employees', items: [{ id: 2, role: 'manager' }] });
+    expect(employeeList.items.some((row: Row) => row.id === consumer.user.id)).toBe(false);
+    const platformCtx = f.ctx(f.first, f.root.token.accessToken); platformCtx.query.scope = 'platform';
+    const platform = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(platformCtx)) as Row;
+    expect(platform.items.map((row: Row) => row.id)).toEqual([consumer.user.id]);
+    const admin = await f.login(f.first, 'local-admin'); await f.member(admin.user.id, 1, 'adminer');
+    const adminToken = (await f.login(f.first, 'local-admin')).token.accessToken;
+    await expect(runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, adminToken, { role: 'manager' }, { id: String(consumer.user.id) })))).rejects.toMatchObject({ status: 403 });
+    const denied = f.ctx(f.first, adminToken); denied.query.scope = 'platform';
+    await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/users')(denied))).rejects.toMatchObject({ status: 403 });
+    expect(await runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, f.root.token.accessToken, { role: 'manager' }, { id: String(consumer.user.id) })))).toMatchObject({ role: 'manager', merchantId: 1 });
+    await expect(f.authenticate(f.first, consumer.token.accessToken)).rejects.toMatchObject({ status: 401 });
+    const identity = await f.login(f.first, 'platform-consumer');
+    expect(identity).toMatchObject({ entry: { id: 1, appId: appA }, managementMerchant: { id: 1 }, merchant: { id: 1 }, user: { merchantId: 1 } });
+  });
+  it('revokes pending assignments, JWTs, browser sessions and scanned challenges when current staff authority is removed', async () => {
+    const f = await fixture(), browser = await f.adminLogin(f.target.token.accessToken);
+    const pending = await f.assign({ merchantId: 3, role: 'adminer', reason: 'Synthetic pending grant before revocation' });
+    await f.db.execute("INSERT INTO ar_admin_login_challenge(id,status,scanned_user_id) VALUES('synthetic-revocable-challenge','confirmed',2)");
+    const revoked = await runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, f.root.token.accessToken, { role: 'user' }, { id: '2' })));
+    expect(revoked).toMatchObject({ role: 'user', merchantId: null });
+    expect(await f.db.one('SELECT role,merchant_id,auth_version FROM ar_user WHERE id=2')).toMatchObject({ role: 'user', merchant_id: null, auth_version: 1 });
+    expect(await f.db.one('SELECT status,authorization_version FROM ar_merchant_membership WHERE user_id=2')).toMatchObject({ status: 'revoked', authorization_version: 2 });
+    await expect(f.authenticate(f.first, f.target.token.accessToken)).rejects.toMatchObject({ status: 401 });
+    await expect(runWithMerchant(f.first, () => f.auth.refresh(f.target.token.refreshToken))).rejects.toMatchObject({ status: 401 });
+    await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, browser.cookie)))).rejects.toMatchObject({ status: 401 });
+    await expect(f.login(f.first, 'target', pending.binding.token)).rejects.toMatchObject({ status: 409 });
+    expect((await f.db.one("SELECT status FROM ar_admin_login_challenge WHERE id='synthetic-revocable-challenge'"))!.status).toBe('cancelled');
+    const fresh = await f.login(f.first, 'target');
+    expect(fresh).toMatchObject({ user: { role: 'user', merchantId: null }, managementMerchant: null });
+    await expect(f.confirmBinding(pending.binding.token, fresh.token.accessToken)).rejects.toMatchObject({ status: 409 });
+    const renewed = await f.assign({ merchantId: 3, role: 'adminer', reason: 'Synthetic new authorization after revocation' });
+    expect((await f.login(f.first, 'target', renewed.binding.token)).user).toMatchObject({ role: 'adminer', merchantId: 3 });
+  });
+  it('rejects a version-stale invitation even if its expiry was not cleared', async () => {
+    const f = await fixture(), pending = await f.assign({ merchantId: 3, role: 'adminer', reason: 'Synthetic grant version check' });
+    await f.db.execute('UPDATE ar_user SET auth_version=auth_version+1 WHERE id=2');
+    await expect(f.login(f.first, 'target', pending.binding.token)).rejects.toMatchObject({ status: 409 });
+    expect((await f.db.one('SELECT merchant_id FROM ar_merchant_membership WHERE user_id=2'))!.merchant_id).toBe(1);
+  });
+  it('lets root list and initially authorize consumers in the selected application using verified identities', async () => {
+    const f = await fixture(), onlyA = await f.login(f.first, 'application-a-only');
+    // A migrated account retains its original profile AppID while the active
+    // identity is authoritative for the selected independent application.
+    await f.db.execute('UPDATE ar_user SET appid=?,merchant_id=NULL WHERE id=3', [appA]);
+    const selected = <T>(operation: () => Promise<T>) => withMerchant({ entry: f.first, merchant: f.second }, operation);
+    const context = f.ctx(f.first, f.root.token.accessToken); context.query.scope = 'platform';
+    const list = await selected(() => f.route('GET', 'admin/users')(context)) as Row;
+    expect(list.items.map((row: Row) => row.id)).toEqual([3]);
+    await expect(selected(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, f.root.token.accessToken, { role: 'manager' }, { id: String(onlyA.user.id) })))).rejects.toMatchObject({ status: 409 });
+    expect(await selected(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, f.root.token.accessToken, { role: 'manager' }, { id: '3' })))).toMatchObject({ id: 3, role: 'manager', merchantId: 2 });
+    expect((await f.login(f.second, 'occupied')).user).toMatchObject({ id: 3, role: 'manager', merchantId: 2 });
+    expect((await f.db.one('SELECT appid FROM ar_user WHERE id=3'))!.appid).toBe(appA);
+  });
+  it('assigns staff into and out of a shared merchant through the same AppID with explicit source consent', async () => {
+    const f = await fixture(), oldAdmin = await f.adminLogin(f.target.token.accessToken);
+    const requested = await f.assign({ merchantId: 3, role: 'adminer', reason: '同小程序明确分配到共享商户' }, f.root.token.accessToken, false);
+    await expect(f.login(f.first, 'target', requested.binding.token)).rejects.toMatchObject({ status: 403 });
+    await f.confirmBinding(requested.binding.token);
+    const bound = await f.login(f.first, 'target', requested.binding.token);
+    expect(bound).toMatchObject({ appId: appA, user: { id: 2, merchantId: 3, role: 'adminer' }, merchant: { id: 3, name: '共享小程序商户' } });
+    expect((await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=2'))!).toEqual({ merchant_id: 3, auth_version: 1 });
+    expect(await f.db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=2')).toHaveLength(1);
+    await expect(f.authenticate(f.first, f.target.token.accessToken)).rejects.toMatchObject({ status: 401 });
+    await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, oldAdmin.cookie)))).rejects.toMatchObject({ status: 401 });
+    await expect(f.login(f.first, 'target', requested.binding.token)).rejects.toMatchObject({ status: 409 });
+    const returned = await f.assign({ merchantId: 1, role: 'manager', reason: '同小程序从共享商户明确调回' });
+    const rebound = await f.login(f.first, 'target', returned.binding.token);
+    expect(rebound).toMatchObject({ user: { id: 2, merchantId: 1, role: 'manager' }, merchant: { id: 1 } });
+    expect(await f.db.query('SELECT merchant_id,previous_merchant_id FROM ar_merchant_audit ORDER BY id')).toEqual([{ merchant_id: 3, previous_merchant_id: 1 }, { merchant_id: 1, previous_merchant_id: 3 }]);
+    expect((await f.db.one('SELECT auth_version FROM ar_user WHERE id=2'))!.auth_version).toBe(2);
+  });
+  it('keeps platform registration independent of business status and blocks new identities when the application is paused', async () => {
+    const f = await fixture();
+    f.first.status = 'paused';
+    await f.db.execute("UPDATE ar_merchant SET status='paused' WHERE id=1");
+    const customer = await f.login(f.first, 'owner-paused-shared-customer');
+    expect(customer.user).toMatchObject({ merchantId: null, role: 'user' });
+    await f.db.execute("UPDATE ar_merchant SET status='paused' WHERE app_id=?", [appA]);
+    expect((await f.login(f.first, 'all-businesses-paused-customer')).user.merchantId).toBeNull();
+    await expect(withMerchant({ entry: { ...f.first, legacyMerchantId: 1, status: 'paused' }, merchant: f.first }, () => f.auth.login('application-paused-new-customer'))).rejects.toMatchObject({ status: 403 });
+    expect((await f.login(f.first, 'owner-paused-shared-customer')).user.id).toBe(customer.user.id);
+  });
+  it('reuses one AppID identity and verified phone across shared merchants without transferring the account', async () => {
+    const f = await fixture(), customer = await f.login(f.first, 'shared-customer');
+    f.a.phoneNumber.mockResolvedValueOnce({ phoneE164: '+8613900139000', countryCode: '86' });
+    const principal = await f.authenticate(f.first, customer.token.accessToken);
+    await runWithMerchant(f.first, () => f.phone.bind(principal, 'shared-customer-phone-code'));
+    const shared = await f.authenticate(f.shared, customer.token.accessToken);
+    expect(shared).toMatchObject({ appid: appA, merchantId: 3, user: { id: customer.user.id, merchant_id: null, role: 'user' } });
+    expect(await runWithMerchant(f.shared, () => f.phone.statusFor(shared))).toMatchObject({ verified: true });
+    expect((await f.login(f.shared, 'shared-customer')).user).toMatchObject({ id: customer.user.id, merchantId: null });
+    expect((await runWithMerchant(f.shared, () => f.auth.refresh(customer.token.refreshToken))).user.id).toBe(customer.user.id);
+    expect(await f.db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=?', [customer.user.id])).toHaveLength(1);
+    expect(await f.db.query('SELECT * FROM ar_user_merchant_binding')).toHaveLength(0);
+    await expect(f.authenticate(f.second, customer.token.accessToken)).rejects.toMatchObject({ status: 401 });
+    await expect(withMerchant({ entry: f.first, merchant: f.second }, () => f.auth.authenticateBearer(f.ctx(f.first, customer.token.accessToken)))).rejects.toMatchObject({ status: 403 });
+  });
+  it('lets shared-entry staff log in while keeping user management within their own merchant', async () => {
+    const f = await fixture(), registered = await f.login(f.shared, 'shared-staff');
+    await f.member(registered.user.id, 3, 'adminer');
+    const staff = await f.login(f.first, 'shared-staff');
+    expect(staff.user).toMatchObject({ id: registered.user.id, merchantId: 3, role: 'adminer' });
+    f.a.phoneNumber.mockResolvedValueOnce({ phoneE164: '+8613900139000', countryCode: '86' });
+    await runWithMerchant(f.first, async () => f.phone.bind(await f.authenticate(f.first, staff.token.accessToken), 'shared-staff-phone-code'));
+    const admin = await f.adminLogin(staff.token.accessToken);
+    expect(admin.session).toMatchObject({ user: { id: staff.user.id, merchantId: 3 }, merchant: { id: 3, appId: appA } });
+    const session = await runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, admin.cookie))) as Row;
+    expect(session.merchant.id).toBe(3);
+    await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, staff.token.accessToken)))).rejects.toMatchObject({ status: 403 });
+    await expect(runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'user' }, { id: '2' })))).rejects.toMatchObject({ status: 403 });
+    const member = await f.login(f.shared, 'shared-member');
+    await f.member(member.user.id, 3, 'manager');
+    const own = (operation: () => Promise<unknown>) => withMerchant({ entry: f.first, merchant: f.shared }, operation);
+    const listed = await own(() => f.route('GET', 'admin/users')(f.ctx(f.first, staff.token.accessToken))) as Row;
+    expect(listed.items.map((user: Row) => user.id)).toEqual([member.user.id]);
+    expect(await own(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'manager' }, { id: String(member.user.id) })))).toMatchObject({ id: member.user.id, role: 'manager' });
+    await expect(own(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'user' }, { id: '2' })))).rejects.toMatchObject({ status: 409 });
+    expect((await f.db.one('SELECT role,merchant_id FROM ar_user WHERE id=2'))!).toMatchObject({ role: 'manager', merchant_id: 1 });
+  });
   it('keeps independent AppID identities and never links equal OpenIDs or UnionIDs across merchants', async () => {
     const f = await fixture();
     f.a.codeSession.mockResolvedValueOnce({ openid: 'new-a', unionid: 'same-union' } as any);
     f.b.codeSession.mockResolvedValueOnce({ openid: 'new-a', unionid: 'same-union' } as any);
     const a = await f.login(f.first, 'a'), b = await f.login(f.second, 'b');
     expect(a.user.id).not.toBe(b.user.id);
-    expect(a.user).toMatchObject({ merchantId: 1, role: 'user' }); expect(b.user).toMatchObject({ merchantId: 2, role: 'user' });
+    expect(a.user).toMatchObject({ merchantId: null, role: 'user' }); expect(b.user).toMatchObject({ merchantId: null, role: 'user' });
     await expect(f.authenticate(f.second, a.token.accessToken)).rejects.toMatchObject({ status: 401 });
     expect(f.b.codeSession).toHaveBeenCalledWith('b');
   });
@@ -182,16 +322,17 @@ describe('merchant account identities and explicit assignment', () => {
     await expect(f.login(f.second, 'new-target-b')).rejects.toMatchObject({ status: 401 });
     expect(await f.db.query("SELECT * FROM ar_user_wechat_identity WHERE user_id=2 AND status='active'")).toHaveLength(1);
   });
-  it('keeps existing paused-merchant identities and management sessions usable for historical business while refusing new registration', async () => {
+  it('keeps paused-merchant identities and management sessions usable without pausing application registration', async () => {
     const f = await fixture(), session = await f.adminLogin(f.target.token.accessToken);
     f.first.status = 'paused';
+    await f.db.execute("UPDATE ar_merchant SET status='paused' WHERE app_id=?", [appA]);
     expect((await f.authenticate(f.first, f.target.token.accessToken)).user.role).toBe('manager');
     expect((await runWithMerchant(f.first, () => f.auth.refresh(f.target.token.refreshToken))).user.id).toBe(2);
     expect((await f.login(f.first, 'target')).user.id).toBe(2);
     const restored = await runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, session.cookie))) as Row;
     expect(restored.user.role).toBe('manager');
-    await expect(f.login(f.first, 'unregistered')).rejects.toMatchObject({ status: 403 });
-    expect(await f.db.query("SELECT * FROM ar_user WHERE openid='unregistered'")).toHaveLength(0);
+    expect((await f.login(f.first, 'unregistered')).user.merchantId).toBeNull();
+    expect(await f.db.query("SELECT * FROM ar_user WHERE openid='unregistered'")).toHaveLength(1);
   });
   it('allows transfer after compensation has fully refunded while retaining the original order', async () => {
     const f = await fixture();

@@ -6,6 +6,7 @@ import { requireManager } from '../core/roles';
 import type { ApiRouter } from '../core/router';
 import type { RentalService } from '../rentals/service';
 import { currentMerchant } from '../merchants/context';
+import { requireMerchantManagementScope } from '../auth/identity';
 
 const statuses = new Set(['PENDING_PAYMENT', 'ACTIVE', 'ENDED', 'CANCELLED', 'COMPENSATING']);
 
@@ -14,6 +15,7 @@ export function registerManagement(router: ApiRouter, db: Database, auth: Rental
   const principal = async (ctx: Context) => {
     const identity = await auth.authenticate(ctx);
     requireManager(identity.user);
+    requireMerchantManagementScope(identity.user);
     return identity;
   };
   router.add('GET', '/v2/rental/admin/overview', async ctx => {
@@ -21,12 +23,12 @@ export function registerManagement(router: ApiRouter, db: Database, auth: Rental
     const merchant = currentMerchant();
     const [deviceCounts, orderCounts] = await Promise.all([
       db.one(`SELECT COUNT(*) AS total,
-        COALESCE(SUM(s.device_id IS NULL AND COALESCE(c.enabled,0)=1),0) AS available,
-        COALESCE(SUM(s.device_id IS NULL AND COALESCE(c.enabled,0)=0),0) AS disabled,
+        COALESCE(SUM(s.device_id IS NULL AND COALESCE(c.enabled,0)=1 AND v.status='active'),0) AS available,
+        COALESCE(SUM(s.device_id IS NULL AND (COALESCE(c.enabled,0)=0 OR v.status IS NULL OR v.status<>'active')),0) AS disabled,
         COALESCE(SUM(s.state='RESERVED'),0) AS reserved,
         COALESCE(SUM(s.state='RENTED'),0) AS rented,
         COALESCE(SUM(s.state='SETTLING'),0) AS settling
-        FROM ar_device d LEFT JOIN ar_rental_config c ON c.device_id=d.id LEFT JOIN ar_rental_slot s ON s.device_id=d.id${merchant ? ' WHERE d.merchant_id=?' : ''}`, merchant ? [merchant.id] : []),
+        FROM ar_device d LEFT JOIN ar_venue v ON v.id=d.venue_id AND v.merchant_id=d.merchant_id LEFT JOIN ar_rental_config c ON c.device_id=d.id LEFT JOIN ar_rental_slot s ON s.device_id=d.id${merchant ? ' WHERE d.merchant_id=?' : ''}`, merchant ? [merchant.id] : []),
       db.one(`SELECT COUNT(*) AS total, COALESCE(SUM(status='ACTIVE'),0) AS active,
         COALESCE(SUM(refund_amount_cents>0 AND refund_status IS NOT NULL AND refund_status<>'SUCCESS'),0) AS refunding
         FROM ar_rental_order WHERE ${merchant ? 'merchant_id=? AND appid' : 'appid'}=?`, merchant ? [merchant.id, merchant.appId] : [identity.appid]),

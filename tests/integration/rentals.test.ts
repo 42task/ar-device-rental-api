@@ -21,10 +21,17 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
         const schema = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(sql => sql.trim()).filter(Boolean);
         for (const statement of schema) await db.execute(statement);
       }
+      await db.execute('CREATE TABLE ar_merchant (id int PRIMARY KEY,name varchar(128) NOT NULL)');
+      await db.execute("INSERT INTO ar_merchant VALUES (1,'合成商户')");
+      for (const statement of (await readFile('database/010-venues.sql', 'utf8')).split(';').map(sql => sql.trim()).filter(Boolean)) await db.execute(statement);
+      await db.insert('ar_venue', { id: 1, merchant_id: 1, name: '并发场地', use_fee_cents: 2000, deposit_cents: 20000, version: 1, created_ms: 0, updated_ms: 0 });
+      await db.insert('ar_venue', { id: 3, merchant_id: 1, name: '其他场地', use_fee_cents: 1000, deposit_cents: 9000, version: 1, created_ms: 0, updated_ms: 0 });
+      await db.execute('ALTER TABLE ar_device ADD COLUMN merchant_id int NOT NULL DEFAULT 1, ADD COLUMN venue_id int NOT NULL, ADD CONSTRAINT fk_test_device_venue FOREIGN KEY(venue_id,merchant_id) REFERENCES ar_venue(id,merchant_id)');
+      await db.execute('ALTER TABLE ar_rental_order ADD COLUMN venue_id int NULL, ADD COLUMN venue_name varchar(128) NULL, ADD COLUMN venue_price_version int NULL');
       for (const [userId, role] of [[1, 'user'], [2, 'user'], [10, 'manager'], [11, 'root'], [12, 'adminer']] as const) {
         await db.insert('ar_user', { id: userId, role, appid: 'wx-rental-test', openid: 'payer-' + userId });
       }
-      const device = await db.insert('ar_device', { uuid: 'rental-concurrent-device', name: '并发设备' });
+      const device = await db.insert('ar_device', { uuid: 'rental-concurrent-device', name: '并发设备', merchant_id: 1, venue_id: 1 });
       const refunds = new Map<string, Row>();
       let paidOrder: Row | null = null;
       const payment = {
@@ -51,9 +58,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       const options = { appId: 'wx-rental-test', authenticate: async () => manager, payment: payment as any };
       const services = { db } as Services;
       const service = new RentalService(services, options);
-      await service.configure(systemAdmin, device.id, { enabled: true, useFeeCents: 2000, depositCents: 20000, version: 0 });
+      await service.configure(systemAdmin, device.id, { enabled: true, version: 0 });
       const contenders = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => service.create(principal(index % 2 + 1, 'user'), {
-        deviceId: device.id, priceVersion: 1, idempotencyKey: 'parallel-rental-' + index,
+        deviceId: device.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'parallel-rental-' + index,
       })));
       const successes = contenders.filter(result => result.status === 'fulfilled').map(result => (result as PromiseFulfilledResult<Row>).value.rental);
       const failures = contenders.filter(result => result.status === 'rejected') as PromiseRejectedResult[];
@@ -109,7 +116,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       expect((await db.one('SELECT COUNT(*) AS total FROM ar_rental_slot'))!.total).toBe(0);
       await expect(db.execute('DELETE FROM ar_user WHERE id=?', [owner.user.id])).rejects.toMatchObject({ code: 'ER_ROW_IS_REFERENCED_2' });
       // A device cannot be deleted while a new rental occupies it.
-      await service.create(owner, { deviceId: device.id, priceVersion: 1, idempotencyKey: 'post-settlement-rental' });
+      await service.create(owner, { deviceId: device.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'post-settlement-rental' });
       await expect(db.execute('DELETE FROM ar_device WHERE id=?', [device.id])).rejects.toMatchObject({ code: 'ER_ROW_IS_REFERENCED_2' });
       // Two workers compete for the same persistent job and cancel only once.
       await db.execute("UPDATE ar_rental_order SET expires_ms=0 WHERE status='PENDING_PAYMENT'");
@@ -118,6 +125,34 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       await Promise.all([service.processJobs(), otherWorker.processJobs()]);
       expect((await db.one("SELECT COUNT(*) AS total FROM ar_rental_event WHERE event='LOCAL_ORDER_CANCELLED'"))!.total).toBe(1);
       expect((await db.one('SELECT COUNT(*) AS total FROM ar_rental_slot'))!.total).toBe(0);
+      // An in-flight venue update owns the price lock. A waiting reservation
+      // must see the committed revision and require the customer to reconfirm.
+      let locked!: () => void, release!: () => void;
+      const lockReady = new Promise<void>(resolve => { locked = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const update = db.transaction(async tx => {
+        await tx.one('SELECT id FROM ar_venue WHERE id=1 FOR UPDATE');
+        locked(); await gate;
+        await tx.execute('UPDATE ar_venue SET use_fee_cents=3000,deposit_cents=21000,version=2 WHERE id=1');
+      });
+      await lockReady;
+      let settled = false;
+      const pending = service.create(owner, { deviceId: device.id, priceVersion: 1, venuePriceVersion: 1, idempotencyKey: 'venue-update-lock-rental' });
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(settled).toBe(false);
+      release(); await update;
+      await expect(pending).rejects.toMatchObject({ status: 409 });
+      expect((await service.context(owner, device.uuid)).pricing).toMatchObject({ totalCents: 24000, venuePriceVersion: 2 });
+      const raced = await Promise.allSettled([
+        service.create(owner, { deviceId: device.id, priceVersion: 1, venuePriceVersion: 2, idempotencyKey: 'reservation-versus-venue-change' }),
+        service.configure(root, device.id, { enabled: true, version: 1, venueId: 3 }),
+      ]);
+      expect(raced.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+      for (const result of raced) if (result.status === 'rejected') expect(result.reason).toMatchObject({ status: 409 });
+      const binding = (await db.one('SELECT venue_id FROM ar_device WHERE id=?', [device.id]))!;
+      const slotAfterRace = await db.one('SELECT * FROM ar_rental_slot WHERE device_id=?', [device.id]);
+      expect(Number(binding.venue_id)).toBe(slotAfterRace ? 1 : 3);
     } finally {
       await db?.close();
       if (created) await admin.query(`DROP DATABASE ${database}`);

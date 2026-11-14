@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import request from 'supertest';
+import request from './http-client';
 import { createApplication } from '../src/application';
 import type { Database } from '../src/core/database';
 import { ApiRouter } from '../src/core/router';
@@ -7,6 +7,7 @@ import { WeChatClient } from '../src/payments/wechat';
 import { RentalAuth } from '../src/auth';
 import express from 'express';
 import { SCHEMA_VERSION } from '../src/core/migrations';
+import rawRequest from 'supertest';
 
 const appId = 'wx03dbf50c15cac06f';
 const fakeDb = () => ({ query: async () => [{ one: 1 }], one: async () => ({ version: SCHEMA_VERSION }) }) as unknown as Database;
@@ -18,6 +19,15 @@ const build = () => {
 };
 
 describe('standalone API HTTP boundary', () => {
+  it('reports capabilities and asks old writers to upgrade while keeping authentication and reads reachable', async () => {
+    const { app } = build();
+    expect((await rawRequest(app).get('/api/v2/rental/capabilities')).body).toMatchObject({ currentClientProtocol: 2, minClientProtocol: 2 });
+    const old = await rawRequest(app).post('/api/v2/rentals').send({ deviceId: 1 });
+    expect(old.status).toBe(426); expect(old.body).toMatchObject({ code: 'CLIENT_UPGRADE_REQUIRED', minClientProtocol: 2 });
+    expect((await rawRequest(app).get('/api/v2/rentals')).status).toBe(401);
+    expect((await rawRequest(app).post('/api/v2/rental/auth/login').send({ code: 'synthetic' })).status).toBe(503);
+    expect((await rawRequest(app).post('/api/v2/rental/payment-notify').send({})).status).not.toBe(426);
+  });
   it('mounts the actual mini-program login route and reports missing credentials as 503 rather than 404', async () => {
     const { app } = build();
     const result = await request(app).post('/api/v2/rental/auth/login').send({ code: 'unit-login-code' });

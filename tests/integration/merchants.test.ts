@@ -1,7 +1,7 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import mysql from 'mysql2/promise';
-import request from 'supertest';
+import request from '../http-client';
 import { describe, expect, it } from 'vitest';
 import { Database } from '../../src/core/database';
 import { migrate, SCHEMA_VERSION } from '../../src/core/migrations';
@@ -10,7 +10,7 @@ import { RentalAuth, bootstrapRoot } from '../../src/auth';
 import { WeChatClient } from '../../src/payments/wechat';
 import { MerchantRegistry } from '../../src/merchants/registry';
 import { MerchantSecrets } from '../../src/merchants/secrets';
-import type { Row } from '../../src/core/contracts';
+import { seedVenue } from './venue-fixtures';
 
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migration and HTTP isolation', () => {
   it('upgrades existing schema-7 data without changing prices, orders, old JWTs or web sessions', async () => {
@@ -46,7 +46,11 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const before = await db.one('SELECT id,user_id,device_id,appid,payer_openid,mch_id,use_fee_cents,deposit_cents,total_cents,price_version,status,payment_status,out_trade_no,refund_amount_cents,refund_status FROM ar_rental_order WHERE id=42');
       await migrate(db); await migrate(db);
       expect(await db.one('SELECT id,user_id,device_id,appid,payer_openid,mch_id,use_fee_cents,deposit_cents,total_cents,price_version,status,payment_status,out_trade_no,refund_amount_cents,refund_status FROM ar_rental_order WHERE id=42')).toEqual(before);
-      expect(await db.one('SELECT merchant_id,version,use_fee_cents FROM ar_rental_config WHERE device_id=7')).toEqual({ merchant_id: 1, version: 3, use_fee_cents: 500 });
+      expect(await db.one('SELECT merchant_id,version FROM ar_rental_config WHERE device_id=7')).toEqual({ merchant_id: 1, version: 3 });
+      expect(await db.one("SHOW COLUMNS FROM ar_rental_config WHERE Field='use_fee_cents'")).toBeNull();
+      expect(await db.one("SHOW COLUMNS FROM ar_rental_config WHERE Field='deposit_cents'")).toBeNull();
+      expect(await db.one('SELECT merchant_id,use_fee_cents,deposit_cents,revision FROM ar_legacy_device_pricing_archive WHERE device_id=7')).toEqual({ merchant_id: 1, use_fee_cents: 500, deposit_cents: 2000, revision: 3 });
+      expect(await db.one('SELECT v.use_fee_cents,v.deposit_cents FROM ar_venue v JOIN ar_device d ON d.venue_id=v.id WHERE d.id=7')).toEqual({ use_fee_cents: 500, deposit_cents: 2000 });
       expect(await db.one('SELECT merchant_id FROM ar_user WHERE id=23')).toEqual({ merchant_id: null });
       const { app } = createApplication({ db, client, auth });
       const bearer = 'Bearer ' + oldLogin.token.accessToken;
@@ -74,14 +78,18 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const appId = 'wx03dbf50c15cac06f';
       const client = new WeChatClient({ appId, appSecret: 'synthetic-default-only', payEnabled: false, allowEnvironmentFallback: false });
       client.codeSession = async code => ({ openid: 'default-' + code });
-      class SyntheticRegistry extends MerchantRegistry {
-        override async clientForConfig(id: number, existing?: Row, merchant?: Row) {
-          const value = await super.clientForConfig(id, existing, merchant);
-          value.codeSession = async code => ({ openid: value.config.appId + '-' + code });
-          return value;
-        }
-      }
-      const registry = new SyntheticRegistry(db, client, new MerchantSecrets('a'.repeat(64)));
+      const registry = new MerchantRegistry(db, client, new MerchantSecrets('a'.repeat(64)));
+      registry.applications.createLoginClient = (row, appSecret) => {
+        const loginClient = new WeChatClient({ appId: row.app_id, appSecret, payEnabled: false, allowEnvironmentFallback: false,
+          fetch: async () => { throw Error('Merchant integration must not contact WeChat.'); } });
+        loginClient.codeSession = async code => ({ openid: row.app_id + '-' + code });
+        return loginClient;
+      };
+      const merchantKeys = generateKeyPairSync('rsa', { modulusLength: 2048 });
+      const platformKeys = generateKeyPairSync('rsa', { modulusLength: 2048 });
+      const paymentCredentials = { privateKey: merchantKeys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+        platformPublicKey: platformKeys.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+        platformKeyId: 'PUB_KEY_ID_SYNTHETIC', serialNo: '1234567890ABCDEF' };
       const auth = new RentalAuth(db, client, { jwtSecret: 'synthetic-merchant-test-signing-key-at-least-32-bytes' });
       const { app } = createApplication({ db, client, auth, merchants: registry });
       const login = async (code: string, host?: string, bindToken?: string) => {
@@ -93,17 +101,20 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const rootId = rootLogin.body.data.user.id, rootToken = 'Bearer ' + rootLogin.body.data.token.accessToken;
       await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [rootId, appId, '+8613700137000', '86', Date.now(), '1'.repeat(64)]);
       await bootstrapRoot(db, rootId, appId, '+8613700137000');
-      const first = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).send({ uuid: 'existing-default-device' });
+      const firstVenue = await seedVenue(db);
+      const first = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).send({ uuid: 'existing-default-device', venueId: firstVenue.id });
       expect(first.status).toBe(200);
       expect((await db.one('SELECT merchant_id FROM ar_device WHERE id=?', [first.body.device.id]))!.merchant_id).toBe(1);
-      const creation = await request(app).post('/api/v2/rental/admin/merchants').set('Authorization', rootToken).send({ name: '合成测试商户', code: 'second', origin: 'https://d1.4mr.cn', appId: 'wx1111111111111111', mchId: '2000000001', status: 'active', payEnabled: false, credentials: { appSecret: 'synthetic-second-secret', apiV3Key: 'a'.repeat(32) } });
+      const creation = await request(app).post('/api/v2/rental/admin/merchants').set('Authorization', rootToken).send({ name: '合成测试商户', code: 'second', miniappOwnerId: null, origin: 'https://d1.4mr.cn', appId: 'wx1111111111111111', mchId: '2000000001', status: 'active', payEnabled: false, credentials: { ...paymentCredentials, appSecret: 'synthetic-second-secret', apiV3Key: 'a'.repeat(32) } });
       expect(creation.status).toBe(200);
       const second = creation.body.merchant, secondId = second.id;
       expect(second).toMatchObject({ appId: 'wx1111111111111111', paymentReady: false, configuration: { hasAppSecret: true } });
       expect(JSON.stringify(second)).not.toContain('synthetic-second-secret');
       const storedConfig = await db.one('SELECT * FROM ar_merchant_wechat_config WHERE id=?', [second.configId]);
       expect(storedConfig!.secret_ciphertext).not.toContain('synthetic-second-secret');
-      expect(await registry.credentials(storedConfig!)).toMatchObject({ appSecret: 'synthetic-second-secret' });
+      expect(await registry.credentials(storedConfig!)).not.toHaveProperty('appSecret');
+      const secondEntry = await registry.applications.forMerchant(secondId);
+      expect(registry.applications.entry(secondEntry).client.config.appSecret).toBe('synthetic-second-secret');
       const oldClient = await registry.clientForConfig(second.configId);
       expect(oldClient.config.apiV3Key).toBe('a'.repeat(32));
       const rotation = await request(app).patch(`/api/v2/rental/admin/merchants/${secondId}`).set('Authorization', rootToken).send({ credentials: { apiV3Key: 'b'.repeat(32) } });
@@ -122,27 +133,29 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       expect((await registry.runtime(secondId)).client.config.mchId).toBe('2000000002');
       expect((await registry.runtime(secondId)).client.config.apiV3Key).toBe('');
       expect((await registry.runtime(secondId)).client.config.payEnabled).toBe(false);
-      const draft = await request(app).post('/api/v2/rental/admin/merchants').set('Authorization', rootToken).send({ name: '未开放草稿', code: 'draft', origin: 'https://d2.4mr.cn', appId: 'wx2222222222222222', credentials: { appSecret: 'synthetic-draft-old-secret' } });
+      const draft = await request(app).post('/api/v2/rental/admin/merchants').set('Authorization', rootToken).send({ name: '未开放草稿', code: 'draft', miniappOwnerId: null, origin: 'https://d2.4mr.cn', appId: 'wx2222222222222222', credentials: { appSecret: 'synthetic-draft-old-secret' } });
       expect(draft.status).toBe(200);
       const changedApp = await request(app).patch(`/api/v2/rental/admin/merchants/${draft.body.merchant.id}`).set('Authorization', rootToken).send({ appId: 'wx3333333333333333' });
       expect(changedApp.status).toBe(200);
       expect(changedApp.body.merchant.configuration.hasAppSecret).toBe(false);
       const list = await request(app).get('/api/v2/rental/admin/merchants').set('Authorization', rootToken);
       expect(list.body.items).toHaveLength(3);
-      const registered = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).set('X-Merchant-Id', String(secondId)).send({ uuid: 'second-device' });
+      const secondVenue = await seedVenue(db, secondId);
+      const registered = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).set('X-Merchant-Id', String(secondId)).send({ uuid: 'second-device', venueId: secondVenue.id });
       expect(registered.status).toBe(200);
       const secondDevice = registered.body.device.id;
       expect((await db.one('SELECT merchant_id FROM ar_device WHERE id=?', [secondDevice]))!.merchant_id).toBe(secondId);
       const a = await login('user-a'), b = await login('user-b', 'd1.4mr.cn');
       expect(a.status).toBe(200); expect(b.status).toBe(200);
       const aToken = 'Bearer ' + a.body.data.token.accessToken, bToken = 'Bearer ' + b.body.data.token.accessToken;
-      expect(b.body.data.user.merchantId).toBe(secondId);
+      expect(b.body.data.user.merchantId).toBeNull();
+      expect(b.body.data.managementMerchant).toBeNull();
       const mismatch = await request(app).get('/api/v2/rental/devices/context?uuid=second-device').set('Authorization', aToken);
       expect(mismatch.status).toBe(409); expect(mismatch.body.code).toBe('MERCHANT_MISMATCH');
       expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', aToken).set('X-Merchant-Id', String(secondId))).status).toBe(403);
       expect((await request(app).get('/api/v2/rental/merchant').set('Host', 'unregistered.example.com')).status).toBe(404);
       expect((await request(app).get('/api/v2/rental/merchant').set('Host', 'd.4mr.cn').set('X-Forwarded-Host', 'd1.4mr.cn')).body.merchant.id).toBe(1);
-      const transfer = await request(app).post(`/api/v2/rental/admin/users/${b.body.data.user.id}/merchant`).set('Authorization', rootToken).send({ merchantId: 1, role: 'user', reason: '合成账号调拨' });
+      const transfer = await request(app).post(`/api/v2/rental/admin/users/${b.body.data.user.id}/merchant`).set('Authorization', rootToken).send({ merchantId: 1, role: 'manager', reason: '合成账号调拨' });
       expect(transfer.status).toBe(200);
       expect((await login('transferred-b', undefined, transfer.body.binding.token)).status).not.toBe(200);
       const confirmed = await request(app).post('/api/v2/rental/auth/merchant-binding/confirm').set('Host', 'd1.4mr.cn').set('Authorization', bToken).send({ bindToken: transfer.body.binding.token });
@@ -158,9 +171,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
         total_cents: 30, price_version: 1, status: 'COMPENSATING', payment_status: 'SUCCESS', out_trade_no: 'synthetic-compensation-order',
         idempotency_key: 'synthetic-compensation-request', expires_ms: Date.now(), created_ms: Date.now(), updated_ms: Date.now(),
         refund_amount_cents: 30, refund_status: 'PROCESSING' });
-      expect((await request(app).post(`/api/v2/rental/admin/devices/${secondDevice}/merchant`).set('Authorization', rootToken).send({ merchantId: 1, reason: '尚未退款完成' })).status).toBe(409);
+      expect((await request(app).post(`/api/v2/rental/admin/devices/${secondDevice}/merchant`).set('Authorization', rootToken).send({ merchantId: 1, venueId: firstVenue.id, reason: '尚未退款完成' })).status).toBe(409);
       await db.execute("UPDATE ar_rental_order SET refund_status='SUCCESS',settled_ms=? WHERE id=?", [Date.now(), historical.id]);
-      const moved = await request(app).post(`/api/v2/rental/admin/devices/${secondDevice}/merchant`).set('Authorization', rootToken).send({ merchantId: 1, reason: '合成设备调拨' });
+      const moved = await request(app).post(`/api/v2/rental/admin/devices/${secondDevice}/merchant`).set('Authorization', rootToken).send({ merchantId: 1, venueId: firstVenue.id, reason: '合成设备调拨' });
       expect(moved.status).toBe(200); expect(moved.body).toMatchObject({ device: { merchantId: 1 }, requiresNewQr: true });
       expect(await db.one('SELECT merchant_id,user_id FROM ar_rental_order WHERE id=?', [historical.id])).toMatchObject({ merchant_id: secondId, user_id: b.body.data.user.id });
       await migrate(db);

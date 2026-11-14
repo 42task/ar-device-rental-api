@@ -7,6 +7,7 @@ import { Database } from '../../src/core/database';
 import { migrate, SCHEMA_VERSION } from '../../src/core/migrations';
 import { ApiRouter } from '../../src/core/router';
 import type { Row } from '../../src/core/contracts';
+import { runWithMerchant, type MerchantRuntime } from '../../src/merchants/context';
 
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge concurrency', () => {
   it('shares images across nodes and consumes exactly once under concurrent browsers', async () => {
@@ -22,26 +23,32 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       expect(Number((await db.one('SELECT version FROM ar_schema_meta'))!.version)).toBe(SCHEMA_VERSION);
       const appId = 'wx03dbf50c15cac06f', origin = 'https://admin.integration.test';
       for (const [id, role] of [[1, 'manager'], [2, 'user'], [3, 'root'], [4, 'adminer'], [5, 'adminer']] as const) await db.insert('ar_user', { id, role, appid: appId, openid: 'synthetic-admin-' + id });
+      for (const [id, role] of [[1, 'manager'], [4, 'adminer'], [5, 'adminer']] as const) await db.insert('ar_merchant_membership', { user_id: id, merchant_id: 1, role, status: 'active', authorization_version: 1, updated_ms: Date.now() });
       for (const [id, phone] of [[1, '+8613800138000'], [3, '+8613900139000'], [4, '+8613600136000'], [5, '+8613500135000']] as const) await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [id, appId, phone, '86', Date.now(), String(id).repeat(64)]);
       let providerCalls = 0;
       const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
       const client = { config: { appId }, codeSession: async (code: string) => ({ openid: 'synthetic-admin-' + code }), unlimitedCode: async () => { providerCalls++; return image; } };
+      const merchant: MerchantRuntime = { id: 1, code: 'default', name: 'Synthetic admin merchant', status: 'active', appId, origin, configId: 1, client: client as any };
+      const scoped = <T>(operation: () => Promise<T>) => runWithMerchant(merchant, operation);
       const context = (input: { id?: string; cookie?: string; token?: string; body?: Row; method?: string } = {}) => ({
         req: { method: input.method || 'POST', protocol: 'https', socket: { remoteAddress: '127.0.0.1' }, headers: { origin, host: 'admin.integration.test', ...(input.cookie ? { cookie: input.cookie } : {}), ...(input.token ? { authorization: 'Bearer ' + input.token } : {}) } },
         res: { setHeader: vi.fn(), append: vi.fn(), type: vi.fn().mockReturnThis(), end: vi.fn() }, params: { id: input.id }, body: input.body || {}, query: {},
       } as any);
       const nodes = [0, 1].map(() => {
         const auth = new RentalAuth(db!, client as any, { jwtSecret: 'synthetic-admin-integration-signing-key-32-bytes' });
+        const originalLogin = auth.login.bind(auth), originalAuthenticate = auth.authenticateBearer;
+        auth.login = (code, token) => scoped(() => originalLogin(code, token));
+        (auth as any).authenticateBearer = (ctx: any) => scoped(() => originalAuthenticate(ctx));
         const admin = new AdminAuth(db!, client as any, auth, { publicOrigin: origin }); auth.webAuthenticate = admin.authenticate;
         const router = new ApiRouter(); admin.register(router); auth.registerAuth(router);
-        const route = (method: string, path: string) => router.routes.find(row => row.method === method && row.path === '/v2/rental/admin/auth' + path)!.handler;
+        const route = (method: string, path: string) => (ctx: any) => scoped(() => Promise.resolve(router.routes.find(row => row.method === method && row.path === '/v2/rental/admin/auth' + path)!.handler(ctx)));
         const call = (method: string, path: string, input: Parameters<typeof context>[0] = {}) => route(method, path)(context({ ...input, method })) as Promise<Row>;
-        const changeRole = (input: Parameters<typeof context>[0]) => router.routes.find(row => row.method === 'PUT' && row.path === '/v2/rental/admin/users/:id/role')!.handler(context({ ...input, method: 'PUT' })) as Promise<Row>;
-        const users = (input: Parameters<typeof context>[0]) => router.routes.find(row => row.method === 'GET' && row.path === '/v2/rental/admin/users')!.handler(context({ ...input, method: 'GET' })) as Promise<Row>;
+        const changeRole = (input: Parameters<typeof context>[0]) => scoped(() => router.routes.find(row => row.method === 'PUT' && row.path === '/v2/rental/admin/users/:id/role')!.handler(context({ ...input, method: 'PUT' })) as Promise<Row>);
+        const users = (input: Parameters<typeof context>[0]) => scoped(() => router.routes.find(row => row.method === 'GET' && row.path === '/v2/rental/admin/users')!.handler(context({ ...input, method: 'GET' })) as Promise<Row>);
         return { auth, admin, route, call, changeRole, users };
       });
       const tokens = [await nodes[0].auth.login('1'), await nodes[1].auth.login('3')].map(value => value.token.accessToken);
-      const userToken = (await nodes[0].auth.login('2')).token.accessToken;
+      let userToken = (await nodes[0].auth.login('2')).token.accessToken;
       const createCtx = context(), challenge = await nodes[0].route('POST', '/challenges')(createCtx) as Row;
       const browserCookie = createCtx.res.append.mock.calls[0][1].split(';')[0];
       const images = await Promise.all(Array.from({ length: 6 }, (_, index) => {
@@ -75,9 +82,12 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       const consumeAdminCtx = context({ id: adminChallenge.id, cookie: adminBrowserCookie });
       expect(await nodes[1].route('POST', '/challenges/:id/consume')(consumeAdminCtx)).toMatchObject({ user: { id: 4, role: 'adminer' } });
       const adminSessionCookie = consumeAdminCtx.res.append.mock.calls[0][1].split(';')[0];
+      await nodes[0].changeRole({ token: tokens[1], id: '2', body: { role: 'manager' } });
+      await expect(nodes[1].auth.authenticateBearer(context({ token: userToken }))).rejects.toMatchObject({ status: 401 });
+      userToken = (await nodes[0].auth.login('2')).token.accessToken;
       const userList = await nodes[0].users({ cookie: adminSessionCookie });
       expect(userList.items.find((user: Row) => user.id === 2).allowedRoles).toEqual(['user', 'manager']);
-      expect(userList.items.find((user: Row) => user.id === 3).allowedRoles).toEqual([]);
+      expect(userList.items.some((user: Row) => user.id === 3)).toBe(false);
       expect(userList.items.find((user: Row) => user.id === 5).allowedRoles).toEqual([]);
       expect(await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'manager' } })).toMatchObject({ role: 'manager' });
       expect((await nodes[1].auth.authenticateBearer(context({ token: userToken }))).user.role).toBe('manager');
@@ -87,15 +97,17 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       // Only root can grant adminer or demote an existing adminer. Previously issued
       // browser cookies and JWTs immediately observe the lower current role.
       await nodes[0].changeRole({ token: tokens[1], id: '2', body: { role: 'adminer' } });
-      expect((await nodes[0].auth.authenticateBearer(context({ token: userToken }))).user.role).toBe('adminer');
+      await expect(nodes[0].auth.authenticateBearer(context({ token: userToken }))).rejects.toMatchObject({ status: 401 });
+      expect((await nodes[0].auth.login('2')).user.role).toBe('adminer');
       await nodes[0].changeRole({ token: tokens[1], id: '4', body: { role: 'manager' } });
-      expect((await nodes[1].call('GET', '/session', { cookie: adminSessionCookie })).user.role).toBe('manager');
-      await expect(nodes[0].users({ cookie: adminSessionCookie })).rejects.toMatchObject({ status: 403 });
-      await expect(nodes[1].changeRole({ token: adminToken, id: '1', body: { role: 'user' } })).rejects.toMatchObject({ status: 403 });
+      await expect(nodes[1].call('GET', '/session', { cookie: adminSessionCookie })).rejects.toMatchObject({ status: 401 });
+      await expect(nodes[0].users({ cookie: adminSessionCookie })).rejects.toMatchObject({ status: 401 });
+      await expect(nodes[1].changeRole({ token: adminToken, id: '1', body: { role: 'user' } })).rejects.toMatchObject({ status: 401 });
       expect(Number((await db.one("SELECT COUNT(*) AS total FROM ar_user WHERE role='root'"))!.total)).toBe(1);
 
-      await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [session.user.id]);
-      await expect(nodes[0].call('GET', '/session', { cookie: sessionCookie })).rejects.toMatchObject({ status: 403 });
+      await db.execute("UPDATE ar_user SET role='user',auth_version=auth_version+1 WHERE id=?", [session.user.id]);
+      await db.execute("UPDATE ar_merchant_membership SET status='revoked',authorization_version=authorization_version+1 WHERE user_id=?", [session.user.id]);
+      await expect(nodes[0].call('GET', '/session', { cookie: sessionCookie })).rejects.toMatchObject({ status: 401 });
       await nodes[0].call('POST', '/logout', { cookie: sessionCookie });
       expect((await db.one('SELECT revoked_ms FROM ar_admin_session WHERE user_id=?', [session.user.id]))!.revoked_ms).not.toBeNull();
     } finally {
