@@ -16,6 +16,8 @@ export { bootstrapRoot } from './admin';
 export interface RentalPrincipal { user: Row; appid: string; openid: string; merchantId?: number; authVersion?: number; identityId?: number }
 export interface RentalAuthOptions { jwtSecret?: string; jwtSecretPath?: string; issuer?: string; audience?: string; appId?: string; rootPhone?: string; now?: () => number }
 export const publicUser = (user: Row): Row => ({ id: Number(user.id), role: userRole(user), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.verified_phone ? maskedPhone(user.verified_phone, user.phone_country_code) : user.tel ?? null, ...(user.verified_phone ? { phoneVerified: true } : {}), ...('merchant_id' in user ? { merchantId: user.merchant_id === null ? null : Number(user.merchant_id) } : {}) });
+// Complete verified numbers are available only in the authorized user directory.
+const directoryUser = (user: Row): Row => ({ ...publicUser(user), phoneNumber: user.verified_phone ?? null, phoneVerified: Boolean(user.verified_phone) });
 export function publicMerchant(): Row | undefined {
   const merchant = currentMerchant();
   return merchant ? { id: merchant.id, code: merchant.code, name: merchant.name, status: merchant.status, origin: merchant.origin, appId: merchant.appId, configId: merchant.configId } : undefined;
@@ -335,7 +337,7 @@ export class RentalAuth {
       const rows = await db.query(`SELECT u.*,p.phone_e164 AS verified_phone,p.country_code AS phone_country_code${scope === 'employees' ? ',m.role AS member_role,m.merchant_id AS member_merchant_id' : ''}${from}${filter} ORDER BY u.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, parameters);
       return { scope, items: rows.map(row => {
         const user = { ...row, role: scope === 'employees' ? row.member_role : 'user', merchant_id: scope === 'employees' ? Number(row.member_merchant_id) : null };
-        return { ...publicUser(user), allowedRoles: assignableRoles(actor, user) };
+        return { ...directoryUser(user), allowedRoles: assignableRoles(actor, user) };
       }), page, pageSize, total: Number(count?.total || 0) };
     });
   }
@@ -383,7 +385,7 @@ export class RentalAuth {
       : ' FROM ar_user u LEFT JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=u.appid AND p.verified_ms>0 WHERE u.appid=? AND u.id<>?';
     const count = await this.db.one('SELECT COUNT(*) AS total' + from + searchSql, values);
     const items = await this.db.query(`SELECT u.*,p.phone_e164 AS verified_phone,p.country_code AS phone_country_code${from}${searchSql} ORDER BY u.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values);
-    return { items: items.map(user => ({ ...publicUser(user), allowedRoles: assignableRoles(principal.user, user) })), page, pageSize, total: Number(count?.total || 0) };
+    return { items: items.map(user => ({ ...directoryUser(user), allowedRoles: assignableRoles(principal.user, user) })), page, pageSize, total: Number(count?.total || 0) };
   }
   private async setRole(ctx: Context): Promise<Row> {
     const principal = await this.authenticate(ctx);

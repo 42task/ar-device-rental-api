@@ -108,6 +108,27 @@ describe('independent rental authentication', () => {
     await expect(f.route('GET', '/v2/rental/admin/users')(f.context(second.token.accessToken))).rejects.toMatchObject({ status: 403 });
     expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(3);
   });
+  it('shows complete verified phones only in the authorized directory and distinguishes unbound legacy numbers', async () => {
+    const f = fixture(), root = await f.auth.login('root'); await f.bootstrap();
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'verified-user' }); const verified = await f.auth.login('verified');
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'unbound-user' }); const unbound = await f.auth.login('unbound');
+    const number = '+8613800138000';
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [verified.user.id, appId, number, '86', Date.now(), 'b'.repeat(64)]);
+    await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['13900139000', unbound.user.id]);
+    const list = f.route('GET', '/v2/rental/admin/users');
+    const result = await list(f.context(root.token.accessToken)) as Row;
+    expect(result.items.find((user: Row) => user.id === verified.user.id)).toMatchObject({ tel: '+86 138****8000', phoneNumber: number, phoneVerified: true });
+    expect(result.items.find((user: Row) => user.id === unbound.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
+    expect(result.items.every((user: Row) => !('openid' in user) && !('code_hash' in user))).toBe(true);
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'verified-user' });
+    expect((await f.auth.login('verified-again')).user).not.toHaveProperty('phoneNumber');
+    expect((await f.auth.refresh(verified.token.refreshToken)).user).not.toHaveProperty('phoneNumber');
+    await expect(list(f.context(verified.token.accessToken))).rejects.toMatchObject({ status: 403 });
+    await expect(list(f.context(''))).rejects.toMatchObject({ status: 401 });
+    await f.db.execute('UPDATE ar_user_phone SET appid=? WHERE user_id=?', ['wxaaaaaaaaaaaaaaaa', verified.user.id]);
+    const mismatched = await list(f.context(root.token.accessToken)) as Row;
+    expect(mismatched.items.find((user: Row) => user.id === verified.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
+  });
   it('lets root assign adminer and lets adminer manage only other lower-level users with fresh roles and audit', async () => {
     const f = fixture(), root = await f.auth.login('root'); await f.bootstrap();
     f.client.codeSession.mockResolvedValueOnce({ openid: 'system-admin' }); const admin = await f.auth.login('adminer');
@@ -179,14 +200,13 @@ describe('independent rental authentication', () => {
     await expect(auth.login('code')).rejects.toMatchObject({ status: 503 });
     expect(f.client.codeSession).not.toHaveBeenCalled();
   });
-  it('searches verified phone ownership for root and exposes only a masked phone', async () => {
+  it('searches verified phone ownership for root and includes the complete directory number', async () => {
     const f = fixture(), root = await f.auth.login('root'); await f.bootstrap(root.user.id);
     f.client.codeSession.mockResolvedValueOnce({ openid: 'verified-phone-owner' });
     const target = await f.auth.login('second');
     await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [target.user.id, appId, '+8613800138000', '86', Date.now(), 'a'.repeat(64)]);
     const response: any = await f.route('GET', '/v2/rental/admin/users')(f.context(root.token.accessToken, {}, {}, { search: '13800138000' }));
-    expect(response).toMatchObject({ total: 1, items: [{ id: target.user.id, tel: '+86 138****8000', phoneVerified: true }] });
-    expect(JSON.stringify(response)).not.toContain('+8613800138000');
+    expect(response).toMatchObject({ total: 1, items: [{ id: target.user.id, tel: '+86 138****8000', phoneNumber: '+8613800138000', phoneVerified: true }] });
     expect((await f.auth.refresh(target.token.refreshToken)).user.tel).toBeNull();
   });
   it('uses a valid secret file when Compose injects an empty inline secret', async () => {

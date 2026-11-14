@@ -128,6 +128,44 @@ for (const role of ['manager', 'adminer', 'root']) {
   assert.deepEqual(Array.from(f.spec.assignableRoles({ id: 10, role: 'root' }, { id: 11, role: 'adminer', allowedRoles: ['user', 'manager'] })), ['user', 'manager']);
 }
 
+// User rows show complete verified phones; legacy tel and unverified fields never imply ownership.
+{
+  const f = fixture('root'), phoneNumber = '+8613800138000';
+  const verified = { id: 11, role: 'user', phoneVerified: true, phoneNumber, tel: '+86 138****8000' };
+  const row = f.spec.userRow(verified), cells = row.querySelectorAll('td');
+  assert.equal(cells[0].querySelector('.cell-main').textContent, phoneNumber);
+  assert.equal(cells[1].querySelector('.cell-main').textContent, phoneNumber);
+  assert.match(cells[1].textContent, /微信已验证/); assert.doesNotMatch(row.textContent, /\*\*\*\*/);
+  const named = f.spec.userRow({ ...verified, nickname: 'Synthetic renter' });
+  assert.equal(named.querySelector('.cell-main').textContent, 'Synthetic renter'); assert.match(named.querySelectorAll('td')[1].textContent, /\+8613800138000/);
+  for (const phone of [{ phoneVerified: false, phoneNumber: null }, { tel: phoneNumber }, { phoneVerified: false, phoneNumber }, { phoneVerified: true, tel: phoneNumber }, { phoneVerified: true, phoneNumber: '138****8000' }]) {
+    const unverified = f.spec.userRow({ id: 12, role: 'user', ...phone });
+    assert.equal(unverified.querySelector('.cell-main').textContent, '用户 #12');
+    assert.match(unverified.textContent, /未授权手机号/); assert.match(unverified.textContent, /需本人在小程序授权/);
+    assert.doesNotMatch(unverified.textContent, /138|微信已验证/);
+  }
+}
+
+// Both permission and merchant-assignment dialogs identify the target by the verified phone.
+for (const verified of [true, false]) {
+  const user = { id: 11, role: 'user', nickname: 'Synthetic renter', tel: '+8613900139000', phoneVerified: verified, phoneNumber: verified ? '+8613800138000' : null };
+  const checkIdentity = node => {
+    assert.match(node.textContent, /Synthetic renter（ID 11）/); assert.doesNotMatch(node.textContent, /13900139000/);
+    if (verified) { assert.match(node.textContent, /手机号：\+8613800138000（微信已验证）/); assert.doesNotMatch(node.textContent, /未授权手机号/); }
+    else { assert.match(node.textContent, /未授权手机号，请由用户本人在小程序授权/); assert.doesNotMatch(node.textContent, /微信已验证/); }
+  };
+  const role = fixture('root'); role.spec.roleDialog(user); checkIdentity(controls(role).form);
+  const transfer = fixture('root'), first = { id: 1, name: 'First' }, second = { id: 2, name: 'Second' };
+  transfer.spec.setContext(first); transfer.replies.push({ items: [first, second], currentMerchantId: 1 });
+  await transfer.spec.transferDialog('users', user);
+  const form = transfer.document.querySelector('dialog').querySelector('form'); checkIdentity(form);
+  form.querySelector('select').value = '2'; form.querySelector('textarea').value = 'Synthetic assignment';
+  transfer.replies.push({ binding: { token: 'a'.repeat(64), appId: 'wxsynthetic', origin: 'https://synthetic.example.test', expiresAt: '2026-11-15T12:00:00.000Z' } });
+  await form.emit('submit'); assert.match(form.textContent, /等待原账号确认商户分配/); checkIdentity(form);
+  const written = transfer.calls.find(call => call.method === 'POST');
+  assert.deepEqual(JSON.parse(written.body), { merchantId: 2, reason: 'Synthetic assignment', role: 'user' });
+}
+
 // Actual form submission grants only the selected, explicitly acknowledged role.
 {
   const f = fixture('adminer'); f.spec.roleDialog({ id: 11, role: 'user', allowedRoles: ['user', 'manager'] }); const c = controls(f);

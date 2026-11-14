@@ -40,6 +40,48 @@ async function setup(db: Database) {
 }
 
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL authoritative merchant memberships', () => {
+  it('exposes verified directory phones within the authorized application and merchant scope', async () => withFixture(async f => {
+    const verified = await f.login('synthetic-phone-consumer');
+    const unbound = await f.login('synthetic-unbound-consumer');
+    const otherApp = await f.login('synthetic-other-app-phone');
+    const unverified = await f.login('synthetic-unverified-phone');
+    const employee = await f.login('synthetic-phone-employee');
+    const administrator = await f.login('synthetic-phone-adminer');
+    const elsewhere = await f.login('synthetic-other-merchant-employee');
+    const phone = async (userId: number, number: string, countryCode = '86', phoneApp = appId, verifiedMs = Date.now()) => f.db.insert('ar_user_phone', {
+      user_id: userId, appid: phoneApp, phone_e164: number, country_code: countryCode, verified_ms: verifiedMs, code_hash: randomBytes(32).toString('hex'),
+    });
+    const membership = async (userId: number, merchantId: number, role: string) => {
+      await f.db.insert('ar_merchant_membership', { user_id: userId, merchant_id: merchantId, role, status: 'active', authorization_version: 1, updated_ms: Date.now() });
+      await f.db.execute('UPDATE ar_user SET role=?,merchant_id=? WHERE id=?', [role, merchantId, userId]);
+    };
+    await phone(verified.user.id, '+8613800138000');
+    await phone(otherApp.user.id, '+8613900139000', '86', 'wx0123456789abcdef');
+    await phone(unverified.user.id, '+8613600136000', '86', appId, 0);
+    await phone(employee.user.id, '+447700900123', '44');
+    await phone(elsewhere.user.id, '+8613500135000');
+    await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['13700137000', unbound.user.id]);
+    await membership(employee.user.id, 1, 'manager');
+    await membership(administrator.user.id, 1, 'adminer');
+    await membership(elsewhere.user.id, 2, 'manager');
+
+    const platform = await f.call('GET', 'admin/users', f.root.token.accessToken, {}, {}, { scope: 'platform' });
+    expect(platform.items.find((user: Row) => user.id === verified.user.id)).toMatchObject({ phoneNumber: '+8613800138000', tel: '+86 138****8000', phoneVerified: true });
+    for (const login of [unbound, otherApp, unverified]) expect(platform.items.find((user: Row) => user.id === login.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
+    expect(platform.items.some((user: Row) => user.id === elsewhere.user.id)).toBe(false);
+    expect((await f.call('GET', 'admin/users', f.root.token.accessToken, {}, {}, { scope: 'platform', search: '13800138000' })).items.map((user: Row) => user.id)).toEqual([verified.user.id]);
+
+    const employees = await f.call('GET', 'admin/users', f.root.token.accessToken);
+    expect(employees.items.find((user: Row) => user.id === employee.user.id)).toMatchObject({ phoneNumber: '+447700900123', tel: '+44 770****0123', phoneVerified: true });
+    expect(employees.items.some((user: Row) => user.id === elsewhere.user.id || user.id === verified.user.id)).toBe(false);
+    const adminLogin = await f.login('synthetic-phone-adminer');
+    expect((await f.call('GET', 'admin/users', adminLogin.token.accessToken)).items.map((user: Row) => user.id)).toEqual([employee.user.id]);
+    await expect(f.call('GET', 'admin/users', adminLogin.token.accessToken, {}, {}, { scope: 'platform' })).rejects.toMatchObject({ status: 403 });
+    await expect(f.call('GET', 'admin/users', verified.token.accessToken)).rejects.toMatchObject({ status: 403 });
+    expect((await f.login('synthetic-phone-consumer')).user).not.toHaveProperty('phoneNumber');
+    expect((await f.scoped(() => f.auth.refresh(verified.token.refreshToken))).user).not.toHaveProperty('phoneNumber');
+  }), 30_000);
+
   it('migrates legacy employees once, preserves revoked memberships and expires unversioned grants', async () => withFixture(async f => {
     await f.db.insert('ar_user', { id: 2, appid: appId, openid: 'legacy-employee', role: 'manager', merchant_id: 1 });
     await f.db.insert('ar_user', { id: 3, appid: appId, openid: 'legacy-consumer', role: 'user', merchant_id: 1 });

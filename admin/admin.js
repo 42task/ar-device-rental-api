@@ -456,9 +456,18 @@ function orderRow(order) {
   append(row, textCell('#' + order.id + '  ·  ' + (order.deviceName || order.uuid), [order.venueName, order.uuid].filter(Boolean).join(' · ')), append(el('td'), badge(order.status, orderLabels)), textCell('¥' + money(order.totalCents), '租金 ¥' + money(order.useFeeCents) + ' · 押金 ¥' + money(order.depositCents)), el('td', '', refundLabels[order.refundStatus] || '—'), el('td', 'numeric', time(order.createdAt)), append(el('td'), button('详情', () => orderDialog(order.id), 'text-button')));
   return row;
 }
+function verifiedUserPhone(user) {
+  return user.phoneVerified === true && typeof user.phoneNumber === 'string' && /^\+[1-9][0-9]{6,14}$/.test(user.phoneNumber) ? user.phoneNumber : '';
+}
+function userName(user) { return user.nickname || verifiedUserPhone(user) || '用户 #' + user.id; }
+function userIdentity(user) {
+  const phone = verifiedUserPhone(user);
+  return '目标账号：' + userName(user) + '（ID ' + user.id + '）。' + (phone ? '手机号：' + phone + '（微信已验证）。' : '未授权手机号，请由用户本人在小程序授权。');
+}
 function userRow(user) {
   const row = el('tr');
-  append(row, textCell(user.nickname || (user.phoneVerified && user.tel) || '用户 #' + user.id, 'ID ' + user.id), textCell(user.tel || '—', user.phoneVerified ? '微信已验证' : user.tel ? '尚未验证' : '尚未绑定'), append(el('td'), badge(user.role, { root: [roleLabel('root'), 'green'], adminer: [roleLabel('adminer'), 'blue'], manager: [roleLabel('manager'), 'blue'], user: [roleLabel('user'), ''] })));
+  const phone = verifiedUserPhone(user);
+  append(row, textCell(userName(user), 'ID ' + user.id), textCell(phone || '未授权手机号', phone ? '微信已验证' : '需本人在小程序授权'), append(el('td'), badge(user.role, { root: [roleLabel('root'), 'green'], adminer: [roleLabel('adminer'), 'blue'], manager: [roleLabel('manager'), 'blue'], user: [roleLabel('user'), ''] })));
   const actions = el('td');
   const protectedLabel = user.role === 'root' ? 'ROOT 身份受保护' : String(user.id) === String(state.user.id) ? '当前账号' : user.role === 'adminer' ? '同级身份受保护' : '不可修改';
   actions.append(assignableRoles(state.user, user).length ? button('管理身份', () => roleDialog(user), 'text-button') : el('span', 'muted', protectedLabel));
@@ -789,6 +798,7 @@ async function merchantDialog(id) {
 async function transferDialog(kind, target) {
   if (state.user?.role !== 'root' || kind === 'users' && target.role === 'root') return;
   const ui = formDialog(kind === 'devices' ? '调拨设备' : '分配用户到商户', '确认分配');
+  if (kind === 'users') ui.form.append(el('p', 'role-copy', userIdentity(target)));
   try { await refreshMerchants(); } catch (error) { ui.form.append(message(error.message)); return; }
   if (!ui.node.open || state.user?.role !== 'root') return;
   const sourceMerchant = state.merchantId;
@@ -835,7 +845,7 @@ async function transferDialog(kind, target) {
       if (kind === 'users') {
         const binding = result.binding;
         if (!binding || !/^[A-Za-z0-9_-]{32,256}$/.test(binding.token) || typeof binding.appId !== 'string') throw new Error('绑定入口响应无效，请查询分配状态后重试');
-        ui.form.replaceChildren(el('h3', '', '等待原账号确认商户分配'), el('p', 'notice', '请仅将下方绑定凭据交给目标用户本人。由被分配账号在小程序首页进入「确认商户分配」，填写凭据并主动确认。共用小程序将在当前页面完成分配；独立入口会打开目标小程序绑定页。关闭此窗口后不再显示。'));
+        ui.form.replaceChildren(el('h3', '', '等待原账号确认商户分配'), el('p', 'role-copy', userIdentity(target)), el('p', 'notice', '请仅将下方绑定凭据交给目标用户本人。由被分配账号在小程序首页进入「确认商户分配」，填写凭据并主动确认。共用小程序将在当前页面完成分配；独立入口会打开目标小程序绑定页。关闭此窗口后不再显示。'));
         const details = el('dl', 'details');
         for (const [label, value] of [['目标小程序', binding.appId], ['目标域名', binding.origin], ['有效期至', time(binding.expiresAt)], ['绑定凭据', binding.token], ['小程序页面', 'pages/merchant/bind?bindToken=' + encodeURIComponent(binding.token)]]) append(details, el('dt', '', label), el('dd', 'binding-value', value));
         ui.form.append(details, button('完成', () => { ui.node.close(); loadPage(); }, 'secondary'));
@@ -848,9 +858,8 @@ async function transferDialog(kind, target) {
 function roleDialog(user) {
   const allowed = assignableRoles(state.user, user);
   if (!allowed.length) { toast('当前身份不能修改该账号'); return; }
-  const name = user.nickname || (user.phoneVerified && user.tel) || '用户 #' + user.id;
   const ui = formDialog('管理用户身份', '确认变更');
-  ui.form.append(el('p', 'role-copy', '目标账号：' + name + '（ID ' + user.id + '）。当前身份：' + roleLabel(user.role) + '。' + (state.user.role === 'root' ? '你可以调整此账号的普通用户、设备管理员或商户管理员身份。' : '你只能在普通用户与设备管理员之间变更身份。')));
+  ui.form.append(el('p', 'role-copy', userIdentity(user) + '当前身份：' + roleLabel(user.role) + '。' + (state.user.role === 'root' ? '你可以调整此账号的普通用户、设备管理员或商户管理员身份。' : '你只能在普通用户与设备管理员之间变更身份。')));
   const target = field(ui.form, '目标身份', { tag: 'select', required: true });
   for (const role of allowed) { const option = el('option', '', roleLabel(role)); option.value = role; target.append(option); }
   target.value = user.role;

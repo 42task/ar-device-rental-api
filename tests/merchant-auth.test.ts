@@ -113,6 +113,31 @@ describe('merchant account identities and explicit assignment', () => {
     const identity = await f.login(f.first, 'platform-consumer');
     expect(identity).toMatchObject({ entry: { id: 1, appId: appA }, managementMerchant: { id: 1 }, merchant: { id: 1 }, user: { merchantId: 1 } });
   });
+  it('labels verified directory phones for employees and platform consumers within the selected application', async () => {
+    const f = await fixture();
+    const listed = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, f.root.token.accessToken))) as Row;
+    expect(listed.items).toMatchObject([{ id: 2, phoneNumber: '+8613800138000', phoneVerified: true, tel: '+86 138****8000' }]);
+    const bound = await f.login(f.first, 'verified-consumer'), unbound = await f.login(f.first, 'unbound-consumer');
+    f.a.phoneNumber.mockResolvedValueOnce({ phoneE164: '+447700900123', countryCode: '44' });
+    await runWithMerchant(f.first, async () => f.phone.bind(await f.authenticate(f.first, bound.token.accessToken), 'consumer-phone-code'));
+    await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['13900139000', unbound.user.id]);
+    const context = f.ctx(f.first, f.root.token.accessToken); context.query.scope = 'platform';
+    const consumers = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(context)) as Row;
+    expect(consumers.items.find((user: Row) => user.id === bound.user.id)).toMatchObject({ phoneNumber: '+447700900123', phoneVerified: true });
+    expect(consumers.items.find((user: Row) => user.id === unbound.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
+    context.query.search = '7700900123';
+    const matches = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(context)) as Row;
+    expect(matches.items.map((user: Row) => user.id)).toEqual([bound.user.id]);
+    const fresh = await f.login(f.first, 'verified-consumer');
+    expect(fresh.user).not.toHaveProperty('phoneNumber');
+    expect((await runWithMerchant(f.first, () => f.auth.refresh(fresh.token.refreshToken))).user).not.toHaveProperty('phoneNumber');
+    await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, fresh.token.accessToken)))).rejects.toMatchObject({ status: 403 });
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?,?)', [3, appA, '+8613900139000', '86', 1800000000000, 'c'.repeat(64), 3]);
+    const independent = f.ctx(f.first, f.root.token.accessToken); independent.query.scope = 'platform';
+    const other = await withMerchant({ entry: f.first, merchant: f.second }, () => f.route('GET', 'admin/users')(independent)) as Row;
+    expect(other.items).toMatchObject([{ id: 3, phoneNumber: null, phoneVerified: false }]);
+    expect(JSON.stringify(other)).not.toContain('+8613900139000');
+  });
   it('revokes pending assignments, JWTs, browser sessions and scanned challenges when current staff authority is removed', async () => {
     const f = await fixture(), browser = await f.adminLogin(f.target.token.accessToken);
     const pending = await f.assign({ merchantId: 3, role: 'adminer', reason: 'Synthetic pending grant before revocation' });
