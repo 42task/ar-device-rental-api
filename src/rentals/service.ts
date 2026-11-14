@@ -47,11 +47,28 @@ export class RentalService {
   private assertPrincipal(principal: RentalPrincipal): void {
     if (!principal.user || !Number.isSafeInteger(Number(principal.user.id)) || Number(principal.user.id) < 1 || principal.appid !== this.options.appId || !principal.openid) throw new ApiError(401, '租赁登录信息无效，请重新登录');
   }
+  private async currentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<boolean> {
+    if (!manager(principal)) return false;
+    const current = await db.one('SELECT role FROM ar_user WHERE id = ? AND appid = ?' + (lock ? ' FOR UPDATE' : ''), [principal.user.id, principal.appid]);
+    return !!current && userRole(current) !== 'user';
+  }
+  private async requireCurrentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<void> {
+    requireManager(principal.user);
+    if (!await this.currentManager(principal, db, lock)) throw new ApiError(403, '管理员权限已变更，请重新登录');
+  }
+  private refundActions(row: Row | null, canManage: boolean): Row {
+    const unsettled = !!row?.out_refund_no && row.refund_status !== 'SUCCESS';
+    return {
+      canEndRental: canManage && row?.status === 'ACTIVE' && row.payment_status === 'SUCCESS',
+      canSyncRefund: canManage && unsettled,
+      canRetryRefund: canManage && unsettled && ['PENDING', 'PROCESSING'].includes(row!.refund_status),
+    };
+  }
   private mine(row: Row, principal: RentalPrincipal): boolean { return Number(row.user_id) === Number(principal.user.id) && row.appid === principal.appid; }
   private async readOrder(orderId: unknown, principal?: RentalPrincipal): Promise<Row> {
     const row = await this.services.db.one('SELECT * FROM ar_rental_order WHERE id = ?', [id(orderId)]);
     if (!row || principal && row.appid !== principal.appid) throw new ApiError(404, '租赁订单不存在');
-    if (principal && !this.mine(row, principal) && !manager(principal)) throw new ApiError(403, '不可查看他人的租赁订单');
+    if (principal && !this.mine(row, principal) && !await this.currentManager(principal)) throw new ApiError(403, '不可查看他人的租赁订单');
     return row;
   }
   view(row: Row, principal?: RentalPrincipal): Row {
@@ -71,8 +88,8 @@ export class RentalService {
   async context(principal: RentalPrincipal, uuid: unknown): Promise<Row> {
     this.assertPrincipal(principal);
     const device = await this.services.db.one('SELECT * FROM ar_device WHERE uuid = ?', [deviceUuid(uuid)]);
-    const canManage = manager(principal);
-    if (!device) return { device: null, state: 'UNREGISTERED', relation: 'none', pricing: null, rental: null, paymentReady: this.paymentReady(), actions: { canRent: false, canContinuePayment: false, canCancelPayment: false, canEndRental: false, canConfigure: false, canCreate: canManage }, serverTime: iso(this.now()) };
+    const canManage = await this.currentManager(principal);
+    if (!device) return { device: null, state: 'UNREGISTERED', relation: 'none', pricing: null, rental: null, paymentReady: this.paymentReady(), actions: { canRent: false, canContinuePayment: false, canCancelPayment: false, ...this.refundActions(null, false), canConfigure: false, canCreate: canManage }, serverTime: iso(this.now()) };
     const config = await this.services.db.one('SELECT * FROM ar_rental_config WHERE device_id = ?', [device.id]);
     const price = this.pricing(config);
     const slot = await this.services.db.one('SELECT * FROM ar_rental_slot WHERE device_id = ?', [device.id]);
@@ -85,10 +102,14 @@ export class RentalService {
       canRent: !slot && price.enabled && price.totalCents > 0 && this.paymentReady(),
       canContinuePayment: current?.status === 'PENDING_PAYMENT' && relation === 'mine' && Number(current.expires_ms) > this.now(),
       canCancelPayment: current?.status === 'PENDING_PAYMENT' && relation === 'mine',
-      canEndRental: canManage && current?.status === 'ACTIVE', canConfigure: canManage, canCreate: false,
+      ...this.refundActions(current, canManage), canConfigure: canManage, canCreate: false,
     }, serverTime: iso(this.now()) };
   }
-  async get(principal: RentalPrincipal, orderId: unknown): Promise<Row> { this.assertPrincipal(principal); return { rental: this.view(await this.readOrder(orderId, principal), principal) }; }
+  async get(principal: RentalPrincipal, orderId: unknown): Promise<Row> {
+    this.assertPrincipal(principal);
+    const row = await this.readOrder(orderId, principal);
+    return { rental: this.view(row, principal), actions: this.refundActions(row, await this.currentManager(principal)) };
+  }
   async list(principal: RentalPrincipal, query: Row): Promise<Row> {
     this.assertPrincipal(principal);
     const { page, pageSize } = pagination(query);
@@ -252,6 +273,9 @@ export class RentalService {
     const key = requestKey(input.idempotencyKey);
     const existing = await this.readOrder(orderId, principal);
     const row = await this.lockOrder(existing.id, async (db, current) => {
+      // Serialize the authorization decision with role revocation. Payer
+      // ownership never grants permission to choose or initiate a refund.
+      await this.requireCurrentManager(principal, db, true);
       if (current.status === 'ENDED') {
         if (current.refund_mode !== mode) throw new ApiError(409, '该租赁已选择其他退款方式，请刷新结果');
         return current;
@@ -307,6 +331,9 @@ export class RentalService {
   }
   async syncRefund(principal: RentalPrincipal, orderId: unknown): Promise<Row> {
     this.assertPrincipal(principal);
+    // A missing provider refund can be re-applied by this operation, so it is
+    // administrative. Customers read the persisted result through GET instead.
+    await this.requireCurrentManager(principal);
     const row = await this.readOrder(orderId, principal);
     return { rental: this.view(await this.syncRefundInternal(row), principal) };
   }
@@ -321,7 +348,7 @@ export class RentalService {
     return this.applyRefundResult(Number(row.id), result);
   }
   async retryRefund(principal: RentalPrincipal, orderId: unknown): Promise<Row> {
-    this.assertPrincipal(principal); requireManager(principal.user);
+    this.assertPrincipal(principal); await this.requireCurrentManager(principal);
     const row = await this.readOrder(orderId, principal);
     if (row.refund_status === 'ABNORMAL' || row.refund_status === 'CLOSED') throw new ApiError(409, '退款已进入异常或关闭状态，请在微信商户平台处理并同步结果');
     return { rental: this.view(await this.syncRefundInternal(row), principal) };

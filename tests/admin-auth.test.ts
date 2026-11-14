@@ -6,6 +6,7 @@ import { ApiRouter } from '../src/core/router';
 import type { Database } from '../src/core/database';
 import type { Row } from '../src/core/contracts';
 import { WeChatClient } from '../src/payments/wechat';
+import { DeviceService } from '../src/devices/service';
 
 const appId = 'wx03dbf50c15cac06f', origin = 'https://admin.example.test';
 const opened: DatabaseSync[] = [];
@@ -13,17 +14,20 @@ afterEach(() => { opened.splice(0).forEach(db => db.close()); vi.unstubAllEnvs()
 
 async function fixture() {
   const sqlite = new DatabaseSync(':memory:'); opened.push(sqlite);
-  sqlite.exec(`CREATE TABLE ar_user(id INTEGER PRIMARY KEY,appid TEXT,openid TEXT,role TEXT,nickname TEXT,avatar TEXT,tel TEXT,unionid TEXT);
-    INSERT INTO ar_user VALUES(1,'${appId}','manager-openid','manager',NULL,NULL,NULL,NULL),(2,'${appId}','ordinary-openid','user',NULL,NULL,NULL,NULL),(3,'${appId}','other-openid','manager',NULL,NULL,NULL,NULL);
+  sqlite.exec(`CREATE TABLE ar_user(id INTEGER PRIMARY KEY,appid TEXT,openid TEXT,role TEXT,nickname TEXT,avatar TEXT,tel TEXT,unionid TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+    INSERT INTO ar_user(id,appid,openid,role) VALUES(1,'${appId}','manager-openid','manager'),(2,'${appId}','ordinary-openid','user'),(3,'${appId}','other-openid','manager'),(4,'${appId}','root-openid','root');
+    CREATE TABLE ar_admin_guard(id INTEGER PRIMARY KEY); INSERT INTO ar_admin_guard VALUES(1);
+    CREATE TABLE ar_role_audit(id INTEGER PRIMARY KEY,actor_user_id INTEGER,target_user_id INTEGER,previous_role TEXT,next_role TEXT,source TEXT,reason TEXT);
     CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT UNIQUE,UNIQUE(appid,phone_e164));
-    INSERT INTO ar_user_phone VALUES(1,'${appId}','+8613800138000','86',1800000000000,'${'a'.repeat(64)}'),(3,'${appId}','+8613900139000','86',1800000000000,'${'b'.repeat(64)}');
+    INSERT INTO ar_user_phone VALUES(1,'${appId}','+8613800138000','86',1800000000000,'${'a'.repeat(64)}'),(3,'${appId}','+8613900139000','86',1800000000000,'${'b'.repeat(64)}'),(4,'${appId}','+8613700137000','86',1800000000000,'${'c'.repeat(64)}');
     CREATE TABLE ar_admin_login_challenge(id TEXT PRIMARY KEY,browser_hash TEXT,origin TEXT,confirmation_code TEXT,status TEXT,scanned_user_id INTEGER,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,qrcode_image BLOB);
     CREATE TABLE ar_admin_session(id TEXT PRIMARY KEY,user_id INTEGER,appid TEXT,created_ms INTEGER,expires_ms INTEGER,revoked_ms INTEGER);`);
-  const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/^(DELETE FROM .*?) LIMIT 100$/, '$1');
+  const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/CURRENT_TIMESTAMP\(3\)/g, 'CURRENT_TIMESTAMP').replace(/^(DELETE FROM .*?) LIMIT 100$/, '$1');
   const db = {
     async query(query: string, values: any[] = []) { return sqlite.prepare(sql(query)).all(...values) as Row[]; },
     async one(query: string, values: any[] = []) { return (await this.query(query, values))[0] ?? null; },
     async execute(query: string, values: any[] = []) { const result = sqlite.prepare(sql(query)).run(...values); return { affectedRows: Number(result.changes), insertId: Number(result.lastInsertRowid) }; },
+    async insert(table: string, data: Row) { const entries = Object.entries(data); const result = await this.execute(`INSERT INTO ${table} (${entries.map(([name]) => name)}) VALUES (${entries.map(() => '?')})`, entries.map(([, value]) => value)); return (await this.one(`SELECT * FROM ${table} WHERE id=?`, [result.insertId]))!; },
     async transaction<T>(operation: (tx: any) => Promise<T>): Promise<T> { sqlite.exec('BEGIN'); try { const result = await operation(this); sqlite.exec('COMMIT'); return result; } catch (error) { sqlite.exec('ROLLBACK'); throw error; } },
   };
   let now = 1_800_000_000_000;
@@ -31,9 +35,9 @@ async function fixture() {
   const auth = new RentalAuth(db as unknown as Database, client as any, { jwtSecret: 'admin-test-signing-key-at-least-32-bytes', now: () => now });
   const admin = new AdminAuth(db as unknown as Database, client as any, auth, { publicOrigin: origin, now: () => now });
   auth.webAuthenticate = admin.authenticate;
-  const router = new ApiRouter(); admin.register(router);
+  const router = new ApiRouter(); admin.register(router); auth.registerAuth(router);
   const tokens: Record<string, string> = {};
-  for (const name of ['manager', 'ordinary', 'other']) tokens[name] = (await auth.login(name)).token.accessToken;
+  for (const name of ['manager', 'ordinary', 'other', 'root']) tokens[name] = (await auth.login(name)).token.accessToken;
   const ctx = (input: { cookie?: string; token?: string; source?: string | null; body?: Row; id?: string; method?: string } = {}) => ({
     req: { method: input.method || 'POST', protocol: 'https', socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'admin.example.test', ...(input.source === null ? {} : { origin: input.source ?? origin }), ...(input.cookie ? { cookie: input.cookie } : {}), ...(input.token ? { authorization: 'Bearer ' + input.token } : {}) } },
     res: { setHeader: vi.fn(), append: vi.fn(), type: vi.fn().mockReturnThis(), end: vi.fn() }, body: input.body || {}, params: { id: input.id }, query: {},
@@ -54,7 +58,8 @@ async function fixture() {
     const result = await route('POST', '/challenges/:id/consume')(context) as Row;
     return { result, context, cookie: cookieFrom(context, 'ar_admin_session') };
   };
-  return { db, client, auth, admin, tokens, ctx, route, invoke, create, approve, consume, advance: (ms: number) => { now += ms; } };
+  const changeRole = (input: Parameters<typeof ctx>[0]) => router.routes.find(item => item.method === 'PUT' && item.path === '/v2/rental/admin/users/:id/role')!.handler(ctx({ ...input, method: 'PUT' })) as Promise<Row>;
+  return { db, client, auth, admin, tokens, ctx, route, invoke, create, approve, consume, changeRole, advance: (ms: number) => { now += ms; } };
 }
 
 describe('durable admin scan login', () => {
@@ -126,6 +131,40 @@ describe('durable admin scan login', () => {
     await expect(f.invoke('GET', '/session', { cookie: session.cookie })).rejects.toMatchObject({ status: 401 });
     const c2 = await f.create(); await f.approve(c2); const s2 = await f.consume(c2); f.advance(28_800_000);
     await expect(f.invoke('GET', '/session', { cookie: s2.cookie })).rejects.toMatchObject({ status: 401 });
+  });
+  it('lets only root grant or revoke managers through the website and applies revocation to existing credentials', async () => {
+    const f = await fixture();
+    const managerChallenge = await f.create(); await f.approve(managerChallenge);
+    const managerSession = await f.consume(managerChallenge);
+    const rootChallenge = await f.create(); await f.approve(rootChallenge, 'root');
+    const rootSession = await f.consume(rootChallenge);
+    const grant = { id: '2', body: { role: 'manager', reason: '授权现场设备归还与退款' } };
+
+    for (const credentials of [{ token: f.tokens.ordinary }, { token: f.tokens.manager }, { cookie: managerSession.cookie }]) {
+      await expect(f.changeRole({ ...grant, ...credentials })).rejects.toMatchObject({ status: 403 });
+    }
+    await expect(f.changeRole({ cookie: managerSession.cookie, id: '1', body: { role: 'manager' } })).rejects.toMatchObject({ status: 403 });
+    await expect(f.changeRole({ ...grant, cookie: rootSession.cookie, source: null })).rejects.toMatchObject({ status: 403 });
+    await expect(f.changeRole({ cookie: rootSession.cookie, id: '2', body: { role: 'root' } })).rejects.toMatchObject({ status: 422 });
+    await expect(f.changeRole({ cookie: rootSession.cookie, id: '4', body: { role: 'user' } })).rejects.toMatchObject({ status: 403 });
+    expect(await f.changeRole({ ...grant, cookie: rootSession.cookie })).toMatchObject({ id: 2, role: 'manager' });
+    // The user keeps the token issued before being promoted; its claims do not own a role.
+    expect((await f.auth.authenticateBearer(f.ctx({ token: f.tokens.ordinary }))).user.role).toBe('manager');
+
+    expect(await f.changeRole({ cookie: rootSession.cookie, id: '1', body: { role: 'user', reason: '撤销管理员' } })).toMatchObject({ role: 'user' });
+    const demoted = await f.auth.authenticateBearer(f.ctx({ token: f.tokens.manager }));
+    expect(demoted.user.role).toBe('user');
+    // A real privileged service refuses the existing mini-program JWT after demotion.
+    await expect(new DeviceService({ db: f.db as any }).create(demoted.user, { uuid: 'must-not-create' })).rejects.toMatchObject({ status: 403 });
+    await expect(f.invoke('GET', '/session', { cookie: managerSession.cookie })).rejects.toMatchObject({ status: 403 });
+    await expect(f.changeRole({ ...grant, cookie: managerSession.cookie })).rejects.toMatchObject({ status: 403 });
+    await f.changeRole({ cookie: rootSession.cookie, id: '2', body: { role: 'user', reason: '撤销临时授权' } });
+    expect((await f.auth.authenticateBearer(f.ctx({ token: f.tokens.ordinary }))).user.role).toBe('user');
+    expect(await f.db.query('SELECT actor_user_id,target_user_id,previous_role,next_role,source,reason FROM ar_role_audit ORDER BY id')).toEqual([
+      { actor_user_id: 4, target_user_id: 2, previous_role: 'user', next_role: 'manager', source: 'api', reason: '授权现场设备归还与退款' },
+      { actor_user_id: 4, target_user_id: 1, previous_role: 'manager', next_role: 'user', source: 'api', reason: '撤销管理员' },
+      { actor_user_id: 4, target_user_id: 2, previous_role: 'manager', next_role: 'user', source: 'api', reason: '撤销临时授权' },
+    ]);
   });
   it('allows only direct loopback origins when PUBLIC_ORIGIN is absent', async () => {
     const f = await fixture(); vi.stubEnv('PUBLIC_ORIGIN', '');
