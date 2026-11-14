@@ -15,7 +15,7 @@ class RentalDb {
     opened.push(this);
     this.sqlite.exec(`PRAGMA foreign_keys=ON;
       CREATE TABLE ar_user(id INTEGER PRIMARY KEY,role TEXT,appid TEXT DEFAULT 'wx-rental-test');
-      INSERT INTO ar_user(id,role) VALUES(1,'user'),(2,'manager'),(3,'user'),(4,'root');
+      INSERT INTO ar_user(id,role) VALUES(1,'user'),(2,'manager'),(3,'user'),(4,'root'),(5,'admin');
       CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
       INSERT INTO ar_device(id,uuid,device_type,name) VALUES(7,'camera-7','rokid','AR眼镜'),(8,'camera-8','ios','设备8');`);
     const mysql = readFileSync(resolve('database/002-rentals.sql'), 'utf8');
@@ -59,6 +59,7 @@ function fixture() {
   const other: RentalPrincipal = { user: { id: 3, role: 'user' }, appid, openid: 'payer-3' };
   const manager: RentalPrincipal = { user: { id: 2, role: 'manager' }, appid, openid: 'payer-2' };
   const root: RentalPrincipal = { user: { id: 4, role: 'root' }, appid, openid: 'payer-4' };
+  const admin: RentalPrincipal = { user: { id: 5, role: 'admin' }, appid, openid: 'payer-5' };
   const orders = new Map<string, Row>(), refunds = new Map<string, Row>();
   const payment = {
     config: { appId: appid, mchId: 'merchant-rental', privateKey: 'test-private', serialNo: 'test-serial', apiV3Key: 'test-api-key', platformKeys: { test: 'test-public' } },
@@ -103,10 +104,29 @@ function fixture() {
     const active = await service.syncPayment(principal, row.id);
     return { row, rental: active.rental, provider };
   };
-  return { db, service, options, services, payment, orders, refunds, user, other, manager, root, configure, create, pay, advance: (milliseconds: number) => { now += milliseconds; } };
+  return { db, service, options, services, payment, orders, refunds, user, other, manager, admin, root, configure, create, pay, advance: (milliseconds: number) => { now += milliseconds; } };
 }
 
 describe('independent AR rental lifecycle', () => {
+  it.each(['manager', 'admin', 'root'] as const)('inherits device operations for %s without trusting a forged client role', async role => {
+    const f = fixture(); const actor = f[role];
+    expect((await f.service.context(actor, 'role-device-' + role)).actions.canCreate).toBe(true);
+    const created = await f.service.createDevice(actor, { uuid: 'role-device-' + role });
+    await f.service.configure(actor, created.device.id, { enabled: true, useFeeCents: 2000, depositCents: 8000, version: 0 });
+    expect(await f.service.context(f.user, created.device.uuid)).toMatchObject({ state: 'AVAILABLE', pricing: { totalCents: 10000 }, actions: { canRent: true, canConfigure: false } });
+    expect((await f.service.devices(actor, { search: created.device.uuid })).total).toBe(1);
+    const forged = { ...f.user, user: { ...f.user.user, role } };
+    await expect(f.service.createDevice(forged, { uuid: 'forged-role-' + role })).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.configure(forged, created.device.id, { enabled: false, useFeeCents: 0, depositCents: 0, version: 1 })).rejects.toMatchObject({ status: 403 });
+    expect((await f.service.context(actor, created.device.uuid)).pricing).toMatchObject({ enabled: true, totalCents: 10000, version: 1 });
+  });
+  it('retains device capabilities when a system administrator is demoted to device manager', async () => {
+    const f = fixture(); await f.configure(); const paid = await f.pay();
+    await f.db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [f.admin.user.id]);
+    expect((await f.service.context(f.admin, 'camera-7')).actions).toMatchObject({ canConfigure: true, canEndRental: true });
+    expect((await f.service.end(f.admin, paid.row.id, { refundMode: 'deposit', reason: '设备已归还', idempotencyKey: 'demoted-admin-to-manager' })).rental).toMatchObject({ status: 'ENDED', refundAmountCents: 20000, refundStatus: 'PROCESSING' });
+    expect((await f.service.context(f.user, 'camera-7')).state).toBe('SETTLING');
+  });
   it('defaults omitted device types while preserving explicit and existing types', async () => {
     const f = fixture();
     expect(await f.service.createDevice(f.manager, { uuid: 'default-type-device' })).toMatchObject({ created: true, device: { type: 'Rokid Studio2' } });
@@ -243,9 +263,9 @@ describe('independent AR rental lifecycle', () => {
     expect((await f.service.syncPayment(f.user, row.id)).rental.startedAt).toBe(active.rental.startedAt);
     await expect(f.service.get(f.other, row.id)).rejects.toMatchObject({ status: 403 });
   });
-  it('normally charges managers and roots when they rent for themselves', async () => {
-    for (const role of ['manager', 'root']) {
-      const f = fixture(); await f.configure(); const actor = role === 'root' ? f.root : f.manager;
+  it('normally charges every management role when they rent for themselves', async () => {
+    for (const role of ['manager', 'admin', 'root'] as const) {
+      const f = fixture(); await f.configure(); const actor = f[role];
       const result = await f.create(actor);
       expect(result.rental).toMatchObject({ totalCents: 22000, mine: true, paymentStatus: 'NOTPAY' });
     }
@@ -258,8 +278,10 @@ describe('independent AR rental lifecycle', () => {
     }
     await expect(f.service.syncRefund(f.user, paid.row.id)).rejects.toMatchObject({ status: 403 });
     await expect(f.service.retryRefund(f.user, paid.row.id)).rejects.toMatchObject({ status: 403 });
-    const forgedManager = { ...f.user, user: { ...f.user.user, role: 'manager' } };
-    await expect(f.service.end(forgedManager, paid.row.id, { refundMode: 'deposit', reason: '伪造身份', idempotencyKey: 'forged-manager-end' })).rejects.toMatchObject({ status: 403 });
+    for (const role of ['manager', 'admin', 'root']) {
+      const forgedManager = { ...f.user, user: { ...f.user.user, role } };
+      await expect(f.service.end(forgedManager, paid.row.id, { refundMode: 'deposit', reason: '伪造身份', idempotencyKey: 'forged-' + role + '-end' })).rejects.toMatchObject({ status: 403 });
+    }
     const actions = { canEndRental: false, canSyncRefund: false, canRetryRefund: false };
     expect(await f.service.get(f.user, paid.row.id)).toMatchObject({ rental: { status: 'ACTIVE', mine: true }, actions });
     expect(await f.service.context(f.user, 'camera-7')).toMatchObject({ state: 'RENTED', actions });
@@ -268,8 +290,8 @@ describe('independent AR rental lifecycle', () => {
     expect(f.refunds.size).toBe(0);
     expect(await f.db.query("SELECT * FROM ar_rental_event WHERE event='RENTAL_ENDED'")).toEqual([]);
   });
-  it.each(['manager', 'root'])('allows a current %s who is also the payer to settle only with management permission', async role => {
-    const f = fixture(); await f.configure(); const actor = role === 'root' ? f.root : f.manager;
+  it.each(['manager', 'admin', 'root'] as const)('allows a current %s who is also the payer to settle only with management permission', async role => {
+    const f = fixture(); await f.configure(); const actor = f[role];
     const paid = await f.pay(actor);
     expect((await f.service.get(actor, paid.row.id)).actions.canEndRental).toBe(true);
     const result = await f.service.end(actor, paid.row.id, { refundMode: 'full', reason: '管理员确认本人设备归还', idempotencyKey: 'own-admin-end-' + role, refundAmountCents: 1 });
@@ -277,8 +299,8 @@ describe('independent AR rental lifecycle', () => {
     expect([...f.refunds.values()][0].amount).toEqual({ refund: 22000, total: 22000, currency: 'CNY' });
     expect((await f.service.context(actor, 'camera-7')).state).toBe('SETTLING');
   });
-  it('rechecks the manager inside the settlement transaction after a role revocation', async () => {
-    const f = fixture(); await f.configure(); const paid = await f.pay();
+  it.each(['manager', 'admin'] as const)('rechecks the current %s inside the settlement transaction after a role revocation', async role => {
+    const f = fixture(); await f.configure(); const paid = await f.pay(); const actor = f[role];
     const originalOne = f.db.one.bind(f.db);
     let revoked = false;
     vi.spyOn(f.db, 'one').mockImplementation(async (sql, values) => {
@@ -287,26 +309,26 @@ describe('independent AR rental lifecycle', () => {
       // device/order lock and final settlement authorization are acquired.
       if (!revoked && sql === 'SELECT role FROM ar_user WHERE id = ? AND appid = ?') {
         revoked = true;
-        await f.db.execute("UPDATE ar_user SET role='user' WHERE id=?", [f.manager.user.id]);
+        await f.db.execute("UPDATE ar_user SET role='user' WHERE id=?", [actor.user.id]);
       }
       return result;
     });
     f.payment.payment.mockClear();
-    await expect(f.service.end(f.manager, paid.row.id, { refundMode: 'deposit', reason: '已撤销管理员', idempotencyKey: 'revoked-during-end' })).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.end(actor, paid.row.id, { refundMode: 'deposit', reason: '已撤销管理员', idempotencyKey: 'revoked-during-end' })).rejects.toMatchObject({ status: 403 });
     expect(revoked).toBe(true);
-    expect((await f.service.context(f.manager, 'camera-7')).actions).toMatchObject({ canEndRental: false, canSyncRefund: false, canRetryRefund: false });
-    await expect(f.service.get(f.manager, paid.row.id)).rejects.toMatchObject({ status: 403 });
-    await expect(f.service.syncRefund(f.manager, paid.row.id)).rejects.toMatchObject({ status: 403 });
-    await expect(f.service.retryRefund(f.manager, paid.row.id)).rejects.toMatchObject({ status: 403 });
+    expect((await f.service.context(actor, 'camera-7')).actions).toMatchObject({ canEndRental: false, canSyncRefund: false, canRetryRefund: false });
+    await expect(f.service.get(actor, paid.row.id)).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.syncRefund(actor, paid.row.id)).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.retryRefund(actor, paid.row.id)).rejects.toMatchObject({ status: 403 });
     expect((await f.service.get(f.user, paid.row.id)).rental.status).toBe('ACTIVE');
     expect((await f.service.context(f.user, 'camera-7')).state).toBe('RENTED');
     expect(f.payment.payment).not.toHaveBeenCalled();
     expect(f.refunds.size).toBe(0);
   });
-  it('keeps an approved timed-out refund occupied and retries the same refund only for a current administrator', async () => {
-    const f = fixture(); await f.configure(); const paid = await f.pay();
+  it.each(['manager', 'admin'] as const)('keeps an approved timed-out refund occupied and retries the same refund only for a current %s', async role => {
+    const f = fixture(); await f.configure(); const paid = await f.pay(); const actor = f[role];
     f.payment.payment.mockRejectedValueOnce(new Error('refund request timed out'));
-    const ended = await f.service.end(f.manager, paid.row.id, { refundMode: 'deposit', reason: '现场确认归还', idempotencyKey: 'timeout-end-request' });
+    const ended = await f.service.end(actor, paid.row.id, { refundMode: 'deposit', reason: '现场确认归还', idempotencyKey: 'timeout-end-request' });
     expect(ended.rental).toMatchObject({ status: 'ENDED', refundStatus: 'PENDING', refundAmountCents: 20000 });
     const pending = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [paid.row.id]))!;
     expect((await f.service.context(f.user, 'camera-7')).state).toBe('SETTLING');
@@ -315,13 +337,13 @@ describe('independent AR rental lifecycle', () => {
     await expect(f.service.retryRefund(f.user, paid.row.id)).rejects.toMatchObject({ status: 403 });
     expect(await f.service.get(f.user, paid.row.id)).toMatchObject({ rental: { refundStatus: 'PENDING' }, actions: { canEndRental: false, canSyncRefund: false, canRetryRefund: false } });
     expect(f.payment.payment.mock.calls).toHaveLength(before);
-    expect(await f.service.get(f.manager, paid.row.id)).toMatchObject({ actions: { canEndRental: false, canSyncRefund: true, canRetryRefund: true } });
-    expect((await f.service.retryRefund(f.manager, paid.row.id)).rental.refundStatus).toBe('PROCESSING');
+    expect(await f.service.get(actor, paid.row.id)).toMatchObject({ actions: { canEndRental: false, canSyncRefund: true, canRetryRefund: true } });
+    expect((await f.service.retryRefund(actor, paid.row.id)).rental.refundStatus).toBe('PROCESSING');
     expect([...f.refunds.keys()]).toEqual([pending.out_refund_no]);
     await f.service.end(f.root, paid.row.id, { refundMode: 'deposit', reason: '重复确认', idempotencyKey: 'timeout-end-duplicate' });
     expect(f.refunds.size).toBe(1);
-    await f.db.execute("UPDATE ar_user SET role='user' WHERE id=?", [f.manager.user.id]);
-    await expect(f.service.end(f.manager, paid.row.id, { refundMode: 'deposit', reason: '已撤销权限后重试', idempotencyKey: 'revoked-end-duplicate' })).rejects.toMatchObject({ status: 403 });
+    await f.db.execute("UPDATE ar_user SET role='user' WHERE id=?", [actor.user.id]);
+    await expect(f.service.end(actor, paid.row.id, { refundMode: 'deposit', reason: '已撤销权限后重试', idempotencyKey: 'revoked-end-duplicate' })).rejects.toMatchObject({ status: 403 });
     [...f.refunds.values()][0].status = 'SUCCESS';
     // The approved durable refund is still completed by the worker after its
     // initiating manager loses permission; customers only read the result.

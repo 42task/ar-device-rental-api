@@ -8,12 +8,12 @@ import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
 import { maskedPhone, normalizePhoneInput } from './phone';
 import { initializeRootFromVerifiedPhone } from './admin';
+import { assignableRoles, requireUserAdmin, userRole } from '../core/roles';
 
 export { bootstrapRoot } from './admin';
 export interface RentalPrincipal { user: Row; appid: string; openid: string }
 export interface RentalAuthOptions { jwtSecret?: string; jwtSecretPath?: string; issuer?: string; audience?: string; appId?: string; rootPhone?: string; now?: () => number }
-const role = (value: unknown) => value === 'root' || value === 'manager' ? value : 'user';
-const publicUser = (user: Row): Row => ({ id: Number(user.id), role: role(user.role), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.verified_phone ? maskedPhone(user.verified_phone, user.phone_country_code) : user.tel ?? null, ...(user.verified_phone ? { phoneVerified: true } : {}) });
+const publicUser = (user: Row): Row => ({ id: Number(user.id), role: userRole(user), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.verified_phone ? maskedPhone(user.verified_phone, user.phone_country_code) : user.tel ?? null, ...(user.verified_phone ? { phoneVerified: true } : {}) });
 const validIdentity = (value: unknown): value is string => typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,128}$/u.test(value);
 
 export class RentalAuth {
@@ -63,7 +63,7 @@ export class RentalAuth {
     const user = await this.db.one('SELECT * FROM ar_user WHERE id=? AND appid=?', [claims.uid, this.appId]);
     if (!user || !validIdentity(user.openid)) throw new ApiError(401, '当前微信账号已失效，请重新登录');
     const current = this.rootPhone ? await initializeRootFromVerifiedPhone(this.db, user, this.appId, this.rootPhone) : user;
-    return { ...current, role: role(current.role) };
+    return { ...current, role: userRole(current) };
   }
   async login(code: unknown): Promise<Row> {
     this.configured();
@@ -109,7 +109,7 @@ export class RentalAuth {
   };
   private async users(ctx: Context): Promise<Row> {
     const principal = await this.authenticate(ctx);
-    if (principal.user.role !== 'root') throw new ApiError(403, '仅 root 可以管理用户');
+    requireUserAdmin(principal.user);
     const page = Math.max(1, Math.min(1000000, Math.floor(Number(ctx.query.page)) || 1)), pageSize = 20;
     const search = typeof ctx.query.search === 'string' ? ctx.query.search.trim().slice(0, 100) : '';
     const searchSql = search ? ' AND (u.nickname LIKE ? OR u.tel LIKE ? OR p.phone_e164 LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
@@ -118,26 +118,27 @@ export class RentalAuth {
     const from = ' FROM ar_user u LEFT JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=u.appid AND p.verified_ms>0 WHERE u.appid=? AND u.id<>?';
     const count = await this.db.one('SELECT COUNT(*) AS total' + from + searchSql, values);
     const items = await this.db.query(`SELECT u.*,p.phone_e164 AS verified_phone,p.country_code AS phone_country_code${from}${searchSql} ORDER BY u.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values);
-    return { items: items.map(publicUser), page, pageSize, total: Number(count?.total || 0) };
+    return { items: items.map(user => ({ ...publicUser(user), allowedRoles: assignableRoles(principal.user, user) })), page, pageSize, total: Number(count?.total || 0) };
   }
   private async setRole(ctx: Context): Promise<Row> {
     const principal = await this.authenticate(ctx);
-    if (principal.user.role !== 'root') throw new ApiError(403, '仅 root 可以管理用户');
+    requireUserAdmin(principal.user);
     const targetId = Number(ctx.params.id), nextRole = ctx.body.role;
-    if (!Number.isSafeInteger(targetId) || targetId < 1 || !['manager', 'user'].includes(nextRole)) throw new ApiError(422, '用户编号或角色无效');
-    const user = await this.db.transaction(async tx => {
+    if (!Number.isSafeInteger(targetId) || targetId < 1 || !['manager', 'user', 'admin'].includes(nextRole)) throw new ApiError(422, '用户编号或角色无效');
+    const result = await this.db.transaction(async tx => {
       if (!await tx.one('SELECT id FROM ar_admin_guard WHERE id=1 FOR UPDATE')) throw new ApiError(503, '请先初始化数据库');
       const actor = await tx.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [principal.user.id, this.appId]);
-      if (!actor || actor.role !== 'root') throw new ApiError(403, 'root 权限已变更，请重新登录');
+      if (!actor) throw new ApiError(403, '用户管理权限已变更，请重新登录');
+      requireUserAdmin(actor);
       const target = await tx.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [targetId, this.appId]);
       if (!target) throw new ApiError(404, '用户不存在');
-      if (target.role === 'root') throw new ApiError(403, 'root 账号不可通过此接口修改');
-      if (target.role === nextRole) return target;
+      if (!assignableRoles(actor, target).includes(nextRole)) throw new ApiError(403, '不能修改自身、同级或更高身份，也不能授予超出权限的身份');
+      if (target.role === nextRole) return { user: target, actor };
       await tx.execute('UPDATE ar_user SET role=?,updated_at=CURRENT_TIMESTAMP(3) WHERE id=?', [nextRole, targetId]);
       await tx.insert('ar_role_audit', { actor_user_id: principal.user.id, target_user_id: targetId, previous_role: target.role, next_role: nextRole, source: 'api', reason: typeof ctx.body.reason === 'string' ? ctx.body.reason.trim().slice(0, 255) || '管理员更新角色' : '管理员更新角色' });
-      return { ...target, role: nextRole };
+      return { user: { ...target, role: nextRole }, actor };
     });
-    return publicUser(user);
+    return { ...publicUser(result.user), allowedRoles: assignableRoles(result.actor, result.user) };
   }
   registerAuth(router: ApiRouter): void {
     const route = (method: string, path: string, handler: (ctx: Context) => Promise<Row>) => router.add(method, path, ctx => { ctx.res.setHeader('Cache-Control', 'no-store'); return handler(ctx); });

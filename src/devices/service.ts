@@ -45,6 +45,9 @@ export class DeviceService {
     let result: { row: Row; created: boolean };
     try {
       result = await this.services.db.transaction(async db => {
+        const currentUser = await db.one('SELECT role FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [user.id, user.appid ?? '']);
+        if (!currentUser) throw new ApiError(403, '设备管理权限已变更，请重新登录');
+        requireManager(currentUser);
         const existing = await db.one('SELECT * FROM ar_device WHERE uuid = ?', [uuid]);
         if (existing) return { row: existing, created: false };
         return { row: await db.insert('ar_device', { uuid, name, device_type }), created: true };

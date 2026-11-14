@@ -33,7 +33,7 @@ npm start
 
 目标账号须先在当前小程序完成微信原生手机号授权。服务端只核对当前 AppID 的已验证绑定；匹配配置且系统尚无 root 时，在之后的登录、令牌刷新或身份校验中自动初始化首个 root，并记录 `env-root-bootstrap` 审计。旧 `tel` 字段、手填号码或仅完成微信登录都不能取得该权限。
 
-`ROOT_PHONE` 留空时关闭自动初始化。已有 root 时不会新增、替换或撤销 root，修改或清空该变量也不会迁移既有权限；后续 manager 由 root 管理。非空号码配置无效时，登录与身份校验返回安全的 503 配置错误，不回显号码。
+`ROOT_PHONE` 留空时关闭自动初始化。已有 root 时不会新增、替换或撤销 root，修改或清空该变量也不会迁移既有权限；身份按 root > admin > manager > user 继承；admin 可管理其他 user、manager，仅 root 可管理 admin；数据库保证全库最多一个 root。非空号码配置无效时，登录与身份校验返回安全的 503 配置错误，不回显号码。
 
 也可保留受控控制台的人工初始化方式，先用已验证手机号核对账号：
 
@@ -42,7 +42,7 @@ npm run admin -- find-user-by-phone --phone-stdin
 npm run admin -- bootstrap-root --phone-stdin
 ```
 
-号码从标准输入读取，TTY 输入不回显。人工初始化同样要求系统没有 root。
+号码从标准输入读取，TTY 输入不回显。人工初始化同样要求系统没有 root，并再次核对微信已验证手机号，不支持按裸用户ID初始化。
 
 ## 构建与校验
 
@@ -80,7 +80,7 @@ Portainer 单独配置同一香港 registry 的拉取凭据；默认使用 `publ
 | `POST /api/v2/rental/auth/refresh` | 刷新身份令牌 |
 | `/api/v2/rental/devices` | 设备识别、登记及费用配置 |
 | `/api/v2/rentals` | 租赁记录、支付、结束及退款查询 |
-| `/api/v2/rental/admin` | 管理员设备列表与 root 身份管理 |
+| `/api/v2/rental/admin` | 管理员设备列表与 admin/root 分级身份管理 |
 | `POST /api/v2/rental/payment-notify` | 微信支付通知 |
 | `POST /api/v2/rental/refund-notify` | 微信退款通知 |
 

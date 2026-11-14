@@ -7,10 +7,12 @@ CREATE TABLE IF NOT EXISTS ar_user (
   nickname varchar(128),
   avatar varchar(1024),
   tel varchar(32),
-  role enum('user','manager','root') NOT NULL DEFAULT 'user',
+  role enum('user','manager','admin','root') NOT NULL DEFAULT 'user',
+  root_singleton tinyint GENERATED ALWAYS AS (CASE WHEN role='root' THEN 1 ELSE NULL END) STORED,
   created_at datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   UNIQUE KEY uq_ar_user_identity (appid,openid),
+  UNIQUE KEY uq_ar_user_single_root (root_singleton),
   KEY ix_ar_user_role (role,id)
 ) ENGINE=InnoDB CHARACTER SET utf8mb4;
 

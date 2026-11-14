@@ -3,7 +3,7 @@ import type { RentalAuth, RentalPrincipal } from '../auth';
 import type { Context, Row } from '../core/contracts';
 import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
-import { requireManager } from '../core/roles';
+import { requireManager, userRole } from '../core/roles';
 import type { ApiRouter } from '../core/router';
 import type { WeChatClient } from '../payments/wechat';
 import { requireVerifiedPhone } from '../auth/phone';
@@ -14,7 +14,7 @@ const CHALLENGE_MS = 5 * 60_000, SESSION_MS = 8 * 60 * 60_000;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const same = (left: string, right: string) => left.length === right.length && timingSafeEqual(Buffer.from(left), Buffer.from(right));
 const iso = (ms: unknown) => new Date(Number(ms)).toISOString();
-const publicUser = (user: Row): Row => ({ id: Number(user.id), role: user.role, nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.tel ?? null });
+const publicUser = (user: Row): Row => ({ id: Number(user.id), role: userRole(user), nickname: user.nickname ?? null, avatar: user.avatar ?? null, tel: user.tel ?? null });
 const loopback = (address: string | undefined) => !!address && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
 
 export interface AdminAuthOptions { publicOrigin?: string; envVersion?: 'release' | 'trial' | 'develop'; now?: () => number }

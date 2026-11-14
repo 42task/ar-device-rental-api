@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type { Context, Row, Services } from '../core/contracts';
 import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
-import { requireManager, userRole } from '../core/roles';
+import { hasDeviceManagement, requireManager } from '../core/roles';
 import { DeviceService, deviceUuid } from '../devices/service';
 import { rentalOrderNumber, rentalRefundNumber } from './numbers';
 import type { RentalOptions, RentalPrincipal } from './types';
@@ -22,7 +22,7 @@ const requestKey = (value: unknown): string => {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(value)) throw new ApiError(422, '请求标识无效');
   return value;
 };
-const manager = (principal: RentalPrincipal) => userRole(principal.user) !== 'user';
+const manager = (principal: RentalPrincipal) => hasDeviceManagement(principal.user);
 const pagination = (query: Row): { page: number; pageSize: number } => {
   const requested = Number(query.page), size = Number(query.pageSize || query['per-page'] || 20);
   const page = Number.isSafeInteger(requested) && requested > 0 ? Math.min(requested, 10000000) : 1;
@@ -50,7 +50,7 @@ export class RentalService {
   private async currentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<boolean> {
     if (!manager(principal)) return false;
     const current = await db.one('SELECT role FROM ar_user WHERE id = ? AND appid = ?' + (lock ? ' FOR UPDATE' : ''), [principal.user.id, principal.appid]);
-    return !!current && userRole(current) !== 'user';
+    return !!current && hasDeviceManagement(current);
   }
   private async requireCurrentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<void> {
     requireManager(principal.user);
@@ -355,7 +355,7 @@ export class RentalService {
   }
   async createDevice(principal: RentalPrincipal, input: Row): Promise<Row> {
     this.assertPrincipal(principal); requireManager(principal.user);
-    return new DeviceService(this.services).create(principal.user, input);
+    return new DeviceService(this.services).create({ ...principal.user, appid: principal.appid }, input);
   }
   async configure(principal: RentalPrincipal, deviceId: unknown, input: Row): Promise<Row> {
     this.assertPrincipal(principal); requireManager(principal.user);
@@ -367,6 +367,7 @@ export class RentalService {
     const device = await this.services.db.transaction(async db => {
       const current = await db.one('SELECT * FROM ar_device WHERE id = ? FOR UPDATE', [id(deviceId)]);
       if (!current) throw new ApiError(404, '设备不存在');
+      await this.requireCurrentManager(principal, db, true);
       const config = await db.one('SELECT * FROM ar_rental_config WHERE device_id = ?', [current.id]);
       if (Number(config?.version || 0) !== version) throw new ApiError(409, '设备配置已被其他管理员修改，请刷新');
       if (config) await db.execute('UPDATE ar_rental_config SET enabled=?,use_fee_cents=?,deposit_cents=?,version=version+1,updated_ms=?,updated_by=? WHERE device_id=?', [Number(input.enabled), useFee, deposit, this.now(), principal.user.id, current.id]);
@@ -376,7 +377,7 @@ export class RentalService {
     return this.context(principal, device.uuid);
   }
   async devices(principal: RentalPrincipal, query: Row): Promise<Row> {
-    this.assertPrincipal(principal); requireManager(principal.user);
+    this.assertPrincipal(principal); await this.requireCurrentManager(principal);
     const { page, pageSize } = pagination(query);
     const search = typeof query.search === 'string' ? query.search.trim().slice(0, 100) : '';
     const pattern = '%' + search.replace(/[=%_]/g, '=$&') + '%';

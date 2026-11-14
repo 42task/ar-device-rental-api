@@ -56,6 +56,24 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL ROOT_PHONE init
       await resetSyntheticRoles();
       await Promise.all([makeAuth(phone1).login('1'), makeAuth(phone2).login('2')]);
       expect(await assertSingleAudit()).toMatchObject({ source: 'env-root-bootstrap' });
+
+      await resetSyntheticRoles();
+      const otherAppId = 'wx1111111111111111';
+      await db.insert('ar_user', { id: 3, appid: otherAppId, openid: 'synthetic-cross-app-root', role: 'user' });
+      await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [3, otherAppId, phone1, '86', Date.now(), '3'.repeat(64)]);
+      const otherClient = { config: { appId: otherAppId }, codeSession: async () => ({ openid: 'synthetic-cross-app-root' }) };
+      const otherAuth = new RentalAuth(db, otherClient as any, { jwtSecret: 'synthetic-cross-app-root-signing-key-32-bytes', rootPhone: phone1 });
+      await Promise.all([makeAuth(phone1).login('1'), otherAuth.login('cross-app')]);
+      expect(await assertSingleAudit()).toMatchObject({ source: 'env-root-bootstrap' });
+
+      await resetSyntheticRoles();
+      await db.execute("CREATE TRIGGER synthetic_root_audit_failure BEFORE INSERT ON ar_role_audit FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='Synthetic audit failure'");
+      await expect(makeAuth(phone1).login('1')).rejects.toMatchObject({ code: 'ER_SIGNAL_EXCEPTION' });
+      expect(await db.query("SELECT id FROM ar_user WHERE role='root'")).toEqual([]);
+      expect(await db.query('SELECT * FROM ar_role_audit')).toEqual([]);
+      await db.execute('DROP TRIGGER synthetic_root_audit_failure');
+      expect((await makeAuth(phone1).login('1')).user.role).toBe('root');
+      expect(await assertSingleAudit()).toMatchObject({ source: 'env-root-bootstrap', target_user_id: 1 });
     } finally {
       await db?.close();
       if (created) await control.query(`DROP DATABASE ${database}`);

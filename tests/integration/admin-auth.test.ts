@@ -21,8 +21,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       await migrate(db); await migrate(db);
       expect(Number((await db.one('SELECT version FROM ar_schema_meta'))!.version)).toBe(SCHEMA_VERSION);
       const appId = 'wx03dbf50c15cac06f', origin = 'https://admin.integration.test';
-      for (const [id, role] of [[1, 'manager'], [2, 'user'], [3, 'root']] as const) await db.insert('ar_user', { id, role, appid: appId, openid: 'synthetic-admin-' + id });
-      for (const id of [1, 3]) await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [id, appId, id === 1 ? '+8613800138000' : '+8613900139000', '86', Date.now(), String(id).repeat(64)]);
+      for (const [id, role] of [[1, 'manager'], [2, 'user'], [3, 'root'], [4, 'admin'], [5, 'admin']] as const) await db.insert('ar_user', { id, role, appid: appId, openid: 'synthetic-admin-' + id });
+      for (const [id, phone] of [[1, '+8613800138000'], [3, '+8613900139000'], [4, '+8613600136000'], [5, '+8613500135000']] as const) await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [id, appId, phone, '86', Date.now(), String(id).repeat(64)]);
       let providerCalls = 0;
       const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
       const client = { config: { appId }, codeSession: async (code: string) => ({ openid: 'synthetic-admin-' + code }), unlimitedCode: async () => { providerCalls++; return image; } };
@@ -33,10 +33,12 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       const nodes = [0, 1].map(() => {
         const auth = new RentalAuth(db!, client as any, { jwtSecret: 'synthetic-admin-integration-signing-key-32-bytes' });
         const admin = new AdminAuth(db!, client as any, auth, { publicOrigin: origin }); auth.webAuthenticate = admin.authenticate;
-        const router = new ApiRouter(); admin.register(router);
+        const router = new ApiRouter(); admin.register(router); auth.registerAuth(router);
         const route = (method: string, path: string) => router.routes.find(row => row.method === method && row.path === '/v2/rental/admin/auth' + path)!.handler;
         const call = (method: string, path: string, input: Parameters<typeof context>[0] = {}) => route(method, path)(context({ ...input, method })) as Promise<Row>;
-        return { auth, admin, route, call };
+        const changeRole = (input: Parameters<typeof context>[0]) => router.routes.find(row => row.method === 'PUT' && row.path === '/v2/rental/admin/users/:id/role')!.handler(context({ ...input, method: 'PUT' })) as Promise<Row>;
+        const users = (input: Parameters<typeof context>[0]) => router.routes.find(row => row.method === 'GET' && row.path === '/v2/rental/admin/users')!.handler(context({ ...input, method: 'GET' })) as Promise<Row>;
+        return { auth, admin, route, call, changeRole, users };
       });
       const tokens = [await nodes[0].auth.login('1'), await nodes[1].auth.login('3')].map(value => value.token.accessToken);
       const userToken = (await nodes[0].auth.login('2')).token.accessToken;
@@ -64,10 +66,38 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       expect((await db.one('SELECT id FROM ar_admin_session'))!.id).not.toBe(sessionCookie.split('=')[1]);
       const session = await nodes[1].call('GET', '/session', { cookie: sessionCookie });
       expect(session.user.id).toBe(winner === 0 ? 1 : 3);
+
+      const adminToken = (await nodes[0].auth.login('4')).token.accessToken;
+      const createAdminCtx = context(), adminChallenge = await nodes[0].route('POST', '/challenges')(createAdminCtx) as Row;
+      const adminBrowserCookie = createAdminCtx.res.append.mock.calls[0][1].split(';')[0];
+      await nodes[0].call('POST', '/challenges/:id/scan', { id: adminChallenge.id, token: adminToken });
+      await nodes[1].call('POST', '/challenges/:id/confirm', { id: adminChallenge.id, token: adminToken, body: { approved: true } });
+      const consumeAdminCtx = context({ id: adminChallenge.id, cookie: adminBrowserCookie });
+      expect(await nodes[1].route('POST', '/challenges/:id/consume')(consumeAdminCtx)).toMatchObject({ user: { id: 4, role: 'admin' } });
+      const adminSessionCookie = consumeAdminCtx.res.append.mock.calls[0][1].split(';')[0];
+      const userList = await nodes[0].users({ cookie: adminSessionCookie });
+      expect(userList.items.find((user: Row) => user.id === 2).allowedRoles).toEqual(['user', 'manager']);
+      expect(userList.items.find((user: Row) => user.id === 3).allowedRoles).toEqual([]);
+      expect(userList.items.find((user: Row) => user.id === 5).allowedRoles).toEqual([]);
+      expect(await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'manager' } })).toMatchObject({ role: 'manager' });
+      expect((await nodes[1].auth.authenticateBearer(context({ token: userToken }))).user.role).toBe('manager');
+      for (const [id, role] of [['4', 'user'], ['5', 'manager'], ['3', 'user'], ['2', 'admin']]) await expect(nodes[1].changeRole({ cookie: adminSessionCookie, id, body: { role } })).rejects.toMatchObject({ status: 403 });
+      await expect(nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'root' } })).rejects.toMatchObject({ status: 422 });
+      await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'user' } });
+      // Only root can grant admin or demote an existing admin. Previously issued
+      // browser cookies and JWTs immediately observe the lower current role.
+      await nodes[0].changeRole({ token: tokens[1], id: '2', body: { role: 'admin' } });
+      expect((await nodes[0].auth.authenticateBearer(context({ token: userToken }))).user.role).toBe('admin');
+      await nodes[0].changeRole({ token: tokens[1], id: '4', body: { role: 'manager' } });
+      expect((await nodes[1].call('GET', '/session', { cookie: adminSessionCookie })).user.role).toBe('manager');
+      await expect(nodes[0].users({ cookie: adminSessionCookie })).rejects.toMatchObject({ status: 403 });
+      await expect(nodes[1].changeRole({ token: adminToken, id: '1', body: { role: 'user' } })).rejects.toMatchObject({ status: 403 });
+      expect(Number((await db.one("SELECT COUNT(*) AS total FROM ar_user WHERE role='root'"))!.total)).toBe(1);
+
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [session.user.id]);
       await expect(nodes[0].call('GET', '/session', { cookie: sessionCookie })).rejects.toMatchObject({ status: 403 });
       await nodes[0].call('POST', '/logout', { cookie: sessionCookie });
-      expect((await db.one('SELECT revoked_ms FROM ar_admin_session'))!.revoked_ms).not.toBeNull();
+      expect((await db.one('SELECT revoked_ms FROM ar_admin_session WHERE user_id=?', [session.user.id]))!.revoked_ms).not.toBeNull();
     } finally {
       await db?.close();
       if (created) await control.query(`DROP DATABASE ${database}`);

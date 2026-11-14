@@ -12,13 +12,14 @@ import type { Database } from '../src/core/database';
 const appId = 'wx0123456789abcdef', key = 'new-rental-secret-32-bytes-at-least';
 const opened: DatabaseSync[] = [];
 const temporary: string[] = [];
-afterEach(() => { opened.splice(0).forEach(db => db.close()); temporary.splice(0).forEach(path => rmSync(path, { recursive: true, force: true })); vi.unstubAllEnvs(); });
+afterEach(() => { opened.splice(0).forEach(db => db.close()); temporary.splice(0).forEach(path => rmSync(path, { recursive: true, force: true })); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 function fixture() {
   const sqlite = new DatabaseSync(':memory:'); opened.push(sqlite);
   sqlite.exec(`CREATE TABLE ar_user(id INTEGER PRIMARY KEY AUTOINCREMENT,appid TEXT,openid TEXT,unionid TEXT,nickname TEXT,avatar TEXT,tel TEXT,role TEXT DEFAULT 'user',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(appid,openid));
     CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT UNIQUE);
     CREATE TABLE ar_role_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_user_id INTEGER,target_user_id INTEGER,previous_role TEXT,next_role TEXT,source TEXT,reason TEXT);
-    CREATE TABLE ar_admin_guard(id INTEGER PRIMARY KEY); INSERT INTO ar_admin_guard VALUES(1);`);
+    CREATE TABLE ar_admin_guard(id INTEGER PRIMARY KEY); INSERT INTO ar_admin_guard VALUES(1);
+    CREATE UNIQUE INDEX uq_ar_user_single_root ON ar_user((CASE WHEN role='root' THEN 1 ELSE NULL END));`);
   const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/CURRENT_TIMESTAMP\(3\)/g, 'CURRENT_TIMESTAMP').replace(/CAST\((u\.)?id AS CHAR\)/g, 'CAST($1id AS TEXT)');
   const db = {
     async query(query: string, values: any[] = []) { return sqlite.prepare(sql(query)).all(...values) as Row[]; },
@@ -33,7 +34,12 @@ function fixture() {
   const auth = new RentalAuth(db as unknown as Database, client as any, options), router = new ApiRouter(); auth.registerAuth(router);
   const context = (token: string, body: Row = {}, params: Row = {}, query: Row = {}) => ({ req: { headers: { authorization: 'Bearer ' + token } }, res: { setHeader: vi.fn() }, body, params, query } as any);
   const route = (method: string, path: string) => router.routes.find(item => item.method === method && item.path === path)!.handler;
-  return { db, client, auth, options, context, route, advance: (ms: number) => { now += ms; } };
+  const bootstrap = async (userId = 1) => {
+    const phone = '+8613700137000';
+    await db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [userId, appId, phone, '86', now, String(userId).repeat(64)]);
+    await bootstrapRoot(db as unknown as Database, userId, appId, phone);
+  };
+  return { db, client, auth, options, context, route, bootstrap, advance: (ms: number) => { now += ms; } };
 }
 
 describe('independent rental authentication', () => {
@@ -71,23 +77,25 @@ describe('independent rental authentication', () => {
   });
   it('reads current roles and account presence on every request, including refresh', async () => {
     const f = fixture(), login = await f.auth.login('code');
-    await bootstrapRoot(f.db as unknown as Database, 1, appId);
+    await f.bootstrap();
     expect((await f.auth.authenticate(f.context(login.token.accessToken))).user.role).toBe('root');
     await f.db.execute("UPDATE ar_user SET role='user' WHERE id=1");
     expect((await f.auth.refresh(login.token.refreshToken)).user.role).toBe('user');
     await f.db.execute('DELETE FROM ar_user WHERE id=1');
     await expect(f.auth.authenticate(f.context(login.token.accessToken))).rejects.toMatchObject({ status: 401 });
   });
-  it('requires explicit console bootstrap, refuses repeated bootstrap and protects the final root', async () => {
+  it('requires verified-phone console bootstrap, refuses repeated bootstrap and protects the final root', async () => {
     const f = fixture(), login = await f.auth.login('code');
     await expect(f.route('GET', '/v2/rental/admin/users')(f.context(login.token.accessToken))).rejects.toMatchObject({ status: 403 });
-    await bootstrapRoot(f.db as unknown as Database, 1, appId);
-    await expect(bootstrapRoot(f.db as unknown as Database, 1, appId)).rejects.toMatchObject({ status: 409 });
+    await expect(bootstrapRoot(f.db as unknown as Database, 1, appId)).rejects.toMatchObject({ status: 422 });
+    await expect(bootstrapRoot(f.db as unknown as Database, 1, appId, '+8613700137000')).rejects.toMatchObject({ status: 409 });
+    await f.bootstrap();
+    await expect(bootstrapRoot(f.db as unknown as Database, 1, appId, '+8613700137000')).rejects.toMatchObject({ status: 409 });
     await expect(f.route('PUT', '/v2/rental/admin/users/:id/role')(f.context(login.token.accessToken, { role: 'user' }, { id: '1' }))).rejects.toMatchObject({ status: 403 });
     expect(await f.db.query('SELECT * FROM ar_role_audit')).toMatchObject([{ source: 'console-bootstrap', next_role: 'root' }]);
   });
   it('permits roots to grant manager with audit, excludes actor and rejects root promotion', async () => {
-    const f = fixture(), root = await f.auth.login('code'); await bootstrapRoot(f.db as unknown as Database, 1, appId);
+    const f = fixture(), root = await f.auth.login('code'); await f.bootstrap();
     f.client.codeSession.mockResolvedValue({ openid: 'second-user' }); const second = await f.auth.login('code-2');
     const change = f.route('PUT', '/v2/rental/admin/users/:id/role');
     await expect(change(f.context(root.token.accessToken, { role: 'root' }, { id: String(second.user.id) }))).rejects.toMatchObject({ status: 422 });
@@ -100,6 +108,56 @@ describe('independent rental authentication', () => {
     await expect(f.route('GET', '/v2/rental/admin/users')(f.context(second.token.accessToken))).rejects.toMatchObject({ status: 403 });
     expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(3);
   });
+  it('lets root assign admin and lets admin manage only other lower-level users with fresh roles and audit', async () => {
+    const f = fixture(), root = await f.auth.login('root'); await f.bootstrap();
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'system-admin' }); const admin = await f.auth.login('admin');
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'target-user' }); const target = await f.auth.login('target');
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'peer-admin' }); const peer = await f.auth.login('peer');
+    const change = f.route('PUT', '/v2/rental/admin/users/:id/role');
+    const set = (token: string, id: number, nextRole: string) => change(f.context(token, { role: nextRole, reason: 'Synthetic role hierarchy test' }, { id: String(id) })) as Promise<Row>;
+    await set(root.token.accessToken, admin.user.id, 'admin');
+    await set(root.token.accessToken, peer.user.id, 'admin');
+    expect((await f.auth.authenticate(f.context(admin.token.accessToken))).user.role).toBe('admin');
+    expect((await f.auth.refresh(admin.token.refreshToken)).user.role).toBe('admin');
+    const list = await f.route('GET', '/v2/rental/admin/users')(f.context(admin.token.accessToken)) as Row;
+    expect(list.items.find((user: Row) => user.id === target.user.id).allowedRoles).toEqual(['user', 'manager']);
+    expect(list.items.find((user: Row) => user.id === root.user.id).allowedRoles).toEqual([]);
+    expect(list.items.find((user: Row) => user.id === peer.user.id).allowedRoles).toEqual([]);
+    expect(list.items.some((user: Row) => user.id === admin.user.id)).toBe(false);
+    expect(await set(admin.token.accessToken, target.user.id, 'manager')).toMatchObject({ role: 'manager', allowedRoles: ['user', 'manager'] });
+    const audits = (await f.db.query('SELECT * FROM ar_role_audit')).length;
+    await set(admin.token.accessToken, target.user.id, 'manager');
+    expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(audits);
+    for (const [id, nextRole] of [[admin.user.id, 'user'], [peer.user.id, 'user'], [root.user.id, 'user'], [target.user.id, 'admin']] as const) {
+      await expect(set(admin.token.accessToken, id, nextRole)).rejects.toMatchObject({ status: 403 });
+    }
+    await expect(set(admin.token.accessToken, target.user.id, 'root')).rejects.toMatchObject({ status: 422 });
+    await expect(set(target.token.accessToken, peer.user.id, 'user')).rejects.toMatchObject({ status: 403 });
+    await set(admin.token.accessToken, target.user.id, 'user');
+    await set(root.token.accessToken, admin.user.id, 'manager');
+    await expect(f.route('GET', '/v2/rental/admin/users')(f.context(admin.token.accessToken))).rejects.toMatchObject({ status: 403 });
+    await expect(set(admin.token.accessToken, target.user.id, 'manager')).rejects.toMatchObject({ status: 403 });
+    expect((await f.auth.refresh(admin.token.refreshToken)).user.role).toBe('manager');
+    expect(await set(root.token.accessToken, peer.user.id, 'user')).toMatchObject({ role: 'user', allowedRoles: ['user', 'manager', 'admin'] });
+    expect(await f.db.query("SELECT * FROM ar_user WHERE role='root'")).toHaveLength(1);
+  });
+  it('rechecks user-management permission under the guard lock after the authenticated actor is demoted', async () => {
+    const f = fixture(), root = await f.auth.login('root'); await f.bootstrap();
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'revocable-admin' }); const admin = await f.auth.login('admin');
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'unchanged-target' }); const target = await f.auth.login('target');
+    const change = f.route('PUT', '/v2/rental/admin/users/:id/role');
+    await change(f.context(root.token.accessToken, { role: 'admin' }, { id: String(admin.user.id) }));
+    const authenticate = f.auth.authenticate;
+    vi.spyOn(f.auth, 'authenticate').mockImplementationOnce(async ctx => {
+      const principal = await authenticate(ctx);
+      await f.db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [admin.user.id]);
+      return principal;
+    });
+    const before = (await f.db.query('SELECT * FROM ar_role_audit')).length;
+    await expect(change(f.context(admin.token.accessToken, { role: 'manager' }, { id: String(target.user.id) }))).rejects.toMatchObject({ status: 403 });
+    expect((await f.db.one('SELECT role FROM ar_user WHERE id=?', [target.user.id]))!.role).toBe('user');
+    expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(before);
+  });
   it('rejects missing signing configuration without preventing route registration', async () => {
     const f = fixture(); vi.stubEnv('JWT_SECRET', ''); vi.stubEnv('JWT_SECRET_PATH', '');
     const auth = new RentalAuth(f.db as any, f.client as any), router = new ApiRouter(); auth.registerAuth(router);
@@ -108,7 +166,7 @@ describe('independent rental authentication', () => {
     expect(f.client.codeSession).not.toHaveBeenCalled();
   });
   it('searches verified phone ownership for root and exposes only a masked phone', async () => {
-    const f = fixture(), root = await f.auth.login('root'); await bootstrapRoot(f.db as unknown as Database, root.user.id, appId);
+    const f = fixture(), root = await f.auth.login('root'); await f.bootstrap(root.user.id);
     f.client.codeSession.mockResolvedValueOnce({ openid: 'verified-phone-owner' });
     const target = await f.auth.login('second');
     await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [target.user.id, appId, '+8613800138000', '86', Date.now(), 'a'.repeat(64)]);

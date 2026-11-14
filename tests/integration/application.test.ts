@@ -36,8 +36,10 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       };
       const owner = await login('owner');
       expect(owner.user.role).toBe('user');
-      await bootstrapRoot(db, owner.user.id, appId);
-      await expect(bootstrapRoot(db, owner.user.id, appId)).rejects.toMatchObject({ status: 409 });
+      const rootPhone = '+8613700137000';
+      await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [owner.user.id, appId, rootPhone, '86', Date.now(), 'f'.repeat(64)]);
+      await bootstrapRoot(db, owner.user.id, appId, rootPhone);
+      await expect(bootstrapRoot(db, owner.user.id, appId, rootPhone)).rejects.toMatchObject({ status: 409 });
       const manager = await login('manager');
       const ordinary = await login('ordinary');
       const ownerToken = 'Bearer ' + owner.token.accessToken, managerToken = 'Bearer ' + manager.token.accessToken, ordinaryToken = 'Bearer ' + ordinary.token.accessToken;

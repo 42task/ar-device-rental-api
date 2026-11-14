@@ -1,6 +1,5 @@
 import 'dotenv/config';
 import { Database } from '../src/core/database';
-import { bootstrapRoot } from '../src/auth';
 import { bootstrapRootByPhone, findUserByVerifiedPhone } from '../src/auth/admin';
 import { ApiError } from '../src/core/errors';
 
@@ -38,8 +37,9 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2), command = args[0];
   const appId = process.env.WECHAT_APP_ID || '';
   if (!/^wx[0-9a-f]{16}$/i.test(appId)) throw Error('WECHAT_APP_ID must identify AR设备租赁.');
-  if (!['list-users', 'bootstrap-root', 'find-user-by-phone'].includes(command || '')) throw Error('Usage: admin.ts list-users | bootstrap-root --user-id N | bootstrap-root --phone-stdin | find-user-by-phone --phone-stdin');
+  if (!['list-users', 'bootstrap-root', 'find-user-by-phone'].includes(command || '')) throw Error('Usage: admin.ts list-users | bootstrap-root --phone-stdin | find-user-by-phone --phone-stdin');
   const byPhone = args.length === 2 && args[1] === '--phone-stdin' && ['bootstrap-root', 'find-user-by-phone'].includes(command);
+  if (!byPhone && !(command === 'list-users' && args.length === 1)) throw Error('Usage: admin.ts list-users | bootstrap-root --phone-stdin | find-user-by-phone --phone-stdin');
   const phone = byPhone ? await phoneFromStdin() : undefined;
   const db = new Database();
   try {
@@ -49,11 +49,6 @@ async function main(): Promise<void> {
     } else if (command === 'list-users' && args.length === 1) {
       const users = await db.query('SELECT id,role,nickname,created_at FROM ar_user WHERE appid=? ORDER BY id DESC LIMIT 100', [appId]);
       console.table(users);
-    } else if (command === 'bootstrap-root') {
-      if (args.length !== 3 || args[1] !== '--user-id' || !/^[1-9][0-9]*$/.test(args[2])) throw Error('Usage: admin.ts bootstrap-root --user-id N');
-      const userId = Number(args[2]);
-      await bootstrapRoot(db, userId, appId);
-      console.log(`Initial root created for user ${userId}; operation recorded in ar_role_audit.`);
     } else throw Error('Usage: admin.ts find-user-by-phone --phone-stdin');
   } finally { await db.close(); }
 }

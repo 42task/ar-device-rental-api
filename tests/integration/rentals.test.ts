@@ -21,7 +21,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
         const schema = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(sql => sql.trim()).filter(Boolean);
         for (const statement of schema) await db.execute(statement);
       }
-      for (const [userId, role] of [[1, 'user'], [2, 'user'], [10, 'manager'], [11, 'root']] as const) {
+      for (const [userId, role] of [[1, 'user'], [2, 'user'], [10, 'manager'], [11, 'root'], [12, 'admin']] as const) {
         await db.insert('ar_user', { id: userId, role, appid: 'wx-rental-test', openid: 'payer-' + userId });
       }
       const device = await db.insert('ar_device', { uuid: 'rental-concurrent-device', name: '并发设备' });
@@ -47,11 +47,11 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
         },
       };
       const principal = (id: number, role: string): RentalPrincipal => ({ user: { id, role }, appid: 'wx-rental-test', openid: 'payer-' + id });
-      const manager = principal(10, 'manager'), root = principal(11, 'root');
+      const manager = principal(10, 'manager'), root = principal(11, 'root'), systemAdmin = principal(12, 'admin');
       const options = { appId: 'wx-rental-test', authenticate: async () => manager, payment: payment as any };
       const services = { db } as Services;
       const service = new RentalService(services, options);
-      await service.configure(manager, device.id, { enabled: true, useFeeCents: 2000, depositCents: 20000, version: 0 });
+      await service.configure(systemAdmin, device.id, { enabled: true, useFeeCents: 2000, depositCents: 20000, version: 0 });
       const contenders = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => service.create(principal(index % 2 + 1, 'user'), {
         deviceId: device.id, priceVersion: 1, idempotencyKey: 'parallel-rental-' + index,
       })));
@@ -74,13 +74,17 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       await expect(service.syncRefund(owner, stored.id)).rejects.toMatchObject({ status: 403 });
       await expect(service.retryRefund(owner, stored.id)).rejects.toMatchObject({ status: 403 });
       expect(refunds.size).toBe(0);
+      await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [systemAdmin.user.id]);
+      expect((await service.context(systemAdmin, device.uuid)).actions.canEndRental).toBe(false);
+      await expect(service.end(systemAdmin, stored.id, { refundMode: 'full', reason: '系统管理权限已撤销', idempotencyKey: 'revoked-system-admin-end' })).rejects.toMatchObject({ status: 403 });
+      await db.execute("UPDATE ar_user SET role='admin' WHERE id=?", [systemAdmin.user.id]);
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [manager.user.id]);
       expect((await service.context(manager, device.uuid)).actions.canEndRental).toBe(false);
       await expect(service.end(manager, stored.id, { refundMode: 'deposit', reason: '权限已撤销', idempotencyKey: 'revoked-manager-end' })).rejects.toMatchObject({ status: 403 });
       await db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [manager.user.id]);
       const endings = await Promise.allSettled([
         service.end(manager, stored.id, { refundMode: 'deposit', reason: '归还确认', idempotencyKey: 'manager-end-request' }),
-        service.end(root, stored.id, { refundMode: 'full', reason: '全部退还', idempotencyKey: 'root-end-request' }),
+        service.end(systemAdmin, stored.id, { refundMode: 'full', reason: '全部退还', idempotencyKey: 'system-admin-end-request' }),
       ]);
       expect(endings.filter(result => result.status === 'fulfilled')).toHaveLength(1);
       expect(endings.filter(result => result.status === 'rejected')).toHaveLength(1);
@@ -94,6 +98,11 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [manager.user.id]);
       await expect(service.syncRefund(manager, stored.id)).rejects.toMatchObject({ status: 403 });
       await expect(service.retryRefund(manager, stored.id)).rejects.toMatchObject({ status: 403 });
+      await db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [systemAdmin.user.id]);
+      expect((await service.get(systemAdmin, stored.id)).actions.canSyncRefund).toBe(true);
+      await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [systemAdmin.user.id]);
+      await expect(service.syncRefund(systemAdmin, stored.id)).rejects.toMatchObject({ status: 403 });
+      await expect(service.retryRefund(systemAdmin, stored.id)).rejects.toMatchObject({ status: 403 });
       [...refunds.values()][0].status = 'SUCCESS';
       await service.syncRefund(root, stored.id);
       expect((await service.context(owner, device.uuid)).state).toBe('AVAILABLE');

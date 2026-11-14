@@ -15,11 +15,12 @@ afterEach(() => { opened.splice(0).forEach(db => db.close()); vi.unstubAllEnvs()
 async function fixture() {
   const sqlite = new DatabaseSync(':memory:'); opened.push(sqlite);
   sqlite.exec(`CREATE TABLE ar_user(id INTEGER PRIMARY KEY,appid TEXT,openid TEXT,role TEXT,nickname TEXT,avatar TEXT,tel TEXT,unionid TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    INSERT INTO ar_user(id,appid,openid,role) VALUES(1,'${appId}','manager-openid','manager'),(2,'${appId}','ordinary-openid','user'),(3,'${appId}','other-openid','manager'),(4,'${appId}','root-openid','root');
+    INSERT INTO ar_user(id,appid,openid,role) VALUES(1,'${appId}','manager-openid','manager'),(2,'${appId}','ordinary-openid','user'),(3,'${appId}','other-openid','manager'),(4,'${appId}','root-openid','root'),(5,'${appId}','admin-openid','admin'),(6,'${appId}','peer-openid','admin');
+    CREATE UNIQUE INDEX uq_ar_user_single_root ON ar_user((CASE WHEN role='root' THEN 1 ELSE NULL END));
     CREATE TABLE ar_admin_guard(id INTEGER PRIMARY KEY); INSERT INTO ar_admin_guard VALUES(1);
     CREATE TABLE ar_role_audit(id INTEGER PRIMARY KEY,actor_user_id INTEGER,target_user_id INTEGER,previous_role TEXT,next_role TEXT,source TEXT,reason TEXT);
     CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT UNIQUE,UNIQUE(appid,phone_e164));
-    INSERT INTO ar_user_phone VALUES(1,'${appId}','+8613800138000','86',1800000000000,'${'a'.repeat(64)}'),(3,'${appId}','+8613900139000','86',1800000000000,'${'b'.repeat(64)}'),(4,'${appId}','+8613700137000','86',1800000000000,'${'c'.repeat(64)}');
+    INSERT INTO ar_user_phone VALUES(1,'${appId}','+8613800138000','86',1800000000000,'${'a'.repeat(64)}'),(3,'${appId}','+8613900139000','86',1800000000000,'${'b'.repeat(64)}'),(4,'${appId}','+8613700137000','86',1800000000000,'${'c'.repeat(64)}'),(5,'${appId}','+8613600136000','86',1800000000000,'${'d'.repeat(64)}'),(6,'${appId}','+8613500135000','86',1800000000000,'${'e'.repeat(64)}');
     CREATE TABLE ar_admin_login_challenge(id TEXT PRIMARY KEY,browser_hash TEXT,origin TEXT,confirmation_code TEXT,status TEXT,scanned_user_id INTEGER,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,qrcode_image BLOB);
     CREATE TABLE ar_admin_session(id TEXT PRIMARY KEY,user_id INTEGER,appid TEXT,created_ms INTEGER,expires_ms INTEGER,revoked_ms INTEGER);`);
   const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/CURRENT_TIMESTAMP\(3\)/g, 'CURRENT_TIMESTAMP').replace(/^(DELETE FROM .*?) LIMIT 100$/, '$1');
@@ -37,7 +38,7 @@ async function fixture() {
   auth.webAuthenticate = admin.authenticate;
   const router = new ApiRouter(); admin.register(router); auth.registerAuth(router);
   const tokens: Record<string, string> = {};
-  for (const name of ['manager', 'ordinary', 'other', 'root']) tokens[name] = (await auth.login(name)).token.accessToken;
+  for (const name of ['manager', 'ordinary', 'other', 'root', 'admin', 'peer']) tokens[name] = (await auth.login(name)).token.accessToken;
   const ctx = (input: { cookie?: string; token?: string; source?: string | null; body?: Row; id?: string; method?: string } = {}) => ({
     req: { method: input.method || 'POST', protocol: 'https', socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'admin.example.test', ...(input.source === null ? {} : { origin: input.source ?? origin }), ...(input.cookie ? { cookie: input.cookie } : {}), ...(input.token ? { authorization: 'Bearer ' + input.token } : {}) } },
     res: { setHeader: vi.fn(), append: vi.fn(), type: vi.fn().mockReturnThis(), end: vi.fn() }, body: input.body || {}, params: { id: input.id }, query: {},
@@ -125,14 +126,14 @@ describe('durable admin scan login', () => {
     await expect(f.invoke('POST', '/logout', { cookie: session.cookie, source: null })).rejects.toMatchObject({ status: 403 });
     await f.db.execute("UPDATE ar_user SET role='user' WHERE id=1");
     await expect(f.invoke('GET', '/session', { cookie: session.cookie })).rejects.toMatchObject({ status: 403 });
-    await f.db.execute("UPDATE ar_user SET role='root' WHERE id=1");
-    expect((await f.invoke('GET', '/session', { cookie: session.cookie })).user.role).toBe('root');
+    await f.db.execute("UPDATE ar_user SET role='admin' WHERE id=1");
+    expect((await f.invoke('GET', '/session', { cookie: session.cookie })).user.role).toBe('admin');
     await f.invoke('POST', '/logout', { cookie: session.cookie });
     await expect(f.invoke('GET', '/session', { cookie: session.cookie })).rejects.toMatchObject({ status: 401 });
     const c2 = await f.create(); await f.approve(c2); const s2 = await f.consume(c2); f.advance(28_800_000);
     await expect(f.invoke('GET', '/session', { cookie: s2.cookie })).rejects.toMatchObject({ status: 401 });
   });
-  it('lets only root grant or revoke managers through the website and applies revocation to existing credentials', async () => {
+  it('rejects ordinary and device-manager role changes and applies root revocation to existing credentials', async () => {
     const f = await fixture();
     const managerChallenge = await f.create(); await f.approve(managerChallenge);
     const managerSession = await f.consume(managerChallenge);
@@ -165,6 +166,24 @@ describe('durable admin scan login', () => {
       { actor_user_id: 4, target_user_id: 1, previous_role: 'manager', next_role: 'user', source: 'api', reason: '撤销管理员' },
       { actor_user_id: 4, target_user_id: 2, previous_role: 'manager', next_role: 'user', source: 'api', reason: '撤销临时授权' },
     ]);
+  });
+  it('allows a verified admin browser session to manage lower roles but never itself, peers, root or admin grants', async () => {
+    const f = await fixture(), challenge = await f.create();
+    await f.approve(challenge, 'admin'); const session = await f.consume(challenge);
+    expect(session.result.user).toMatchObject({ id: 5, role: 'admin' });
+    expect((await f.auth.authenticate(f.ctx({ cookie: session.cookie, method: 'GET' }))).user.role).toBe('admin');
+    expect(await f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'manager' } })).toMatchObject({ role: 'manager', allowedRoles: ['user', 'manager'] });
+    expect(await f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'user' } })).toMatchObject({ role: 'user' });
+    for (const [id, role] of [['5', 'user'], ['6', 'manager'], ['4', 'user'], ['2', 'admin']]) {
+      await expect(f.changeRole({ cookie: session.cookie, id, body: { role } })).rejects.toMatchObject({ status: 403 });
+    }
+    await expect(f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'root' } })).rejects.toMatchObject({ status: 422 });
+    await expect(f.changeRole({ cookie: session.cookie, id: '2', source: null, body: { role: 'manager' } })).rejects.toMatchObject({ status: 403 });
+    await f.changeRole({ token: f.tokens.root, id: '5', body: { role: 'manager' } });
+    expect((await f.invoke('GET', '/session', { cookie: session.cookie })).user.role).toBe('manager');
+    await expect(f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'manager' } })).rejects.toMatchObject({ status: 403 });
+    expect((await f.auth.authenticateBearer(f.ctx({ token: f.tokens.admin }))).user.role).toBe('manager');
+    expect(await f.db.query("SELECT * FROM ar_user WHERE role='root'")).toHaveLength(1);
   });
   it('allows only direct loopback origins when PUBLIC_ORIGIN is absent', async () => {
     const f = await fixture(); vi.stubEnv('PUBLIC_ORIGIN', '');
