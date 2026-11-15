@@ -63,7 +63,7 @@ export class RentalAuth {
     const entry = entryMerchant();
     const managementMerchant = entry && userRole(user) !== 'root' && user.merchant_id != null ? await this.managementMerchant(user.merchant_id) : null;
     const merchant = managementMerchant ?? publicMerchant();
-    return { token: this.issue(user), user: publicUser(user), openid: user.openid, unionid: user.unionid ?? null, appId: this.appId,
+    return { token: this.issue(user), user: publicUser(user), openid: user.openid, unionid: user.unionid ?? null, appId: this.appId, authVersion: Number(user.auth_version ?? 0),
       ...(entry ? { entry: this.publicEntry(), managementMerchant, merchant } : {}) };
   }
   publicEntry(): Row | null {
