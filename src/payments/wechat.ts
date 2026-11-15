@@ -4,8 +4,10 @@ import type { Row } from '../core/contracts';
 import { ApiError } from '../core/errors';
 
 export interface WeChatOptions {
+  allowEnvironmentFallback?: boolean;
   appId?: string; appSecret?: string; appSecretPath?: string;
   mchId?: string; serialNo?: string; privateKey?: string; apiV3Key?: string;
+  apiV3Keys?: string[];
   platformKeys?: Record<string, string>; platformKeyId?: string;
   notifyUrl?: string; refundNotifyUrl?: string; payEnabled?: boolean;
   fetch?: typeof fetch; now?: () => number; nonce?: () => string;
@@ -27,8 +29,11 @@ export class WeChatClient {
   private accessTokenRequest?: Promise<string>;
 
   constructor(options: WeChatOptions = {}) {
-    const env = process.env;
+    // Managed merchants must supply their entire configuration. A missing
+    // credential must never borrow another merchant's default environment.
+    const env: NodeJS.ProcessEnv = options.allowEnvironmentFallback === false ? {} : process.env;
     let appSecret: string | undefined, privateKey: string | undefined, apiV3Key: string | undefined;
+    let apiV3Keys: string[] = [];
     let platformKeys: Record<string, string> = {};
     try { appSecret = secret(options.appSecret ?? env.WECHAT_APP_SECRET, options.appSecretPath ?? env.WECHAT_APP_SECRET_PATH); }
     catch { this.loginConfigurationError = true; }
@@ -47,11 +52,17 @@ export class WeChatClient {
       if (privateKey && createPrivateKey(privateKey).asymmetricKeyType !== 'rsa') throw Error();
       for (const key of Object.values(platformKeys)) if (createPublicKey(key).asymmetricKeyType !== 'rsa') throw Error();
       if (apiV3Key && Buffer.byteLength(apiV3Key) !== 32) throw Error();
+      if (options.apiV3Keys !== undefined) {
+        if (!Array.isArray(options.apiV3Keys) || options.apiV3Keys.length > 8
+          || options.apiV3Keys.some(key => typeof key !== 'string' || Buffer.byteLength(key) !== 32)) throw Error();
+        apiV3Keys = [...new Set(options.apiV3Keys)];
+        if (new Set([...(apiV3Key ? [apiV3Key] : []), ...apiV3Keys]).size > 8) throw Error();
+      }
     } catch { this.paymentConfigurationError = true; }
     this.config = {
       appId: options.appId ?? env.WECHAT_APP_ID, appSecret,
       mchId: options.mchId ?? env.WECHAT_PAY_MCH_ID, serialNo: options.serialNo ?? env.WECHAT_PAY_SERIAL_NO,
-      privateKey, apiV3Key, platformKeys, platformKeyId,
+      privateKey, apiV3Key, apiV3Keys, platformKeys, platformKeyId,
       notifyUrl: options.notifyUrl ?? env.WECHAT_PAY_NOTIFY_URL,
       refundNotifyUrl: options.refundNotifyUrl ?? env.WECHAT_PAY_REFUND_NOTIFY_URL,
       payEnabled: options.payEnabled ?? env.WECHAT_PAY_ENABLED === '1',
@@ -225,15 +236,23 @@ export class WeChatClient {
     if (!object(notice) || !object(notice.resource)) throw new ApiError(400, '微信通知格式无效');
     const resource = notice.resource;
     if (resource.algorithm !== 'AEAD_AES_256_GCM' || typeof resource.ciphertext !== 'string' || typeof resource.nonce !== 'string' || resource.associated_data !== undefined && typeof resource.associated_data !== 'string') throw new ApiError(400, '微信通知加密格式无效');
-    let decoded: unknown;
-    try {
-      const encrypted = Buffer.from(resource.ciphertext, 'base64');
-      if (encrypted.length < 17) throw Error();
-      const decipher = createDecipheriv('aes-256-gcm', Buffer.from(this.config.apiV3Key), Buffer.from(resource.nonce));
-      decipher.setAuthTag(encrypted.subarray(-16));
-      decipher.setAAD(Buffer.from(resource.associated_data || ''));
-      decoded = JSON.parse(Buffer.concat([decipher.update(encrypted.subarray(0, -16)), decipher.final()]).toString('utf8'));
-    } catch { throw new ApiError(400, '微信通知解密失败'); }
+    const encrypted = Buffer.from(resource.ciphertext, 'base64');
+    if (encrypted.length < 17) throw new ApiError(400, '微信通知解密失败');
+    let decoded: unknown, decrypted = false;
+    // Signature verification above always precedes the bounded key ring. Old
+    // ciphertext may arrive after rotation, while new requests use the live key.
+    const keys = [...new Set([this.config.apiV3Key, ...(this.config.apiV3Keys || [])])].slice(0, 8);
+    for (const key of keys) {
+      try {
+        const decipher = createDecipheriv('aes-256-gcm', Buffer.from(key), Buffer.from(resource.nonce));
+        decipher.setAuthTag(encrypted.subarray(-16));
+        decipher.setAAD(Buffer.from(resource.associated_data || ''));
+        decoded = JSON.parse(Buffer.concat([decipher.update(encrypted.subarray(0, -16)), decipher.final()]).toString('utf8'));
+        decrypted = true;
+        break;
+      } catch { /* Only an authenticated, decrypted resource can change state. */ }
+    }
+    if (!decrypted) throw new ApiError(400, '微信通知解密失败');
     if (!object(decoded) || decoded.mchid !== this.config.mchId || decoded.appid !== undefined && decoded.appid !== this.config.appId) throw new ApiError(403, '微信通知商户或小程序不一致');
     return { ...notice, resource: decoded };
   }

@@ -7,11 +7,12 @@ COPY tsconfig.json ./
 COPY src ./src
 COPY scripts ./scripts
 COPY database ./database
+COPY admin ./admin
 RUN npm run build && npm prune --omit=dev --ignore-scripts && npm cache clean --force
 
 FROM node:24-bookworm-slim AS runtime
 ARG GIT_COMMIT=unknown
-LABEL org.opencontainers.image.source="https://github.com/42task/ar-device-rental-api" \
+LABEL org.opencontainers.image.source="https://github.com/42task/ar-device-rental" \
       org.opencontainers.image.title="AR设备租赁 API" \
       org.opencontainers.image.revision="${GIT_COMMIT}"
 ENV NODE_ENV=production \
@@ -24,6 +25,7 @@ COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --from=build --chown=node:node /app/database ./database
+COPY --from=build --chown=node:node /app/admin ./admin
 USER node
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
