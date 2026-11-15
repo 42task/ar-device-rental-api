@@ -151,6 +151,48 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect((await f.http('get', '/api/v2/rental/admin/overview', undefined, 1).set('Cookie', sessionCookie)).status).toBe(403);
   }), 30_000);
 
+  it('limits a manager device list to a self-selected venue while adminer retains the whole merchant', async () => withFixture(async f => {
+    const child = await f.shared('venue-selection'); expect(child.status).toBe(200);
+    const merchantId = child.body.merchant.id;
+    const first = await seedVenue(f.db, merchantId, 100, 200);
+    const second = await seedVenue(f.db, merchantId, 300, 400);
+    const foreign = await seedVenue(f.db, 1);
+    const devices = [];
+    for (const [uuid, venueId, owner] of [['manager-venue-a1', first.id, merchantId], ['manager-venue-a2', first.id, merchantId], ['manager-venue-b1', second.id, merchantId], ['manager-venue-other', foreign.id, 1]] as const) {
+      const created = await f.http('post', '/api/v2/rental/devices', f.rootToken, owner).send({ uuid, venueId });
+      expect(created.status).toBe(200); devices.push(created.body.device);
+    }
+    const ordinary = await f.login('manager-selects-venue'); expect(ordinary.status).toBe(200);
+    const userId = ordinary.body.data.user.id;
+    expect((await f.http('post', `/api/v2/rental/admin/users/${userId}/merchant`, f.rootToken).send({ merchantId, role: 'manager', reason: 'Synthetic attraction selection manager' })).status).toBe(200);
+    const manager = await f.login('manager-selects-venue'); expect(manager.status).toBe(200);
+    const token = 'Bearer ' + manager.body.data.token.accessToken;
+    const list = (venueId?: unknown, query: Row = {}, owner = merchantId) => f.http('get', '/api/v2/rental/admin/devices', token, owner).query({ ...(venueId === undefined ? {} : { venueId }), ...query });
+    expect((await list()).status).toBe(422);
+    expect((await list('invalid')).status).toBe(422);
+    expect([403, 404]).toContain((await list(foreign.id)).status);
+    expect((await list(foreign.id, {}, 1)).status).toBe(403);
+    expect((await list(first.id, { scope: 'all' })).status).toBe(403);
+    const pageOne = await list(first.id, { 'per-page': 1 });
+    expect(pageOne.status).toBe(200); expect(pageOne.body.total).toBe(2); expect(pageOne.body.items).toHaveLength(1);
+    expect(pageOne.body.items[0].device.venueId).toBe(first.id);
+    const pageTwo = await list(first.id, { 'per-page': 1, page: 2 });
+    expect(pageTwo.status).toBe(200); expect(pageTwo.body.total).toBe(2); expect(pageTwo.body.items[0].device.venueId).toBe(first.id);
+    expect(pageTwo.body.items[0].device.id).not.toBe(pageOne.body.items[0].device.id);
+    expect((await list(first.id, { search: 'manager-venue-b1' })).body.total).toBe(0);
+    await f.db.execute("UPDATE ar_venue SET status='paused' WHERE id=?", [second.id]);
+    const venues = await f.http('get', '/api/v2/rental/admin/venues', token, merchantId);
+    expect(venues.status).toBe(200); expect(venues.body.items.some((venue: Row) => venue.id === second.id)).toBe(true);
+    const switched = await list(second.id);
+    expect(switched.status).toBe(200); expect(switched.body).toMatchObject({ total: 1, items: [{ device: { id: devices[2].id, venueId: second.id } }] });
+    expect((await f.http('post', `/api/v2/rental/admin/users/${userId}/merchant`, f.rootToken).send({ merchantId, role: 'adminer', reason: 'Synthetic full merchant administrator' })).status).toBe(200);
+    expect((await list(first.id)).status).toBe(401);
+    const adminer = await f.login('manager-selects-venue'); expect(adminer.status).toBe(200);
+    const all = await f.http('get', '/api/v2/rental/admin/devices', 'Bearer ' + adminer.body.data.token.accessToken, merchantId);
+    expect(all.status).toBe(200); expect(all.body.total).toBe(3);
+    expect(all.body.items.map((row: Row) => row.device.id).sort()).toEqual(devices.slice(0, 3).map(device => device.id).sort());
+  }), 30_000);
+
   it('preserves independent AppID login and management isolation alongside the shared entry', async () => withFixture(async f => {
     const child = await f.shared(); expect(child.status).toBe(200);
     const independent = await f.http('post', '/api/v2/rental/admin/merchants', f.rootToken).send({ code: 'independent', name: 'Synthetic independent merchant', miniappOwnerId: null, origin: 'https://independent.example.test', appId: otherAppId, status: 'active', mchId: '3000000001', payEnabled: false, credentials: { appSecret: 'synthetic-independent-secret' } });
@@ -174,33 +216,40 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect((await f.http('get', '/api/v2/rental/devices/context', token).query({ uuid: 'independent-device' })).status).toBe(409);
   }), 30_000);
 
-  it('assigns an account into and out of a shared merchant using explicit consent in the same application', async () => withFixture(async f => {
+  it('lets root assign and revoke a shared-application employee without employee confirmation', async () => withFixture(async f => {
     const child = await f.shared(); expect(child.status).toBe(200);
     const childId = child.body.merchant.id;
     const initial = await f.login('future-staff'); expect(initial.status).toBe(200);
     const userId = initial.body.data.user.id, oldToken = 'Bearer ' + initial.body.data.token.accessToken;
     const assigned = await f.http('post', `/api/v2/rental/admin/users/${userId}/merchant`, f.rootToken).send({ merchantId: childId, role: 'manager', reason: 'Synthetic explicit shared-entry staff assignment' });
     expect(assigned.status).toBe(200);
-    const binding = assigned.body.binding.token;
-    expect((await f.http('post', '/api/v2/rental/auth/login').send({ code: 'future-staff', bindToken: binding })).status).toBe(403);
-    expect((await f.http('post', '/api/v2/rental/auth/merchant-binding/confirm', f.rootToken).send({ bindToken: binding })).status).toBe(403);
-    expect((await f.http('post', '/api/v2/rental/auth/merchant-binding/confirm', oldToken).send({ bindToken: binding })).status).toBe(200);
-    const bound = await f.http('post', '/api/v2/rental/auth/login').send({ code: 'future-staff', bindToken: binding });
+    expect(assigned.body).toMatchObject({ user: { id: userId, merchantId: childId, role: 'manager' }, merchant: { id: childId, appId } });
+    expect(assigned.body).not.toHaveProperty('binding');
+    expect(await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=?', [userId])).toEqual({ merchant_id: childId, auth_version: 1 });
+    const repeated = await f.http('post', `/api/v2/rental/admin/users/${userId}/merchant`, f.rootToken).send({ merchantId: childId, role: 'manager', reason: 'Synthetic retry after uncertain response' });
+    expect(repeated.status).toBe(200);
+    expect(repeated.body.user).toEqual(assigned.body.user);
+    expect(await f.db.one('SELECT auth_version FROM ar_user WHERE id=?', [userId])).toEqual({ auth_version: 1 });
+    const bound = await f.login('future-staff');
     expect(bound.status).toBe(200);
     expect(bound.body.data).toMatchObject({ appId, user: { id: userId, merchantId: childId, role: 'manager' }, merchant: { id: childId, name: 'Synthetic shared' } });
     const token = 'Bearer ' + bound.body.data.token.accessToken;
     expect((await f.http('get', '/api/v2/rentals', oldToken)).status).toBe(401);
     expect((await f.http('get', '/api/v2/rental/admin/overview', token, childId)).status).toBe(200);
-    expect((await f.http('post', '/api/v2/rental/auth/login').send({ code: 'future-staff', bindToken: binding })).status).toBe(409);
+    const legacyToken = 'c'.repeat(64);
+    expect((await f.http('post', '/api/v2/rental/auth/login').send({ code: 'future-staff', bindToken: legacyToken })).status).toBe(422);
+    expect((await f.http('post', '/api/v2/rental/auth/merchant-binding/confirm', token).send({ bindToken: legacyToken })).status).toBe(410);
 
     const returning = await f.http('post', `/api/v2/rental/admin/users/${userId}/merchant`, f.rootToken).send({ merchantId: 1, role: 'user', reason: 'Synthetic explicit return from shared merchant' });
     expect(returning.status).toBe(200);
-    expect((await f.http('post', '/api/v2/rental/auth/merchant-binding/confirm', token).send({ bindToken: returning.body.binding.token })).status).toBe(200);
-    const returned = await f.http('post', '/api/v2/rental/auth/login').send({ code: 'future-staff', bindToken: returning.body.binding.token });
+    expect(returning.body.user).toMatchObject({ id: userId, role: 'user', merchantId: null });
+    expect((await f.http('get', '/api/v2/rental/admin/overview', token, childId)).status).toBe(401);
+    const returned = await f.login('future-staff');
     expect(returned.status).toBe(200);
     expect(returned.body.data).toMatchObject({ user: { id: userId, merchantId: null, role: 'user' }, managementMerchant: null, entry: { id: 1 } });
     expect(await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=?', [userId])).toEqual({ merchant_id: null, auth_version: 2 });
     expect(await f.db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=?', [userId])).toHaveLength(1);
+    expect(await f.db.query('SELECT * FROM ar_user_merchant_binding WHERE user_id=?', [userId])).toHaveLength(0);
     expect(await f.db.query('SELECT merchant_id,previous_merchant_id FROM ar_merchant_audit WHERE target_id=? AND action=? ORDER BY id', [userId, 'USER_TRANSFERRED'])).toEqual([{ merchant_id: childId, previous_merchant_id: null }, { merchant_id: 1, previous_merchant_id: childId }]);
   }), 30_000);
 

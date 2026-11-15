@@ -55,18 +55,13 @@ async function fixture() {
   const route = (method: string, path: string) => router.routes.find(value => value.method === method && value.path === '/v2/rental/' + path)!.handler;
   const root = await runWithMerchant(first, () => auth.login('root'));
   const target = await runWithMerchant(first, () => auth.login('target'));
-  let sourceToken = target.token.accessToken, sourceRuntime = first;
-  const confirmBinding = (token: string, bearer = sourceToken, runtime = sourceRuntime) => runWithMerchant(runtime, () => route('POST', 'auth/merchant-binding/confirm')(ctx(runtime, bearer, { bindToken: token }))) as Promise<Row>;
-  const assign = async (body: Row = { merchantId: 2, role: 'adminer', reason: '明确分配到第二商户' }, token = root.token.accessToken, confirm = true) => {
-    const request = await runWithMerchant(first, () => route('POST', 'admin/users/:id/merchant')(ctx(first, token, body, { id: '2' }))) as Row;
-    if (confirm) await confirmBinding(request.binding.token);
-    return request;
-  };
-  const login = async (runtime: MerchantRuntime, code: string, bindToken?: unknown) => {
-    const result = await withMerchant({ entry: { ...runtime, legacyMerchantId: runtime.id, status: 'active' }, merchant: runtime }, () => auth.login(code, bindToken));
-    if (result.user.id === 2) { sourceToken = result.token.accessToken; sourceRuntime = runtime; }
-    return result;
-  };
+  const confirmBinding = (token: string, bearer = target.token.accessToken, runtime = first) => runWithMerchant(runtime, () => route('POST', 'auth/merchant-binding/confirm')(ctx(runtime, bearer, { bindToken: token }))) as Promise<Row>;
+  const assign = (body: Row = { merchantId: 3, role: 'adminer', reason: '明确分配到共享商户' }, token = root.token.accessToken, userId = 2) =>
+    runWithMerchant(first, () => route('POST', 'admin/users/:id/merchant')(ctx(first, token, body, { id: String(userId) }))) as Promise<Row>;
+  const login = (runtime: MerchantRuntime, code: string, bindToken?: unknown) =>
+    withMerchant({ entry: { ...runtime, legacyMerchantId: runtime.id, status: 'active' }, merchant: runtime }, () => auth.login(code, bindToken));
+  const pendingBinding = () => db.insert('ar_user_merchant_binding', { id: 'f'.repeat(64), user_id: 2, source_merchant_id: 1, source_appid: appA, source_auth_version: 0,
+    target_merchant_id: 3, target_role: 'adminer', created_by: 1, reason: 'Synthetic legacy invitation', created_ms: now, expires_ms: now + 1800000, consumed_ms: null, source_confirmed_ms: now });
   const authenticate = (runtime: MerchantRuntime, token: string) => runWithMerchant(runtime, () => auth.authenticateBearer(ctx(runtime, token)));
   const cookie = (context: ReturnType<typeof ctx>, name: string) => context.res.append.mock.calls.find((value: string[]) => value[1].startsWith(name + '='))[1].split(';')[0];
   const adminLogin = async (token: string, runtime = first) => runWithMerchant(runtime, async () => {
@@ -81,7 +76,7 @@ async function fixture() {
     await db.execute('INSERT INTO ar_merchant_membership(user_id,merchant_id,role,status,authorization_version,updated_ms) VALUES(?,?,?,?,?,?)', [userId, merchantId, role, 'active', 1, now]);
     await db.execute('UPDATE ar_user SET role=?,merchant_id=? WHERE id=?', [role, merchantId, userId]);
   };
-  return { db, auth, admin, phone, a, b, first, second, shared, root, target, ctx, route, assign, confirmBinding, login, authenticate, adminLogin, member, advance(ms: number) { now += ms; } };
+  return { db, auth, admin, phone, a, b, first, second, shared, root, target, ctx, route, assign, pendingBinding, confirmBinding, login, authenticate, adminLogin, member, advance(ms: number) { now += ms; } };
 }
 
 describe('merchant account identities and explicit assignment', () => {
@@ -138,30 +133,33 @@ describe('merchant account identities and explicit assignment', () => {
     expect(other.items).toMatchObject([{ id: 3, phoneNumber: null, phoneVerified: false }]);
     expect(JSON.stringify(other)).not.toContain('+8613900139000');
   });
-  it('revokes pending assignments, JWTs, browser sessions and scanned challenges when current staff authority is removed', async () => {
+  it('revokes legacy assignments, JWTs, browser sessions and scanned challenges when staff authority is removed', async () => {
     const f = await fixture(), browser = await f.adminLogin(f.target.token.accessToken);
-    const pending = await f.assign({ merchantId: 3, role: 'adminer', reason: 'Synthetic pending grant before revocation' });
+    await f.pendingBinding();
     await f.db.execute("INSERT INTO ar_admin_login_challenge(id,status,scanned_user_id) VALUES('synthetic-revocable-challenge','confirmed',2)");
     const revoked = await runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, f.root.token.accessToken, { role: 'user' }, { id: '2' })));
     expect(revoked).toMatchObject({ role: 'user', merchantId: null });
     expect(await f.db.one('SELECT role,merchant_id,auth_version FROM ar_user WHERE id=2')).toMatchObject({ role: 'user', merchant_id: null, auth_version: 1 });
     expect(await f.db.one('SELECT status,authorization_version FROM ar_merchant_membership WHERE user_id=2')).toMatchObject({ status: 'revoked', authorization_version: 2 });
+    expect(Number((await f.db.one('SELECT expires_ms FROM ar_user_merchant_binding'))!.expires_ms)).toBe(1800000000000);
     await expect(f.authenticate(f.first, f.target.token.accessToken)).rejects.toMatchObject({ status: 401 });
     await expect(runWithMerchant(f.first, () => f.auth.refresh(f.target.token.refreshToken))).rejects.toMatchObject({ status: 401 });
     await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, browser.cookie)))).rejects.toMatchObject({ status: 401 });
-    await expect(f.login(f.first, 'target', pending.binding.token)).rejects.toMatchObject({ status: 409 });
     expect((await f.db.one("SELECT status FROM ar_admin_login_challenge WHERE id='synthetic-revocable-challenge'"))!.status).toBe('cancelled');
-    const fresh = await f.login(f.first, 'target');
-    expect(fresh).toMatchObject({ user: { role: 'user', merchantId: null }, managementMerchant: null });
-    await expect(f.confirmBinding(pending.binding.token, fresh.token.accessToken)).rejects.toMatchObject({ status: 409 });
-    const renewed = await f.assign({ merchantId: 3, role: 'adminer', reason: 'Synthetic new authorization after revocation' });
-    expect((await f.login(f.first, 'target', renewed.binding.token)).user).toMatchObject({ role: 'adminer', merchantId: 3 });
+    expect((await f.login(f.first, 'target')).user).toMatchObject({ role: 'user', merchantId: null });
+    const renewed = await f.assign();
+    expect(renewed).toMatchObject({ user: { id: 2, role: 'adminer', merchantId: 3 }, merchant: { id: 3 } });
+    expect(renewed).not.toHaveProperty('binding');
+    expect((await f.login(f.first, 'target')).user).toMatchObject({ role: 'adminer', merchantId: 3 });
   });
-  it('rejects a version-stale invitation even if its expiry was not cleared', async () => {
-    const f = await fixture(), pending = await f.assign({ merchantId: 3, role: 'adminer', reason: 'Synthetic grant version check' });
-    await f.db.execute('UPDATE ar_user SET auth_version=auth_version+1 WHERE id=2');
-    await expect(f.login(f.first, 'target', pending.binding.token)).rejects.toMatchObject({ status: 409 });
-    expect((await f.db.one('SELECT merchant_id FROM ar_merchant_membership WHERE user_id=2'))!.merchant_id).toBe(1);
+  it('rejects all retired binding tokens and confirmation calls without exchanging a WeChat code or changing identity', async () => {
+    const f = await fixture(); await f.pendingBinding();
+    const exchanges = f.a.codeSession.mock.calls.length;
+    for (const token of ['f'.repeat(64), '', null, 42]) await expect(f.login(f.first, 'target', token)).rejects.toMatchObject({ status: 422 });
+    for (const token of [f.root.token.accessToken, f.target.token.accessToken]) await expect(f.confirmBinding('f'.repeat(64), token)).rejects.toMatchObject({ status: 410 });
+    expect(f.a.codeSession.mock.calls.length).toBe(exchanges);
+    expect((await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=2'))!).toEqual({ merchant_id: 1, auth_version: 0 });
+    expect((await f.db.one('SELECT consumed_ms FROM ar_user_merchant_binding'))!.consumed_ms).toBeNull();
   });
   it('lets root list and initially authorize consumers in the selected application using verified identities', async () => {
     const f = await fixture(), onlyA = await f.login(f.first, 'application-a-only');
@@ -177,21 +175,20 @@ describe('merchant account identities and explicit assignment', () => {
     expect((await f.login(f.second, 'occupied')).user).toMatchObject({ id: 3, role: 'manager', merchantId: 2 });
     expect((await f.db.one('SELECT appid FROM ar_user WHERE id=3'))!.appid).toBe(appA);
   });
-  it('assigns staff into and out of a shared merchant through the same AppID with explicit source consent', async () => {
+  it('directly assigns staff into and out of a shared merchant without employee confirmation', async () => {
     const f = await fixture(), oldAdmin = await f.adminLogin(f.target.token.accessToken);
-    const requested = await f.assign({ merchantId: 3, role: 'adminer', reason: '同小程序明确分配到共享商户' }, f.root.token.accessToken, false);
-    await expect(f.login(f.first, 'target', requested.binding.token)).rejects.toMatchObject({ status: 403 });
-    await f.confirmBinding(requested.binding.token);
-    const bound = await f.login(f.first, 'target', requested.binding.token);
+    const requested = await f.assign();
+    expect(requested).toMatchObject({ user: { id: 2, merchantId: 3, role: 'adminer' }, merchant: { id: 3, appId: appA, name: '共享小程序商户' } });
+    expect(requested).not.toHaveProperty('binding');
+    const bound = await f.login(f.first, 'target');
     expect(bound).toMatchObject({ appId: appA, user: { id: 2, merchantId: 3, role: 'adminer' }, merchant: { id: 3, name: '共享小程序商户' } });
     expect((await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=2'))!).toEqual({ merchant_id: 3, auth_version: 1 });
     expect(await f.db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=2')).toHaveLength(1);
+    expect(await f.db.query('SELECT * FROM ar_user_merchant_binding')).toHaveLength(0);
     await expect(f.authenticate(f.first, f.target.token.accessToken)).rejects.toMatchObject({ status: 401 });
     await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, oldAdmin.cookie)))).rejects.toMatchObject({ status: 401 });
-    await expect(f.login(f.first, 'target', requested.binding.token)).rejects.toMatchObject({ status: 409 });
-    const returned = await f.assign({ merchantId: 1, role: 'manager', reason: '同小程序从共享商户明确调回' });
-    const rebound = await f.login(f.first, 'target', returned.binding.token);
-    expect(rebound).toMatchObject({ user: { id: 2, merchantId: 1, role: 'manager' }, merchant: { id: 1 } });
+    await f.assign({ merchantId: 1, role: 'manager', reason: '从共享商户明确调回' });
+    expect(await f.login(f.first, 'target')).toMatchObject({ user: { id: 2, merchantId: 1, role: 'manager' }, merchant: { id: 1 } });
     expect(await f.db.query('SELECT merchant_id,previous_merchant_id FROM ar_merchant_audit ORDER BY id')).toEqual([{ merchant_id: 3, previous_merchant_id: 1 }, { merchant_id: 1, previous_merchant_id: 3 }]);
     expect((await f.db.one('SELECT auth_version FROM ar_user WHERE id=2'))!.auth_version).toBe(2);
   });
@@ -266,66 +263,121 @@ describe('merchant account identities and explicit assignment', () => {
     await f.db.execute('UPDATE ar_user SET auth_version=1 WHERE id=2');
     await expect(f.authenticate(f.first, legacy)).rejects.toMatchObject({ status: 401 });
   });
-  it('completes a one-time assignment with stable account and historical order IDs, invalidating every old credential', async () => {
+  it('direct assignment retains the account, phone, historical orders and identity while invalidating old credentials', async () => {
     const f = await fixture(), oldAdmin = await f.adminLogin(f.target.token.accessToken);
+    await f.pendingBinding();
     await f.db.execute("INSERT INTO ar_rental_order(id,user_id,status,merchant_id,appid,payer_openid,mch_id) VALUES(1,2,'ENDED',1,?,'target','merchant-a')", [appA]);
-    const request = await f.assign();
-    expect(request.binding).toMatchObject({ merchantId: 2, appId: appB, origin: f.second.origin });
-    expect((await f.db.one('SELECT merchant_id FROM ar_user WHERE id=2'))!.merchant_id).toBe(1);
-    const moved = await f.login(f.second, 'new-target', request.binding.token);
-    expect(moved.user).toMatchObject({ id: 2, role: 'adminer', merchantId: 2 });
-    expect(moved.openid).toBe('new-target');
-    expect((await f.db.one('SELECT * FROM ar_user WHERE id=2'))!).toMatchObject({ appid: appA, openid: 'target', merchant_id: 2, auth_version: 1 });
+    await f.db.execute("INSERT INTO ar_admin_login_challenge(id,status,scanned_user_id) VALUES('pending-assignment-challenge','scanned',2)");
+    const phone = await f.db.one('SELECT * FROM ar_user_phone WHERE user_id=2');
+    await f.assign();
+    const moved = await f.login(f.first, 'target');
+    expect(moved.user).toMatchObject({ id: 2, role: 'adminer', merchantId: 3 }); expect(moved.openid).toBe('target');
+    expect((await f.db.one('SELECT * FROM ar_user WHERE id=2'))!).toMatchObject({ appid: appA, openid: 'target', merchant_id: 3, auth_version: 1 });
     expect((await f.db.one('SELECT * FROM ar_rental_order WHERE id=1'))!).toMatchObject({ user_id: 2, merchant_id: 1, appid: appA, payer_openid: 'target', mch_id: 'merchant-a' });
-    expect(await f.db.query("SELECT * FROM ar_role_audit WHERE source='merchant-transfer'")).toMatchObject([{ merchant_id: 2, target_user_id: 2 }]);
-    expect(await f.db.query('SELECT * FROM ar_merchant_audit')).toMatchObject([{ merchant_id: 2, previous_merchant_id: 1, target_id: 2, action: 'USER_TRANSFERRED' }]);
+    expect(await f.db.query("SELECT * FROM ar_role_audit WHERE source='merchant-transfer'")).toMatchObject([{ merchant_id: 3, target_user_id: 2 }]);
+    expect(await f.db.query('SELECT * FROM ar_merchant_audit')).toMatchObject([{ merchant_id: 3, previous_merchant_id: 1, target_id: 2, action: 'USER_TRANSFERRED' }]);
+    expect(await f.db.one('SELECT * FROM ar_user_phone WHERE user_id=2')).toEqual(phone);
+    expect((await f.db.one('SELECT expires_ms FROM ar_user_merchant_binding'))!.expires_ms).toBe(1800000000000);
+    expect((await f.db.one("SELECT status FROM ar_admin_login_challenge WHERE id='pending-assignment-challenge'"))!.status).toBe('cancelled');
     await expect(f.authenticate(f.first, f.target.token.accessToken)).rejects.toMatchObject({ status: 401 });
     await expect(runWithMerchant(f.first, () => f.auth.refresh(f.target.token.refreshToken))).rejects.toMatchObject({ status: 401 });
-    await expect(f.login(f.first, 'target')).rejects.toMatchObject({ status: 401 });
     await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, oldAdmin.cookie)))).rejects.toMatchObject({ status: 401 });
-    await expect(f.login(f.second, 'new-target', request.binding.token)).rejects.toMatchObject({ status: 409 });
-    expect((await f.authenticate(f.second, moved.token.accessToken)).merchantId).toBe(2);
-    const principal = await f.authenticate(f.second, moved.token.accessToken);
-    expect(await runWithMerchant(f.second, () => f.phone.statusFor(principal))).toEqual({ verified: false });
-    await runWithMerchant(f.second, () => f.phone.bind(principal, 'new-native-phone-code'));
-    expect(await f.db.query('SELECT * FROM ar_user_phone_history')).toMatchObject([{ user_id: 2, appid: appA, identity_id: 2 }]);
-    expect((await f.db.one('SELECT * FROM ar_user_phone WHERE user_id=2'))!).toMatchObject({ appid: appB, phone_e164: '+8613800138000' });
-    expect((await f.adminLogin(moved.token.accessToken, f.second)).session).toMatchObject({ user: { id: 2, role: 'adminer' }, merchant: { id: 2 } });
+    expect((await f.authenticate(f.shared, moved.token.accessToken)).user.merchant_id).toBe(3);
   });
-  it('requires root, explicit target login and an unoccupied target identity without automatic account merges', async () => {
-    const f = await fixture();
-    await expect(f.assign(undefined, f.target.token.accessToken)).rejects.toMatchObject({ status: 403 });
-    const request = await f.assign();
-    await expect(f.login(f.first, 'target', request.binding.token)).rejects.toMatchObject({ status: 403 });
-    await expect(f.login(f.second, 'occupied', request.binding.token)).rejects.toMatchObject({ status: 409 });
+  it('requires root and an existing target-application identity without automatic account linking or merging', async () => {
+    const f = await fixture(), consumer = await f.login(f.first, 'ordinary-consumer'), admin = await f.login(f.first, 'ordinary-admin');
+    await f.member(admin.user.id, 1, 'adminer');
+    for (const token of [f.target.token.accessToken, consumer.token.accessToken, (await f.login(f.first, 'ordinary-admin')).token.accessToken]) await expect(f.assign(undefined, token)).rejects.toMatchObject({ status: 403 });
+    await expect(f.assign({ merchantId: 2, role: 'adminer', reason: 'Unverified cross-AppID grant' })).rejects.toMatchObject({ status: 409 });
     expect((await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=2'))!).toEqual({ merchant_id: 1, auth_version: 0 });
-    expect((await f.db.one('SELECT consumed_ms FROM ar_user_merchant_binding'))!.consumed_ms).toBeNull();
-    f.advance(30 * 60_000);
-    await expect(f.login(f.second, 'new', request.binding.token)).rejects.toMatchObject({ status: 409 });
+    expect((await f.db.one('SELECT user_id FROM ar_user_wechat_identity WHERE appid=? AND openid=?', [appB, 'occupied']))!.user_id).toBe(3);
+    await f.db.insert('ar_user_wechat_identity', { user_id: 2, appid: appB, openid: 'previously-verified-target', status: 'disabled' });
+    await expect(f.assign({ merchantId: 2, role: 'manager', reason: 'Disabled identity grant' })).rejects.toMatchObject({ status: 409 });
+    await f.db.execute("UPDATE ar_user_wechat_identity SET status='active' WHERE user_id=2 AND appid=?", [appB]);
+    expect(await f.assign({ merchantId: 2, role: 'manager', reason: 'Existing verified identity grant' })).toMatchObject({ user: { id: 2, merchantId: 2, role: 'manager' } });
+    expect((await f.login(f.second, 'previously-verified-target')).user.id).toBe(2);
+    expect(await f.db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=2')).toHaveLength(2);
   });
-  it('requires the source account itself to confirm before any target identity can consume the invitation', async () => {
-    const f = await fixture(), request = await f.assign(undefined, f.root.token.accessToken, false);
-    await expect(f.login(f.second, 'new-target', request.binding.token)).rejects.toMatchObject({ status: 403 });
-    await expect(f.confirmBinding(request.binding.token, f.root.token.accessToken)).rejects.toMatchObject({ status: 403 });
-    const stranger = await f.login(f.first, 'stranger');
-    await expect(f.confirmBinding(request.binding.token, stranger.token.accessToken)).rejects.toMatchObject({ status: 403 });
-    const confirmed = await f.confirmBinding(request.binding.token);
-    expect(confirmed.binding).toMatchObject({ merchantId: 2, appId: appB, origin: f.second.origin });
-    expect(await f.confirmBinding(request.binding.token)).toEqual(confirmed);
-    expect((await f.login(f.second, 'new-target', request.binding.token)).user.id).toBe(2);
+  it('supports same-merchant role changes and idempotent retries without employee confirmation', async () => {
+    const f = await fixture();
+    await f.db.execute("INSERT INTO ar_rental_order(id,user_id,status) VALUES(1,2,'ACTIVE')");
+    const body = { merchantId: 1, role: 'adminer', reason: 'Promote existing employee' };
+    const assigned = await f.assign(body);
+    expect(assigned.user).toMatchObject({ id: 2, role: 'adminer', merchantId: 1 });
+    expect(await f.assign(body)).toEqual(assigned);
+    expect((await f.db.one('SELECT auth_version FROM ar_user WHERE id=2'))!.auth_version).toBe(1);
+    expect((await f.db.one('SELECT authorization_version FROM ar_merchant_membership WHERE user_id=2'))!.authorization_version).toBe(2);
+    expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(1);
+    expect(await f.db.query('SELECT * FROM ar_merchant_audit')).toHaveLength(1);
+    expect((await f.db.one('SELECT status FROM ar_rental_order WHERE id=1'))!.status).toBe('ACTIVE');
+    const revoked = await f.assign({ merchantId: 1, role: 'user', reason: 'Remove employee authorization' });
+    expect(revoked.user).toMatchObject({ id: 2, role: 'user', merchantId: null });
+    expect((await f.db.one('SELECT status FROM ar_rental_order WHERE id=1'))!.status).toBe('ACTIVE');
+    expect((await f.login(f.first, 'target')).managementMerchant).toBeNull();
+  });
+  it.each([
+    { status: 'ACTIVE', amount: 0, refund: null },
+    { status: 'COMPENSATING', amount: 100, refund: 'PROCESSING' },
+    { status: 'ENDED', amount: 100, refund: 'ABNORMAL' },
+  ])('revokes staff immediately while preserving unfinished business ($status/$refund)', async ({ status, amount, refund }) => {
+    const f = await fixture();
+    await f.db.execute('INSERT INTO ar_rental_order(id,user_id,status,refund_amount_cents,refund_status,merchant_id,appid,payer_openid,mch_id) VALUES(1,2,?,?,?,1,?,?,?)', [status, amount, refund, appA, 'target', 'original-payment-merchant']);
+    const order = await f.db.one('SELECT * FROM ar_rental_order WHERE id=1');
+    expect(await f.assign({ merchantId: 1, role: 'user', reason: 'Immediately remove staff permission' })).toMatchObject({ user: { id: 2, role: 'user', merchantId: null } });
+    expect(await f.db.one('SELECT * FROM ar_rental_order WHERE id=1')).toEqual(order);
+    expect((await f.db.one('SELECT status FROM ar_merchant_membership WHERE user_id=2'))!.status).toBe('revoked');
+    await expect(f.authenticate(f.first, f.target.token.accessToken)).rejects.toMatchObject({ status: 401 });
+    expect((await f.login(f.first, 'target')).user).toMatchObject({ id: 2, role: 'user', merchantId: null });
+  });
+  it('initially grants a consumer staff authority without moving or changing unfinished customer orders', async () => {
+    const f = await fixture(), consumer = await f.login(f.first, 'future-staff-with-order');
+    await f.db.execute("INSERT INTO ar_rental_order(id,user_id,status,refund_amount_cents,refund_status,merchant_id,appid,payer_openid,mch_id) VALUES(1,?,'COMPENSATING',100,'PROCESSING',1,?,?,?)", [consumer.user.id, appA, 'future-staff-with-order', 'original-payment-merchant']);
+    const order = await f.db.one('SELECT * FROM ar_rental_order WHERE id=1');
+    expect(await f.assign({ merchantId: 3, role: 'manager', reason: 'Initial employee authorization' }, f.root.token.accessToken, consumer.user.id)).toMatchObject({ user: { id: consumer.user.id, role: 'manager', merchantId: 3 } });
+    expect(await f.db.one('SELECT * FROM ar_rental_order WHERE id=1')).toEqual(order);
+    await expect(f.authenticate(f.first, consumer.token.accessToken)).rejects.toMatchObject({ status: 401 });
+    expect((await f.login(f.first, 'future-staff-with-order')).user).toMatchObject({ role: 'manager', merchantId: 3 });
+  });
+  it('allows unchanged authorization and root revocation in a paused merchant without granting new staff authority', async () => {
+    const f = await fixture();
+    await f.db.execute("UPDATE ar_merchant SET status='paused' WHERE id=1");
+    expect(await f.assign({ merchantId: 1, role: 'manager', reason: 'Retry unchanged paused authorization' })).toMatchObject({ user: { role: 'manager', merchantId: 1 }, merchant: { id: 1, status: 'paused' } });
+    expect((await f.db.one('SELECT auth_version FROM ar_user WHERE id=2'))!.auth_version).toBe(0);
+    await expect(f.assign({ merchantId: 1, role: 'adminer', reason: 'Cannot promote in paused merchant' })).rejects.toMatchObject({ status: 422 });
+    expect(await f.assign({ merchantId: 1, role: 'user', reason: 'Revoke staff in paused merchant' })).toMatchObject({ user: { role: 'user', merchantId: null }, merchant: { id: 1, status: 'paused' } });
+    expect((await f.db.one('SELECT status FROM ar_merchant_membership WHERE user_id=2'))!.status).toBe('revoked');
+    await expect(f.authenticate(f.first, f.target.token.accessToken)).rejects.toMatchObject({ status: 401 });
+    expect((await f.login(f.first, 'target')).user).toMatchObject({ role: 'user', merchantId: null });
+  });
+  it('rechecks root authorization inside the transaction and never changes the current or highest account', async () => {
+    const f = await fixture();
+    await expect(f.assign(undefined, undefined, 1)).rejects.toMatchObject({ status: 403 });
+    const one = f.db.one.bind(f.db);
+    const check = vi.spyOn(f.db, 'one').mockImplementation(async (sql, values) => {
+      const row = await one(sql, values);
+      return sql === 'SELECT * FROM ar_user WHERE id=? FOR UPDATE' && Number(values?.[0]) === 1 ? { ...row, auth_version: 1 } : row;
+    });
+    await expect(f.assign()).rejects.toMatchObject({ status: 401 });
+    check.mockImplementation(async (sql, values) => {
+      const row = await one(sql, values);
+      return sql === 'SELECT * FROM ar_user WHERE id=? FOR UPDATE' && Number(values?.[0]) === 1 ? { ...row, role: 'user' } : row;
+    });
+    await expect(f.assign()).rejects.toMatchObject({ status: 403 });
+    expect((await one('SELECT merchant_id,auth_version FROM ar_user WHERE id=2'))!).toEqual({ merchant_id: 1, auth_version: 0 });
   });
   it.each([
     { status: 'PENDING_PAYMENT', amount: 0, refund: null },
     { status: 'ACTIVE', amount: 0, refund: null },
     { status: 'COMPENSATING', amount: 100, refund: 'PROCESSING' },
+    { status: 'COMPENSATING', amount: 100, refund: null },
     { status: 'ENDED', amount: 100, refund: 'ABNORMAL' },
-  ])('rechecks unfinished business at assignment and final binding ($status/$refund)', async ({ status, amount, refund }) => {
-    const f = await fixture(), request = await f.assign();
+  ])('rejects direct affiliation changes while business is unfinished ($status/$refund)', async ({ status, amount, refund }) => {
+    const f = await fixture();
     await f.db.execute('INSERT INTO ar_rental_order(id,user_id,status,refund_amount_cents,refund_status) VALUES(1,2,?,?,?)', [status, amount, refund]);
     await expect(f.assign()).rejects.toMatchObject({ status: 409 });
-    await expect(f.login(f.second, 'new', request.binding.token)).rejects.toMatchObject({ status: 409 });
     expect((await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=2'))!).toEqual({ merchant_id: 1, auth_version: 0 });
     expect(await f.db.query("SELECT * FROM ar_user_wechat_identity WHERE user_id=2 AND status='active'")).toHaveLength(1);
+    expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(0);
   });
   it('lets root keep the original login session while selecting a different merchant and rejects non-root scope changes', async () => {
     const f = await fixture(), rootAdmin = await f.adminLogin(f.root.token.accessToken);
@@ -336,16 +388,14 @@ describe('merchant account identities and explicit assignment', () => {
     await expect(withMerchant({ entry: f.first, merchant: f.second }, () => f.auth.authenticateBearer(f.ctx(f.first, f.target.token.accessToken)))).rejects.toMatchObject({ status: 403 });
     expect(rootAdmin.cookie).not.toContain('Domain=');
   });
-  it('keeps disabled historical identities when moving back to an earlier merchant with a new OpenID', async () => {
-    const f = await fixture(), firstRequest = await f.assign();
-    await f.login(f.second, 'new-target-b', firstRequest.binding.token);
-    const returnRequest = await f.assign({ merchantId: 1, role: 'manager', reason: '分配回第一商户并重新绑定微信身份' });
-    const returned = await f.login(f.first, 'new-target-a', returnRequest.binding.token);
-    expect(returned.user).toMatchObject({ id: 2, merchantId: 1, role: 'manager' });
-    expect((await f.authenticate(f.first, returned.token.accessToken)).openid).toBe('new-target-a');
-    await expect(f.login(f.first, 'target')).rejects.toMatchObject({ status: 401 });
-    await expect(f.login(f.second, 'new-target-b')).rejects.toMatchObject({ status: 401 });
-    expect(await f.db.query("SELECT * FROM ar_user_wechat_identity WHERE user_id=2 AND status='active'")).toHaveLength(1);
+  it('keeps active and historical identities unchanged when moving between shared merchants', async () => {
+    const f = await fixture();
+    await f.db.insert('ar_user_wechat_identity', { user_id: 2, appid: appB, openid: 'historical-disabled-identity', status: 'disabled' });
+    const identities = await f.db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=2 ORDER BY id');
+    await f.assign();
+    await f.assign({ merchantId: 1, role: 'manager', reason: 'Return without rebinding a WeChat identity' });
+    expect((await f.login(f.first, 'target')).user).toMatchObject({ id: 2, merchantId: 1, role: 'manager' });
+    expect(await f.db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=2 ORDER BY id')).toEqual(identities);
   });
   it('keeps paused-merchant identities and management sessions usable without pausing application registration', async () => {
     const f = await fixture(), session = await f.adminLogin(f.target.token.accessToken);
@@ -359,11 +409,11 @@ describe('merchant account identities and explicit assignment', () => {
     expect((await f.login(f.first, 'unregistered')).user.merchantId).toBeNull();
     expect(await f.db.query("SELECT * FROM ar_user WHERE openid='unregistered'")).toHaveLength(1);
   });
-  it('allows transfer after compensation has fully refunded while retaining the original order', async () => {
+  it('allows direct transfer after compensation has fully refunded while retaining the original order', async () => {
     const f = await fixture();
     await f.db.execute("INSERT INTO ar_rental_order(id,user_id,status,refund_amount_cents,refund_status,merchant_id) VALUES(1,2,'COMPENSATING',100,'SUCCESS',1)");
-    const request = await f.assign();
-    expect((await f.login(f.second, 'new-target', request.binding.token)).user.merchantId).toBe(2);
+    expect((await f.assign()).user.merchantId).toBe(3);
+    expect((await f.login(f.first, 'target')).user.merchantId).toBe(3);
     expect((await f.db.one('SELECT merchant_id,status FROM ar_rental_order WHERE id=1'))!).toEqual({ merchant_id: 1, status: 'COMPENSATING' });
   });
   it('retains direct loopback admin development origins without trusting forwarded host or remote requests', async () => {
@@ -382,18 +432,25 @@ describe('merchant account identities and explicit assignment', () => {
     const remote = local(); remote.req.socket.remoteAddress = '192.0.2.1';
     await expect(runWithMerchant(f.first, () => f.route('POST', 'admin/auth/challenges')(remote))).rejects.toMatchObject({ status: 403 });
   });
-  it('rolls back every transfer mutation on audit failure and allows a safe retry', async () => {
-    const f = await fixture(), request = await f.assign();
+  it.each(['ar_role_audit', 'ar_merchant_audit'])('rolls back every direct-assignment mutation on %s failure and allows a safe retry', async failedTable => {
+    const f = await fixture(), browser = await f.adminLogin(f.target.token.accessToken);
+    await f.pendingBinding();
     const insert = f.db.insert.bind(f.db);
-    vi.spyOn(f.db, 'insert').mockImplementation(async (table, data) => {
-      if (table === 'ar_role_audit') throw new Error('Synthetic transfer audit failure');
+    const failure = vi.spyOn(f.db, 'insert').mockImplementation(async (table, data) => {
+      if (table === failedTable) throw new Error('Synthetic transfer audit failure');
       return insert(table, data);
     });
-    await expect(f.login(f.second, 'new-target', request.binding.token)).rejects.toThrow('Synthetic transfer audit failure');
+    await expect(f.assign()).rejects.toThrow('Synthetic transfer audit failure');
     expect((await f.db.one('SELECT merchant_id,auth_version FROM ar_user WHERE id=2'))!).toEqual({ merchant_id: 1, auth_version: 0 });
-    expect((await f.db.one('SELECT consumed_ms FROM ar_user_merchant_binding'))!.consumed_ms).toBeNull();
+    expect((await f.db.one('SELECT merchant_id,authorization_version FROM ar_merchant_membership WHERE user_id=2'))!).toEqual({ merchant_id: 1, authorization_version: 1 });
+    expect((await f.db.one('SELECT expires_ms FROM ar_user_merchant_binding'))!.expires_ms).toBe(1800001800000);
+    expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(0);
+    expect(await f.db.query('SELECT * FROM ar_merchant_audit')).toHaveLength(0);
     expect((await f.authenticate(f.first, f.target.token.accessToken)).user.id).toBe(2);
-    vi.mocked(f.db.insert).mockImplementation(insert);
-    expect((await f.login(f.second, 'new-target', request.binding.token)).user.id).toBe(2);
+    expect(await runWithMerchant(f.first, () => f.route('GET', 'admin/auth/session')(f.ctx(f.first, undefined, {}, {}, browser.cookie)))).toMatchObject({ user: { id: 2 } });
+    failure.mockImplementation(insert);
+    expect((await f.assign()).user).toMatchObject({ id: 2, merchantId: 3, role: 'adminer' });
+    expect((await f.db.one('SELECT auth_version FROM ar_user WHERE id=2'))!.auth_version).toBe(1);
+    expect(await f.db.query('SELECT * FROM ar_merchant_audit')).toHaveLength(1);
   });
 });

@@ -122,7 +122,7 @@ describe('independent AR rental lifecycle', () => {
     const created = await f.service.createDevice(actor, { venueId: 1, uuid: 'role-device-' + role });
     await f.service.configure(actor, created.device.id, { enabled: true, version: 0 });
     expect(await f.service.context(f.user, created.device.uuid)).toMatchObject({ state: 'AVAILABLE', pricing: { totalCents: 22000 }, actions: { canRent: true, canConfigure: false } });
-    expect((await f.service.devices(actor, { search: created.device.uuid })).total).toBe(1);
+    expect((await f.service.devices(actor, { venueId: 1, search: created.device.uuid })).total).toBe(1);
     const forged = { ...f.user, user: { ...f.user.user, role } };
     await expect(f.service.createDevice(forged, { venueId: 1, uuid: 'forged-role-' + role })).rejects.toMatchObject({ status: 403 });
     await expect(f.service.configure(forged, created.device.id, { enabled: false, version: 1 })).rejects.toMatchObject({ status: 403 });
@@ -166,7 +166,7 @@ describe('independent AR rental lifecycle', () => {
     const f = fixture();
     await f.service.createDevice(f.manager, { venueId: 1, uuid: 'literal-device', name: '设备100%_ready' });
     await expect(f.service.devices(f.user, {})).rejects.toMatchObject({ status: 403 });
-    const result = await f.service.devices(f.manager, { search: '%_', 'per-page': 1 });
+    const result = await f.service.devices(f.manager, { venueId: 1, search: '%_', 'per-page': 1 });
     expect(result).toMatchObject({ page: 1, pageSize: 1, total: 1, items: [{ device: { uuid: 'literal-device' }, state: 'DISABLED' }] });
     expect((await f.service.devices(f.root, { search: 'AR眼镜' })).total).toBe(1);
   });
@@ -174,7 +174,7 @@ describe('independent AR rental lifecycle', () => {
     const f = fixture();
     for (let index = 0; index < 20; index++) await f.db.insert('ar_device', { uuid: 'page-device-' + index, name: '场地设备' + index, venue_id: 1, merchant_id: 1 });
     const query = vi.spyOn(f.db, 'query');
-    const result = await f.service.devices(f.manager, { pageSize: 50 });
+    const result = await f.service.devices(f.manager, { venueId: 1, pageSize: 50 });
     expect(result.total).toBe(22); expect(result.items).toHaveLength(22);
     expect(query.mock.calls.length).toBeLessThanOrEqual(4);
     for (const item of result.items) {
@@ -693,6 +693,51 @@ function merchantFixture(shared = false) {
   return { first, second, db, service, options, a, b, user, manager, root, userB, managerB, merchantA, merchantB, clients, resolveMerchant, resolvePaymentForOrder, configure, configureB, create, createB, providerSuccess };
 }
 
+describe('admin device QR generation', () => {
+  it.each(['manager', 'adminer', 'root'] as const)('allows current %s permissions without changing device or rental state', async role => {
+    const f = fixture();
+    const execute = vi.spyOn(f.db, 'execute'), transaction = vi.spyOn(f.db, 'transaction');
+    const result = await f.service.deviceQrcode(f[role], 7);
+    expect(result).toMatchObject({ device: { id: 7, uuid: 'camera-7', name: 'AR眼镜', type: 'rokid', venueName: '场地一' }, url: 'https://d.4mr.cn/d?i=camera-7&t=rokid' });
+    expect(result.qr.modules).toHaveLength(result.qr.size ** 2);
+    expect(execute).not.toHaveBeenCalled(); expect(transaction).not.toHaveBeenCalled();
+    expect(f.payment.order).not.toHaveBeenCalled(); expect(f.payment.payment).not.toHaveBeenCalled();
+  });
+
+  it('rejects consumers, forged roles and revoked manager permissions before reading a device', async () => {
+    const f = fixture();
+    await expect(f.service.deviceQrcode(f.user, 7)).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.deviceQrcode({ ...f.user, user: { ...f.user.user, role: 'manager' } }, 7)).rejects.toMatchObject({ status: 403 });
+    await f.db.execute("UPDATE ar_user SET role='user' WHERE id=2");
+    await expect(f.service.deviceQrcode(f.manager, 7)).rejects.toMatchObject({ status: 403 });
+  });
+
+  it('uses options.authenticate and ignores client supplied origin, UUID and type', async () => {
+    const f = fixture(); const router = new ApiRouter(); const authenticate = vi.fn(async () => f.manager);
+    registerRentals(router, f.services, { ...f.options, authenticate });
+    const route = router.routes.find(route => route.path === '/v2/rental/admin/devices/:id/qrcode')!;
+    expect(route.method).toBe('GET'); const setHeader = vi.fn();
+    const result = await route.handler({ params: { id: '7' }, query: { origin: 'https://evil.example', uuid: 'forged', type: 'rs3' }, res: { setHeader } } as any) as Row;
+    expect(authenticate).toHaveBeenCalledOnce(); expect(setHeader).toHaveBeenCalledWith('Cache-Control', 'no-store');
+    expect(result.url).toBe('https://d.4mr.cn/d?i=camera-7&t=rokid');
+    authenticate.mockRejectedValueOnce(new ApiError(401, 'unauthorized'));
+    await expect(route.handler({ params: { id: '7' }, res: { setHeader } } as any)).rejects.toMatchObject({ status: 401 });
+    await expect(f.service.deviceQrcode(f.manager, '7 OR 1=1')).rejects.toMatchObject({ status: 422 });
+    await expect(f.service.deviceQrcode(f.manager, 999)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it.each([false, true])('keeps selected-merchant scope for independent/shared entries (shared=%s)', async shared => {
+    const f = merchantFixture(shared);
+    const result = await f.a(() => f.service.deviceQrcode(f.manager, 7));
+    expect(result.url).toBe('https://first.example/d?i=camera-7&t=rokid');
+    await expect(f.a(() => f.service.deviceQrcode(f.manager, 9))).rejects.toMatchObject({ status: 404 });
+    await expect(f.a(() => f.service.deviceQrcode(f.root, 9))).rejects.toMatchObject({ status: 404 });
+    await expect(f.a(() => f.service.deviceQrcode(f.managerB, 7))).rejects.toMatchObject({ status: shared ? 403 : 401 });
+    expect((await f.b(() => f.service.deviceQrcode(f.managerB, 9))).url).toBe('https://second.example/d?i=second-device&t=rokid');
+    expect(f.resolveMerchant).not.toHaveBeenCalled();
+  });
+});
+
 describe('shared mini-program merchant rentals', () => {
   it('keeps different mini-program identities isolated when merchant resolution is enabled', async () => {
     const f = merchantFixture(); await f.configure();
@@ -831,8 +876,8 @@ describe('merchant-scoped rentals and original payment accounts', () => {
   it('isolates every device entry and order read, including forged manager scope', async () => {
     const f = merchantFixture(); await f.configure(); await f.configureB();
     const created = await f.create();
-    expect(await f.a(() => f.service.devices(f.manager, {}))).toMatchObject({ total: 2 });
-    expect(await f.b(() => f.service.devices(f.managerB, {}))).toMatchObject({ total: 1, items: [{ device: { id: 9 } }] });
+    expect(await f.a(() => f.service.devices(f.manager, { venueId: 1 }))).toMatchObject({ total: 2 });
+    expect(await f.b(() => f.service.devices(f.managerB, { venueId: 2 }))).toMatchObject({ total: 1, items: [{ device: { id: 9 } }] });
     await expect(f.a(() => f.service.context(f.user, 'second-device'))).rejects.toMatchObject({ status: 409, code: 'MERCHANT_MISMATCH' });
     await expect(f.b(() => f.service.get(f.managerB, created.rental.id))).rejects.toMatchObject({ status: 404 });
     await expect(f.b(() => f.service.configure(f.managerB, 7, { enabled: false, version: 1 }))).rejects.toMatchObject({ status: 404 });

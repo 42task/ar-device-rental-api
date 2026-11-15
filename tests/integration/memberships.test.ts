@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import mysql from 'mysql2/promise';
 import { describe, expect, it, vi } from 'vitest';
 import { RentalAuth } from '../../src/auth';
@@ -104,28 +104,36 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL authoritative m
     expect(consumer).toMatchObject({ role: 'user', merchant_id: null });
   }), 30_000);
 
-  it('invalidates an outstanding staff assignment when root revokes authority and requires a new grant', async () => withFixture(async f => {
+  it('assigns and revokes staff directly, expiring legacy grants and every superseded session', async () => withFixture(async f => {
     await f.db.insert('ar_user', { id: 2, appid: appId, openid: 'synthetic-subject', role: 'adminer', merchant_id: 1 });
     await f.db.insert('ar_merchant_membership', { user_id: 2, merchant_id: 1, role: 'adminer', status: 'active', authorization_version: 1, updated_ms: Date.now() });
     const subject = await f.login('synthetic-subject');
-    const pending = await f.call('POST', 'admin/users/:id/merchant', f.root.token.accessToken, { merchantId: 2, role: 'adminer', reason: 'Synthetic grant before revocation' }, { id: '2' });
-    await f.call('POST', 'auth/merchant-binding/confirm', subject.token.accessToken, { bindToken: pending.binding.token });
-    await f.call('PUT', 'admin/users/:id/role', f.root.token.accessToken, { role: 'user' }, { id: '2' });
-    expect(await f.db.one('SELECT role,merchant_id,auth_version FROM ar_user WHERE id=2')).toEqual({ role: 'user', merchant_id: null, auth_version: 1 });
-    expect(await f.db.one('SELECT status,authorization_version FROM ar_merchant_membership WHERE user_id=2')).toEqual({ status: 'revoked', authorization_version: 2 });
-    await expect(f.login('synthetic-subject', pending.binding.token)).rejects.toMatchObject({ status: 409 });
+    const legacyToken = 'b'.repeat(64), now = Date.now();
+    await f.db.insert('ar_user_merchant_binding', { id: createHash('sha256').update(legacyToken).digest('hex'), user_id: 2, source_merchant_id: 1, source_appid: appId, source_auth_version: 0, target_merchant_id: 2, target_role: 'adminer', created_by: 1, reason: 'Synthetic retired invitation', created_ms: now, expires_ms: now + 3600000 });
+    const assigned = await f.call('POST', 'admin/users/:id/merchant', f.root.token.accessToken, { merchantId: 2, role: 'adminer', reason: 'Synthetic direct staff assignment' }, { id: '2' });
+    expect(assigned).toMatchObject({ user: { id: 2, role: 'adminer', merchantId: 2 }, merchant: { id: 2, appId } });
+    expect(assigned).not.toHaveProperty('binding');
+    expect(Number((await f.db.one('SELECT expires_ms FROM ar_user_merchant_binding WHERE user_id=2'))!.expires_ms)).toBeLessThanOrEqual(Date.now());
     await expect(f.scoped(() => f.auth.refresh(subject.token.refreshToken))).rejects.toMatchObject({ status: 401 });
+    const employee = await f.login('synthetic-subject');
+    expect(employee).toMatchObject({ user: { role: 'adminer', merchantId: 2 }, managementMerchant: { id: 2 } });
+    await f.call('POST', 'admin/users/:id/merchant', f.root.token.accessToken, { merchantId: 2, role: 'user', reason: 'Synthetic direct staff revocation' }, { id: '2' });
+    expect(await f.db.one('SELECT role,merchant_id,auth_version FROM ar_user WHERE id=2')).toEqual({ role: 'user', merchant_id: null, auth_version: 2 });
+    expect(await f.db.one('SELECT status,authorization_version FROM ar_merchant_membership WHERE user_id=2')).toEqual({ status: 'revoked', authorization_version: 3 });
+    await expect(f.login('synthetic-subject', legacyToken)).rejects.toMatchObject({ status: 422 });
+    await expect(f.scoped(() => f.auth.refresh(employee.token.refreshToken))).rejects.toMatchObject({ status: 401 });
     const fresh = await f.login('synthetic-subject');
     expect(fresh).toMatchObject({ user: { role: 'user', merchantId: null }, managementMerchant: null, entry: { id: 1, legacyMerchantId: 1 } });
-    await expect(f.call('POST', 'auth/merchant-binding/confirm', fresh.token.accessToken, { bindToken: pending.binding.token })).rejects.toMatchObject({ status: 409 });
+    await expect(f.call('POST', 'auth/merchant-binding/confirm', fresh.token.accessToken, { bindToken: legacyToken })).rejects.toMatchObject({ status: 410 });
     const employees = await f.call('GET', 'admin/users', f.root.token.accessToken);
     expect(employees).toMatchObject({ scope: 'employees', items: [] });
     const platform = await f.call('GET', 'admin/users', f.root.token.accessToken, {}, {}, { scope: 'platform' });
     expect(platform.items).toMatchObject([{ id: 2, role: 'user', merchantId: null }]);
     const renewed = await f.call('POST', 'admin/users/:id/merchant', f.root.token.accessToken, { merchantId: 2, role: 'adminer', reason: 'Synthetic renewed grant' }, { id: '2' });
-    await f.call('POST', 'auth/merchant-binding/confirm', fresh.token.accessToken, { bindToken: renewed.binding.token });
-    const bound = await f.login('synthetic-subject', renewed.binding.token);
+    expect(renewed.user).toMatchObject({ id: 2, role: 'adminer', merchantId: 2 });
+    const bound = await f.login('synthetic-subject');
     expect(bound).toMatchObject({ user: { id: 2, role: 'adminer', merchantId: 2 }, managementMerchant: { id: 2 }, merchant: { id: 2 } });
-    expect(await f.db.one('SELECT merchant_id,role,status,authorization_version FROM ar_merchant_membership WHERE user_id=2')).toEqual({ merchant_id: 2, role: 'adminer', status: 'active', authorization_version: 3 });
+    expect(await f.db.one('SELECT merchant_id,role,status,authorization_version FROM ar_merchant_membership WHERE user_id=2')).toEqual({ merchant_id: 2, role: 'adminer', status: 'active', authorization_version: 4 });
+    expect(await f.db.one('SELECT auth_version FROM ar_user WHERE id=2')).toEqual({ auth_version: 3 });
   }), 30_000);
 });
