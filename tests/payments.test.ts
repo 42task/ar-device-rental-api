@@ -15,8 +15,8 @@ function response(body: unknown, status = 200, timestamp = now): Response {
   const raw = typeof body === 'string' ? body : JSON.stringify(body);
   return new Response(status === 204 ? null : raw, { status, headers: headers(raw, timestamp) });
 }
-function notification(resource: Record<string, unknown>) {
-  const cipher = createCipheriv('aes-256-gcm', Buffer.from(apiV3Key), Buffer.from('12-byte-iv01'));
+function notification(resource: Record<string, unknown>, key = apiV3Key) {
+  const cipher = createCipheriv('aes-256-gcm', Buffer.from(key), Buffer.from('12-byte-iv01'));
   cipher.setAAD(Buffer.from('transaction'));
   const ciphertext = Buffer.concat([cipher.update(JSON.stringify(resource)), cipher.final(), cipher.getAuthTag()]).toString('base64');
   const raw = JSON.stringify({ id: 'notice-1', event_type: 'TRANSACTION.SUCCESS', resource: { algorithm: 'AEAD_AES_256_GCM', nonce: '12-byte-iv01', associated_data: 'transaction', ciphertext } });
@@ -25,6 +25,21 @@ function notification(resource: Record<string, unknown>) {
 afterEach(() => vi.unstubAllEnvs());
 
 describe('standalone WeChat client', () => {
+  it('never borrows default credentials or callback URLs for a managed merchant', async () => {
+    vi.stubEnv('WECHAT_APP_ID', appId); vi.stubEnv('WECHAT_APP_SECRET', 'another-merchant-secret');
+    vi.stubEnv('WECHAT_PAY_MCH_ID', mchId); vi.stubEnv('WECHAT_PAY_SERIAL_NO', 'another-serial');
+    vi.stubEnv('WECHAT_PAY_PRIVATE_KEY', options.privateKey!); vi.stubEnv('WECHAT_PAY_API_V3_KEY', apiV3Key);
+    vi.stubEnv('WECHAT_PAY_PLATFORM_KEYS_JSON', JSON.stringify(options.platformKeys)); vi.stubEnv('WECHAT_PAY_ENABLED', '1');
+    vi.stubEnv('WECHAT_PAY_NOTIFY_URL', 'https://other.example/payment'); vi.stubEnv('WECHAT_PAY_REFUND_NOTIFY_URL', 'https://other.example/refund');
+    const fetcher = vi.fn();
+    const client = new WeChatClient({ allowEnvironmentFallback: false, appId: 'wxaaaaaaaaaaaaaaaa', fetch: fetcher });
+    expect(client.config).toMatchObject({ appId: 'wxaaaaaaaaaaaaaaaa', platformKeys: {}, payEnabled: false });
+    for (const field of ['appSecret', 'mchId', 'serialNo', 'privateKey', 'apiV3Key', 'notifyUrl', 'refundNotifyUrl'] as const) expect(client.config[field]).toBeUndefined();
+    expect(client.isPaymentReady()).toBe(false);
+    await expect(client.codeSession('code')).rejects.toMatchObject({ status: 503 });
+    await expect(client.payment('GET', '/v3/refund/domestic/refunds/old')).rejects.toMatchObject({ status: 503 });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
   it('exchanges only server-configured app credentials and returns no session key', async () => {
     const fetcher = vi.fn(async () => new Response(JSON.stringify({ openid: 'confirmed-user', unionid: 'confirmed-union', session_key: 'never-return-this' })));
     const client = new WeChatClient({ ...options, payEnabled: false, fetch: fetcher });
@@ -85,6 +100,27 @@ describe('standalone WeChat client', () => {
     await expect(client.notification(otherMerchant.raw, otherMerchant.headers)).rejects.toMatchObject({ status: 403 });
     const otherApp = notification({ mchid: mchId, appid: 'wxaaaaaaaaaaaaaaaa' });
     await expect(client.notification(otherApp.raw, otherApp.headers)).rejects.toMatchObject({ status: 403 });
+  });
+  it('decrypts delayed signed notifications with bounded historical APIv3 keys after rotation', async () => {
+    const currentKey = '98765432109876543210987654321098';
+    const client = new WeChatClient({ ...options, apiV3Key: currentKey, apiV3Keys: [apiV3Key] });
+    const old = notification({ mchid: mchId, appid: appId, out_trade_no: 'ARL_old' });
+    expect((await client.notification(old.raw, old.headers)).resource.out_trade_no).toBe('ARL_old');
+    const current = notification({ mchid: mchId, appid: appId, out_trade_no: 'ARL_current' }, currentKey);
+    expect((await client.notification(current.raw, current.headers)).resource.out_trade_no).toBe('ARL_current');
+    await expect(client.notification(old.raw + ' ', old.headers)).rejects.toMatchObject({ status: 403 });
+    const otherMerchant = notification({ mchid: 'other-merchant', appid: appId });
+    await expect(client.notification(otherMerchant.raw, otherMerchant.headers)).rejects.toMatchObject({ status: 403 });
+    const unknownKey = notification({ mchid: mchId, appid: appId }, '11111111111111111111111111111111');
+    await expect(client.notification(unknownKey.raw, unknownKey.headers)).rejects.toMatchObject({ status: 400 });
+  });
+  it('rejects malformed or oversized historical key rings without exposing key material', async () => {
+    for (const apiV3Keys of [['invalid-historical-key'], Array.from({ length: 8 }, (_, index) => String(index).padStart(32, '0'))]) {
+      const client = new WeChatClient({ ...options, apiV3Keys });
+      expect(client.isPaymentReady()).toBe(false);
+      const notice = notification({ mchid: mchId, appid: appId });
+      await expect(client.notification(notice.raw, notice.headers)).rejects.toMatchObject({ status: 503, message: '微信支付验证或商户配置不完整' });
+    }
   });
   it('keeps malformed payment configuration isolated from normal login', async () => {
     const client = new WeChatClient({ ...options, privateKey: 'broken-key-must-not-leak', fetch: async () => new Response(JSON.stringify({ openid: 'user-1' })) });
