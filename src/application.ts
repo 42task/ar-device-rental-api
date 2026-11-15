@@ -13,6 +13,8 @@ import { PhoneBinding } from './auth/phone';
 import { MerchantRegistry, merchantId } from './merchants/registry';
 import { publicMerchant, withMerchant } from './merchants/context';
 import { registerMerchants } from './merchants/management';
+import { registerBranding } from './merchants/branding';
+import { registerVenueAppearance } from './venues/appearance';
 import { requireManager } from './core/roles';
 import { registerVenues } from './venues';
 import { clientCapabilities, requireClientProtocol } from './core/client-protocol';
@@ -35,7 +37,15 @@ export function createApplication(options: ApplicationOptions = {}) {
     res.setHeader('Cache-Control', 'no-store');
     next();
   });
-  app.use(express.json({ limit: '64kb', verify(req, _res, raw) { (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(raw); } }));
+  const verifyBody = (req: express.Request, _res: express.Response, raw: Buffer) => { (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(raw); };
+  const standardJson = express.json({ limit: '64kb', verify: verifyBody });
+  const brandingJson = express.json({ limit: '384kb', verify: verifyBody });
+  const appearanceJson = express.json({ limit: '768kb', verify: verifyBody });
+  app.use((req, res, next) => {
+    const parser = req.method === 'PATCH' && /^\/api\/v2\/rental\/admin\/branding\/?$/.test(req.path) ? brandingJson
+      : req.method === 'PATCH' && /^\/api\/v2\/rental\/admin\/venues\/[1-9][0-9]*\/appearance\/?$/.test(req.path) ? appearanceJson : standardJson;
+    parser(req, res, next);
+  });
   app.use((req, _res, next) => {
     if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
       if (!req.is('application/json')) return next(new ApiError(415, '请使用 application/json 请求格式'));
@@ -92,6 +102,8 @@ export function createApplication(options: ApplicationOptions = {}) {
       return { merchant: publicMerchant(currentMerchant()!) };
     });
     registerMerchants(router, merchants, auth);
+    registerBranding(router, db, auth);
+    registerVenueAppearance(router, db, auth);
   }
   auth.registerAuth(router);
   phone.register(router);
@@ -103,7 +115,7 @@ export function createApplication(options: ApplicationOptions = {}) {
   router.mount(app);
   app.get(/^\/admin$/, (_req, res) => res.redirect(302, '/admin/'));
   app.use('/admin/', (_req, res, next) => {
-    res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'");
+    res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https: data: blob:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'");
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     next();

@@ -6,11 +6,11 @@ import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
 import { archiveDevicePricing } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 15;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
-const TABLES = new Set(['ar_schema_meta', 'ar_schema_migration', 'ar_device', 'ar_user', 'ar_role_audit', 'ar_admin_guard', 'ar_rental_config', 'ar_rental_order', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job', 'ar_user_phone', 'ar_admin_login_challenge', 'ar_admin_session', 'ar_merchant', 'ar_merchant_wechat_config', 'ar_user_wechat_identity', 'ar_user_merchant_binding', 'ar_user_phone_history', 'ar_merchant_audit', 'ar_venue', 'ar_merchant_membership', 'ar_application', 'ar_application_merchant', 'ar_legacy_device_pricing_archive']);
+const TABLES = new Set(['ar_schema_meta', 'ar_schema_migration', 'ar_device', 'ar_user', 'ar_role_audit', 'ar_admin_guard', 'ar_rental_config', 'ar_rental_order', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job', 'ar_user_phone', 'ar_admin_login_challenge', 'ar_admin_session', 'ar_merchant', 'ar_merchant_wechat_config', 'ar_user_wechat_identity', 'ar_user_merchant_binding', 'ar_user_phone_history', 'ar_merchant_audit', 'ar_venue', 'ar_merchant_membership', 'ar_application', 'ar_application_merchant', 'ar_legacy_device_pricing_archive', 'ar_merchant_branding', 'ar_venue_appearance']);
 
 /** Each DDL step can resume after interruption; MySQL DDL is not transactional. */
 async function migrateMerchantColumns(db: Database): Promise<void> {
@@ -177,6 +177,8 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
         { version: 11, filename: '011-memberships.sql', run: migrateMemberships },
         { version: 12, filename: '012-applications.sql', run: migrateApplications },
         { version: 13, filename: '013-device-pricing-archive.sql', run: archiveDevicePricing },
+        { version: 14, filename: '014-merchant-branding.sql', run: async (_db: Database) => {} },
+        { version: 15, filename: '015-venue-appearance.sql', run: async (_db: Database) => {} },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');

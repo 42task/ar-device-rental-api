@@ -21,7 +21,7 @@ const orderLabels = { PENDING_PAYMENT: ['待支付', 'amber'], ACTIVE: ['租赁�
 const refundLabels = { PENDING: '待退款', PROCESSING: '退款处理中', SUCCESS: '退款成功', ABNORMAL: '退款异常', CLOSED: '退款关闭' };
 const paymentLabels = { NOTPAY: '未支付', USERPAYING: '支付中', SUCCESS: '已支付', CLOSED: '已关闭', REVOKED: '已撤销', PAYERROR: '支付失败', REFUND: '转入退款' };
 let dialogSequence = 0;
-const pages = { overview: ['运营总览', 'OVERVIEW', '设备与租赁状态，一目了然。'], venues: ['场地', 'VENUES', '场地隶属当前商户，设备按所属场地的租金与押金收费。'], devices: ['设备管理', 'DEVICES', '设备绑定本商户场地，商户归属由场地继承；管理设备租赁开关。'], orders: ['租赁订单', 'RENTALS', '查看当前商户租赁记录及服务端确认的支付、退款状态。'], users: ['权限管理', 'ACCESS', '按当前商户及权限管理用户身份。'], merchants: ['商户管理', 'MERCHANTS', '管理商户资料及收款配置，统一使用平台小程序入口。'] };
+const pages = { overview: ['运营总览', 'OVERVIEW', '设备与租赁状态，一目了然。'], venues: ['场地', 'VENUES', '场地隶属当前商户，设备按所属场地的租金与押金收费。'], devices: ['设备管理', 'DEVICES', '设备绑定本商户场地，商户归属由场地继承；管理设备租赁开关。'], orders: ['租赁订单', 'RENTALS', '查看当前商户租赁记录及服务端确认的支付、退款状态。'], users: ['权限管理', 'ACCESS', '按当前商户及权限管理用户身份。'], merchants: ['商户管理', 'MERCHANTS', '管理商户资料及收款配置，统一使用平台小程序入口。'], branding: ['品牌设置', 'BRANDING', '设置本商户通用的小程序显示名称与 Logo。'] };
 const roles = {
   user: { label: '普通用户', rank: 0, description: '可以租赁设备、查询自己的订单与退款进度，不能管理设备或办理退款。' },
   manager: { label: '设备管理员', rank: 1, description: '可在所属商户选择景点并查看该景点设备；在小程序管理设备、确认归还及退款。' },
@@ -32,6 +32,9 @@ const roleLabel = role => (Object.hasOwn(roles, role) ? roles[role] : roles.user
 const canUseAdmin = role => ['manager', 'adminer', 'root'].includes(role);
 const canManageUsers = role => ['adminer', 'root'].includes(role);
 const canManageVenues = role => ['adminer', 'root'].includes(role);
+const canManageBranding = role => ['adminer', 'root'].includes(role);
+const brandingThemes = { aero: ['晴空蓝', '清爽明亮，轻盈科技感'], forest: ['森林绿', '自然安静，适合户外场景'], sunset: ['落日橙', '温暖活力，适合文旅体验'], ink: ['曜石黑', '深色界面，简洁沉稳'] };
+function canOpenPage(page) { return Boolean(pages[page]) && (page !== 'users' || canManageUsers(state.user?.role)) && (page !== 'branding' || canManageBranding(state.user?.role)); }
 function managementMerchantId() {
   const value = state.user?.role === 'root' ? state.merchantId : ['manager', 'adminer'].includes(state.user?.role) ? state.managementMerchant?.id ?? state.user.merchantId : null;
   return Number.isSafeInteger(value) && value > 0 ? value : null;
@@ -271,7 +274,9 @@ function shell() {
   const merchantLink = navLink('merchants', 'settings', merchantParentTitle()); merchantLink.classList.add('nav-parent');
   const subnav = el('div', 'subnav'); subnav.setAttribute('aria-label', merchantParentTitle() + '子导航');
   const venuesLink = navLink('venues', 'chevron-right', '场地'); venuesLink.classList.add('venue-nav'); venuesLink.dataset.parent = 'merchants';
-  append(subnav, el('span', 'nav-merchant-scope'), venuesLink); append(merchantGroup, merchantLink, subnav); nav.append(merchantGroup);
+  append(subnav, el('span', 'nav-merchant-scope'), venuesLink);
+  if (canManageBranding(state.user.role)) { const link = navLink('branding', 'settings', '品牌设置'); link.classList.add('venue-nav'); subnav.append(link); }
+  append(merchantGroup, merchantLink, subnav); nav.append(merchantGroup);
   const sidebarFoot = el('div', 'sidebar-foot'); append(sidebarFoot, icon('shield', 'white'), el('span', '', roleLabel(state.user.role)));
   append(sidebar, brand(), el('div', 'nav-label', '管理工作台'), nav, sidebarFoot);
   const work = el('div', 'workspace');
@@ -286,7 +291,7 @@ function shell() {
   const main = el('main', 'content'); main.id = 'main-content';
   append(top, crumb, account); append(work, top, main); append(shellNode, sidebar, work); app.replaceChildren(shellNode);
   const requested = location.hash.slice(1);
-  state.page = pages[requested] && (requested !== 'users' || canManageUsers(state.user.role)) ? requested : 'overview';
+  state.page = canOpenPage(requested) ? requested : 'overview';
   renderMerchantContext();
   if (state.user.role === 'root') refreshMerchants().catch(() => { if (state.user) toast('商户列表暂时无法加载，请在商户管理中重试'); });
   loadPage();
@@ -300,9 +305,9 @@ async function logout(event) {
 window.addEventListener('hashchange', () => {
   if (!state.user) return;
   const page = location.hash.slice(1);
-  if (pages[page] && (page !== 'users' || canManageUsers(state.user.role))) { state.page = page; return loadPage(); }
+  if (canOpenPage(page)) { state.page = page; return loadPage(); }
 });
-function navigate(page) { if (location.hash === '#' + page) { state.page = page; loadPage(); } else location.hash = page; }
+function navigate(page) { if (!canOpenPage(page)) return; if (location.hash === '#' + page) { state.page = page; loadPage(); } else location.hash = page; }
 function heading(page) {
   const node = el('div', 'page-heading' + (page === 'devices' ? ' device-hero' : ''));
   const scope = managementMerchant();
@@ -311,24 +316,26 @@ function heading(page) {
   if (page === 'devices') {
     const product = el('img', 'device-hero-image'); product.src = '/admin/assets/aero-glasses.png'; product.alt = 'AR 智能眼镜'; product.width = 1881; product.height = 836; node.append(product);
   } else if (page === 'merchants' && state.user.role === 'root') node.append(button('新建商户', () => merchantDialog(), '', 'plus'));
-  else if (page === 'venues') {
+  else if (page === 'venues' || page === 'branding') {
     const actions = el('div', 'page-heading-actions');
     actions.append(button(state.user.role === 'root' ? '返回商户列表' : '返回我的商户', () => navigate('merchants'), 'secondary', 'arrow-left'));
-    if (scope && canManageVenues(state.user.role)) actions.append(button('新建场地', () => venueDialog(), '', 'plus'));
+    if (page === 'venues' && scope && canManageVenues(state.user.role)) actions.append(button('新建场地', () => venueDialog(), '', 'plus'));
+    if (page === 'branding' && scope) actions.append(button('重新加载', () => loadPage(), 'secondary', 'refresh'));
     node.append(actions);
   } else node.append(button('刷新数据', () => loadPage(), 'secondary', 'refresh'));
   return node;
 }
 function renderPageBreadcrumb(page) {
   const breadcrumb = document.querySelector('.breadcrumb'); if (!breadcrumb) return;
-  if (page !== 'venues') { breadcrumb.textContent = page === 'merchants' ? merchantParentTitle() : pages[page][0]; return; }
+  if (!['venues', 'branding'].includes(page)) { breadcrumb.textContent = page === 'merchants' ? merchantParentTitle() : pages[page][0]; return; }
   const parent = el('a', '', merchantParentTitle()); parent.href = '#merchants';
   parent.addEventListener('click', event => { event.preventDefault(); navigate('merchants'); });
-  breadcrumb.replaceChildren(parent, document.createTextNode(' / ' + (managementMerchant()?.name || '请选择商户') + ' / 场地'));
+  breadcrumb.replaceChildren(parent, document.createTextNode(' / ' + (managementMerchant()?.name || '请选择商户') + ' / ' + pages[page][0]));
 }
 
 async function loadPage() {
   if (!state.user) return;
+  if (!canOpenPage(state.page)) state.page = 'overview';
   const page = state.page;
   const sequence = ++state.sequence;
   const selectedMerchantId = managementMerchantId();
@@ -338,7 +345,7 @@ async function loadPage() {
   const currentManagerDevices = () => currentDevices() && managerScope && managerScope === managerDeviceScope();
   const main = document.querySelector('#main-content'); if (!main) return;
   for (const link of document.querySelectorAll('.nav a')) {
-    link.classList.toggle('active', link.dataset.page === page || link.classList.contains('nav-parent') && page === 'venues');
+    link.classList.toggle('active', link.dataset.page === page || link.classList.contains('nav-parent') && ['venues', 'branding'].includes(page));
     if (link.dataset.page === page) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
     const image = link.querySelector('.nav-icon'); if (image) image.src = '/admin/assets/icons/' + image.dataset.icon + '-white.svg';
   }
@@ -354,6 +361,10 @@ async function loadPage() {
     } else if (page === 'venues') {
       const result = await api('/rental/admin/venues', { headers: { 'X-Merchant-Id': String(selectedMerchantId) } });
       if (sequence === state.sequence && state.user && selectedMerchantId === managementMerchantId()) renderVenues(content, result);
+    } else if (page === 'branding') {
+      const scope = deviceContextScope();
+      const result = await api('/rental/admin/branding', { headers: { 'X-Merchant-Id': String(selectedMerchantId) } });
+      if (sequence === state.sequence && state.user && scope === deviceContextScope() && canManageBranding(state.user.role)) renderBranding(content, result);
     } else if (page === 'overview') {
       const result = await api('/rental/admin/overview');
       if (sequence === state.sequence && result.merchant && result.merchant.id !== selectedMerchantId) throw new Error('商户范围已变化，请重新选择后加载');
@@ -648,7 +659,7 @@ function renderVenues(content, result) {
     const details = el('dl', 'details');
     for (const [label, value] of [['地址', venue.address || '未填写'], ['联系人', venue.contactName || '未填写'], ['联系电话', venue.contactPhone || '未填写'], ['场地说明', venue.description || '未填写'], ['每次租金', '¥' + money(venue.useFeeCents)], ['押金', '¥' + money(venue.depositCents)]]) append(details, el('dt', '', label), el('dd', '', value));
     card.append(details);
-    if (canManageVenues(state.user.role)) card.append(append(el('div', 'merchant-actions'), button('编辑场地与收费', () => venueDialog(venue), 'secondary', 'settings')));
+    if (canManageVenues(state.user.role)) card.append(append(el('div', 'merchant-actions'), button('编辑场地与收费', () => venueDialog(venue), 'secondary', 'settings'), button('样式设置', () => venueAppearanceDialog(venue), 'secondary', 'settings')));
     list.append(card);
   }
   content.replaceChildren(el('p', 'venue-owner', '所属商户：' + merchantLabel(scope)), el('p', 'notice', canManageVenues(state.user.role) ? '场地归属当前商户。设备绑定场地后使用该场地的租金与押金；调整收费仅影响新订单。' : '你可以查看本商户场地及收费。创建或编辑场地请联系商户管理员。'), list);
@@ -781,6 +792,133 @@ async function orderDialog(id) {
   } catch (error) { if (ui.node.open) ui.body.replaceChildren(message(error.message)); }
 }
 function merchantName() { return managementMerchant()?.name || '请先选择商户'; }
+function brandingLogoUrl(value, uploaded = false, label = 'Logo') {
+  if (!value) return '';
+  if (uploaded && /^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/]+={0,2}$/i.test(value)) return value;
+  try {
+    const url = new URL(value);
+    if (value.length > 2048 || /[\x00-\x20\x7f]/.test(value) || url.protocol !== 'https:' || url.username || url.password || url.hash) throw Error();
+    return url.href;
+  } catch { throw new Error(label + '地址须为完整 HTTPS 图片地址'); }
+}
+function checkedBranding(result, merchantId) {
+  const value = result?.branding;
+  if (result?.merchant?.id !== merchantId || !value || typeof value.displayName !== 'string' || !value.displayName.trim() || typeof value.logoUrl !== 'string' || !Number.isSafeInteger(value.version) || value.version < 0) throw new Error('品牌配置响应无效，请重新加载');
+  brandingLogoUrl(value.logoUrl); return { ...value };
+}
+function checkedVenueAppearance(result, merchantId, venueId) {
+  const value = result?.appearance;
+  if (result?.venue?.id !== venueId || result.venue.merchantId !== merchantId || !value || typeof value.heroImageUrl !== 'string' || !Object.hasOwn(brandingThemes, value.theme) || !Number.isSafeInteger(value.version) || value.version < 0) throw new Error('景点样式响应无效，请重新加载');
+  brandingLogoUrl(value.heroImageUrl, false, 'AR 眼镜主图'); return { ...value };
+}
+function brandingPreview() {
+  const node = el('aside', 'branding-preview'); node.setAttribute('aria-label', '小程序效果预览');
+  append(node, el('p', 'eyebrow', 'LIVE PREVIEW'), el('h2', '', '小程序效果预览'));
+  const phone = el('div', 'branding-phone'), nav = el('div', 'branding-phone-nav'), title = el('strong'); append(nav, title, el('span', 'branding-capsule', '•••  ◉'));
+  const body = el('div', 'branding-phone-body'), identity = el('div', 'branding-preview-identity'), mark = el('div', 'branding-preview-logo'), image = el('img'), initials = el('span'); image.alt = '商户 Logo 预览'; image.referrerPolicy = 'no-referrer'; append(mark, image, initials);
+  const name = el('h3'), subtitle = el('p'); append(identity, mark, name, subtitle);
+  const hero = el('img', 'branding-preview-product'); hero.alt = 'AR 眼镜主图预览'; hero.referrerPolicy = 'no-referrer';
+  append(body, identity, hero, el('div', 'branding-preview-scan', '扫一扫 · 开始体验'), el('div', 'branding-preview-tip', '扫描设备二维码，查看场地与租赁信息'), append(el('div', 'branding-preview-order'), el('span', '', '我的租赁'), el('span', '', '查看订单 ›')));
+  append(phone, nav, body); const status = el('p', 'branding-preview-state'); status.setAttribute('role', 'status'); append(node, phone, status);
+  let failedLogo = '', failedHero = ''; const defaultHero = '/admin/assets/aero-glasses.png';
+  image.addEventListener('error', () => { failedLogo = image.getAttribute('src'); image.hidden = true; initials.hidden = false; });
+  hero.addEventListener('error', () => { const source = hero.getAttribute('src'); if (source === defaultHero) { hero.hidden = true; return; } failedHero = source; hero.setAttribute('src', defaultHero); });
+  return { node, update(brand, appearance = {}, changed = false, venueName = '') {
+    const label = brand.displayName?.trim() || '你的品牌名称'; title.textContent = name.textContent = label; initials.textContent = [...label].slice(0, 2).join(''); subtitle.textContent = venueName || '欢迎体验 AR 设备租赁';
+    phone.className = 'branding-phone branding-preview-theme-' + (Object.hasOwn(brandingThemes, appearance.theme) ? appearance.theme : 'aero');
+    const logo = brand.logoUrl || ''; if (logo && logo !== failedLogo) { image.hidden = false; initials.hidden = true; if (image.getAttribute('src') !== logo) image.setAttribute('src', logo); } else { image.hidden = true; image.removeAttribute('src'); initials.hidden = false; }
+    const source = appearance.heroImageUrl && appearance.heroImageUrl !== failedHero ? appearance.heroImageUrl : defaultHero; if (hero.getAttribute('src') !== source) { hero.hidden = false; hero.setAttribute('src', source); }
+    status.textContent = changed ? '预览中 · 有未保存的修改' : '当前已保存的配置';
+  } };
+}
+/** Image drafts have independent read generations and never replace an uploaded URL with itself. */
+function brandingImageEditor(form, options) {
+  let dataUrl = null, revision = 0, reading = false;
+  const upload = field(form, options.uploadLabel, { type: 'file', accept: 'image/png,image/jpeg,image/webp', help: '支持 PNG、JPG、WebP，最大 ' + options.maxKB + ' KB。' });
+  const url = field(form, options.urlLabel, { type: 'url', maxLength: 2048, value: options.value, placeholder: 'https://…', help: options.help });
+  const actions = el('div', 'branding-logo-actions'), status = el('span', 'muted'); status.setAttribute('role', 'status');
+  const clear = button(options.clearLabel, () => { if (!options.current() || options.locked()) return; control.reset(''); options.report(''); options.changed(); }, 'text-button'); append(actions, clear, status); form.append(actions);
+  const control = { upload, url, get reading() { return reading; }, source() { try { return brandingLogoUrl(dataUrl || url.value.trim(), Boolean(dataUrl), options.label); } catch { return ''; } }, dirty(saved) { return dataUrl !== null || url.value.trim() !== saved; }, reset(value) { revision++; reading = false; dataUrl = null; url.value = value; upload.value = ''; status.textContent = ''; }, payload(saved, urlKey, dataKey) { if (dataUrl !== null) return { [dataKey]: dataUrl }; return url.value.trim() !== saved ? { [urlKey]: brandingLogoUrl(url.value.trim(), false, options.label) } : {}; } };
+  url.addEventListener('input', () => { if (!options.current() || options.locked()) return; revision++; reading = false; dataUrl = null; upload.value = ''; status.textContent = ''; options.changed(); });
+  upload.addEventListener('change', async () => {
+    if (!options.current() || options.locked()) return; const file = upload.files?.[0]; if (!file) return;
+    const generation = ++revision; options.report('');
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || !file.size || file.size > options.maxKB * 1024) { options.report('请选择不超过 ' + options.maxKB + ' KB 的 PNG、JPG 或 WebP 图片'); upload.value = ''; reading = false; status.textContent = ''; options.changed(); return; }
+    reading = true; status.textContent = '正在读取图片…'; options.changed();
+    try {
+      const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error('图片读取失败，请重新选择')); reader.onabort = () => reject(new Error('图片读取已取消')); reader.readAsDataURL(file); });
+      if (!options.current() || generation !== revision) return;
+      if (typeof data !== 'string' || !data.startsWith('data:' + file.type + ';base64,')) throw new Error('图片格式无效，请重新选择');
+      brandingLogoUrl(data, true, options.label); dataUrl = data; url.value = ''; status.textContent = '图片已就绪，保存后生效';
+    } catch (failure) { if (options.current() && generation === revision) { options.report(failure.message || '图片读取失败，请重试'); upload.value = ''; status.textContent = ''; } }
+    finally { if (options.current() && generation === revision) { reading = false; options.changed(); } }
+  }); return control;
+}
+function renderBranding(content, result) {
+  const merchantId = managementMerchantId(); if (!merchantId || !canManageBranding(state.user?.role)) return;
+  let saved = checkedBranding(result, merchantId), saving = false, forbidden = false;
+  const scope = deviceContextScope(), sequence = state.sequence, current = () => state.page === 'branding' && sequence === state.sequence && scope === deviceContextScope() && canManageBranding(state.user?.role);
+  const layout = el('div', 'branding-layout'), card = el('section', 'card branding-editor'), form = el('form', 'branding-form'), error = message(''), success = el('p', 'branding-status'); success.setAttribute('role', 'status');
+  const name = field(form, '小程序显示名称', { required: true, maxLength: 32, value: saved.displayName, placeholder: '输入面向用户的品牌名称', help: '最多 32 个字符，本商户下的景点共用此名称与 Logo。' });
+  const logo = brandingImageEditor(form, { value: saved.logoUrl, uploadLabel: '上传 Logo', urlLabel: 'Logo 图片地址', label: 'Logo', maxKB: 256, clearLabel: '移除 Logo', help: '也可填写 HTTPS 图片地址。建议使用方形图片。', current, locked: () => saving || forbidden, report: text => { error.textContent = text; }, changed: () => refresh() });
+  form.append(el('p', 'notice', '各景点的小程序风格与 AR 眼镜主图可在「场地」中分别设置。'));
+  const preview = brandingPreview(); preview.node.append(el('p', 'muted', '此处预览商户通用名称与 Logo，景点样式由各景点自行设置。'));
+  const submit = button('保存品牌设置', null, '', 'check'); submit.type = 'submit';
+  const reset = button('撤销未保存修改', () => { if (!current() || saving || forbidden) return; name.value = saved.displayName; logo.reset(saved.logoUrl); error.textContent = success.textContent = ''; refresh(); }, 'secondary');
+  const reload = button('重新加载最新配置', () => { if (current() && !saving) loadPage(); }, 'secondary'); reload.hidden = true;
+  append(form, error, reload, append(el('div', 'branding-actions'), reset, submit), success);
+  field(form, '商户首页路径', { readOnly: true, value: 'pages/index/index?merchantId=' + merchantId, help: '制作本商户的小程序码时可使用此页面路径。' });
+  form.append(el('p', 'footer-note', '微信客户端显示的小程序注册名称和图标需在微信公众平台维护。'));
+  append(card, append(el('div', 'card-heading'), el('h2', '', '商户通用品牌')), el('p', 'venue-owner', '所属商户：' + merchantLabel(result.merchant)), form); append(layout, card, preview.node); content.replaceChildren(layout);
+  function refresh() { preview.update({ displayName: name.value, logoUrl: logo.source() }, {}, name.value.trim() !== saved.displayName || logo.dirty(saved.logoUrl)); for (const input of form.querySelectorAll('input,button')) input.disabled = saving || forbidden; submit.disabled = saving || forbidden || logo.reading; }
+  name.addEventListener('input', () => { if (current() && !saving && !forbidden) refresh(); });
+  form.addEventListener('submit', async event => {
+    event.preventDefault(); if (saving || forbidden || !current()) return; error.textContent = success.textContent = '';
+    if (logo.reading) { error.textContent = '图片正在读取，请稍后保存'; return; }
+    const displayName = name.value.trim(); if (!displayName || [...displayName].length > 32 || /[\x00-\x1f\x7f]/.test(displayName)) { error.textContent = '请填写 1 至 32 个字符的显示名称'; return; }
+    let payload; try { payload = { displayName, version: saved.version, ...logo.payload(saved.logoUrl, 'logoUrl', 'logoDataUrl') }; } catch (failure) { error.textContent = failure.message; return; }
+    saving = true; refresh();
+    try {
+      const response = await api('/rental/admin/branding', { method: 'PATCH', headers: { 'X-Merchant-Id': String(merchantId) }, body: JSON.stringify(payload), beforeDispatch: () => { if (!current()) throw new Error('登录或商户范围已变化，请重新打开品牌设置'); } });
+      if (!current()) return; saved = checkedBranding(response, merchantId); name.value = saved.displayName; logo.reset(saved.logoUrl); success.textContent = '品牌设置已保存' + (saved.updatedAt ? ' · ' + time(saved.updatedAt) : ''); reload.hidden = true;
+    } catch (failure) { if (!current()) return; error.textContent = failure.status === 409 ? '品牌设置已被其他管理员修改。请重新加载最新配置后再编辑。' : failure.message; if (failure.status === 409) reload.hidden = false; if (failure.status === 403) forbidden = true; }
+    finally { if (current()) { saving = false; refresh(); } }
+  }); refresh();
+}
+async function venueAppearanceDialog(venue) {
+  if (!canManageVenues(state.user?.role)) return;
+  const merchant = managementMerchant(); if (!merchant || !Number.isSafeInteger(venue?.id) || venue.id < 1 || venue.merchantId !== merchant.id) { toast('请选择当前商户的景点'); return; }
+  const merchantId = merchant.id, venueId = venue.id, scope = deviceContextScope(), sequence = state.sequence;
+  const ui = formDialog('景点样式设置 · ' + venue.name, '保存景点样式'); ui.node.classList.add('venue-appearance-dialog');
+  const current = () => ui.node.open && scope === deviceContextScope() && sequence === state.sequence && canManageVenues(state.user?.role);
+  const path = '/rental/admin/venues/' + encodeURIComponent(venueId) + '/appearance', headers = { 'X-Merchant-Id': String(merchantId) };
+  ui.submit.disabled = true; ui.form.append(el('p', 'loading', '正在读取景点样式…'));
+  let saved, brand;
+  try { const [appearance, branding] = await Promise.all([api(path, { headers }), api('/rental/admin/branding', { headers })]); if (!current()) return; saved = checkedVenueAppearance(appearance, merchantId, venueId); brand = checkedBranding(branding, merchantId); }
+  catch (failure) { if (!current()) return; ui.form.replaceChildren(message(failure.message), button('重新加载', () => { if (current()) { ui.node.close(); venueAppearanceDialog(venue); } }, 'secondary')); return; }
+  if (!current()) return; ui.form.replaceChildren(); let saving = false, forbidden = false;
+  const layout = el('div', 'branding-layout'), preview = brandingPreview(); ui.body.replaceChildren(layout); append(layout, ui.form, preview.node); ui.form.classList.add('branding-form');
+  ui.form.append(el('p', 'venue-owner', '所属商户：' + merchantLabel(merchant) + ' / 景点：' + venue.name), el('p', 'notice', '此配置仅用于当前景点。显示名称与 Logo 使用所属商户的通用品牌。'));
+  const themes = el('fieldset', 'branding-themes'); themes.append(el('legend', '', '景点小程序风格')); const choices = [];
+  for (const [key, [label, description]] of Object.entries(brandingThemes)) { const wrapper = el('label', 'branding-theme-option branding-theme-' + key), radio = el('input'); radio.type = 'radio'; radio.name = 'venue-theme'; radio.value = key; radio.checked = key === saved.theme; choices.push(radio); append(wrapper, radio, el('span', 'branding-swatch'), append(el('span'), el('strong', '', label), el('small', '', description))); themes.append(wrapper); radio.addEventListener('change', () => { if (!current() || saving || forbidden) return; if (radio.checked) for (const other of choices) if (other !== radio) other.checked = false; refresh(); }); } ui.form.append(themes);
+  const hero = brandingImageEditor(ui.form, { value: saved.heroImageUrl, uploadLabel: 'AR 眼镜主图', urlLabel: '主图图片地址', label: 'AR 眼镜主图', maxKB: 512, clearLabel: '恢复默认主图', help: '填写 HTTPS 图片地址，或上传景点主图。留空使用默认 AR 眼镜图片。', current, locked: () => saving || forbidden, report: text => { ui.error.textContent = text; }, changed: () => refresh() });
+  field(ui.form, '景点首页路径', { readOnly: true, value: 'pages/index/index?merchantId=' + merchantId + '&venueId=' + venueId, help: '制作该景点的小程序码时使用此路径。' });
+  const success = el('p', 'branding-status'); success.setAttribute('role', 'status');
+  const reset = button('撤销未保存修改', () => { if (!current() || saving || forbidden) return; hero.reset(saved.heroImageUrl); for (const radio of choices) radio.checked = radio.value === saved.theme; ui.error.textContent = success.textContent = ''; refresh(); }, 'secondary');
+  const reload = button('重新加载最新配置', () => { if (current() && !saving) { ui.node.close(); venueAppearanceDialog(venue); } }, 'secondary'); reload.hidden = true; append(ui.form, reset, reload, success); ui.ready();
+  const selectedTheme = () => choices.find(radio => radio.checked)?.value || '';
+  function refresh() { preview.update(brand, { theme: selectedTheme(), heroImageUrl: hero.source() }, selectedTheme() !== saved.theme || hero.dirty(saved.heroImageUrl), venue.name); ui.busy(saving); for (const input of ui.form.querySelectorAll('input,button')) input.disabled = saving || forbidden; ui.submit.disabled = saving || forbidden || hero.reading; }
+  ui.form.addEventListener('submit', async event => {
+    event.preventDefault(); if (!current() || saving || forbidden) return; ui.error.textContent = success.textContent = '';
+    if (hero.reading) { ui.error.textContent = '图片正在读取，请稍后保存'; return; }
+    const theme = selectedTheme(); if (!Object.hasOwn(brandingThemes, theme)) { ui.error.textContent = '请选择有效景点风格'; return; }
+    let payload; try { payload = { theme, version: saved.version, ...hero.payload(saved.heroImageUrl, 'heroImageUrl', 'heroDataUrl') }; } catch (failure) { ui.error.textContent = failure.message; return; }
+    saving = true; refresh();
+    try { const response = await api(path, { method: 'PATCH', headers, body: JSON.stringify(payload), beforeDispatch: () => { if (!current()) throw new Error('登录或景点所属商户已变化，请重新打开景点样式'); } }); if (!current()) return; saved = checkedVenueAppearance(response, merchantId, venueId); hero.reset(saved.heroImageUrl); for (const radio of choices) radio.checked = radio.value === saved.theme; success.textContent = '景点样式已保存' + (saved.updatedAt ? ' · ' + time(saved.updatedAt) : ''); reload.hidden = true; }
+    catch (failure) { if (!current()) return; ui.error.textContent = failure.status === 409 ? '景点样式已被其他管理员修改。请重新加载最新配置后再编辑。' : failure.message; if (failure.status === 409) reload.hidden = false; if (failure.status === 403) forbidden = true; }
+    finally { if (current()) { saving = false; refresh(); } }
+  }); refresh();
+}
 function renderMerchantContext() {
   const container = document.querySelector('#merchant-context'); if (!container || !state.user) return;
   const scope = managementMerchant();
@@ -824,6 +962,7 @@ function renderMerchants(content) {
     for (const [label, value] of [['商户编号', merchant.code], ['收款商户号', merchant.mchId || '待配置'], ['支付功能', merchant.paymentReady ? '已就绪' : '未就绪']]) append(details, el('dt', '', label), el('dd', '', value));
     const actions = el('div', 'merchant-actions');
     if (state.user.role === 'root') actions.append(button('编辑配置', () => merchantDialog(merchant.id), 'secondary', 'settings'));
+    if (canManageBranding(state.user.role)) actions.append(button('品牌设置', () => { if (state.user.role === 'root' && !selectManagementMerchant(merchant)) return; navigate('branding'); }, 'secondary', 'settings'));
     actions.append(button(canManageVenues(state.user.role) ? '管理场地' : '查看场地', () => openMerchantVenues(merchant), 'secondary', 'home'));
     actions.append(button('进入商户', () => {
       if (state.user.role === 'root' && !selectManagementMerchant(merchant)) return;
