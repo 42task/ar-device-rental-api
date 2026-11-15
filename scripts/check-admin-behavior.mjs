@@ -53,7 +53,7 @@ function fixture(role = 'root') {
   Object.defineProperty(location, 'hash', { get: () => hash, set: value => { hash = '#' + String(value).replace(/^#/, ''); } });
   const window = { addEventListener: (type, handler) => windowEvents.set(type, handler), printCalls: 0, print() { this.printCalls++; } };
   const context = vm.createContext({ document, window, location, URL, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, fetch: async (path, options = {}) => { fetches.push({ path, ...options }); if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; calls.push({ path, ...options }); return { ok: true, json: async () => replies.length ? replies.shift() : path.startsWith('/api/v2/rental/admin/venues') ? { items: [{ id: 11, name: 'Synthetic venue', status: 'active', useFeeCents: 2000, depositCents: 10000, version: 3 }] } : ({ id: 11, role: JSON.parse(options.body || '{}').role }) }; }, pageLoads: 0 });
-  vm.runInContext(source.replace(/\nboot\(\);\s*$/, '') + '\nconst originalLoadPage = loadPage; loadPage = () => { pageLoads++; }; globalThis.spec = { loadPage: originalLoadPage, useRealPages: () => { loadPage = originalLoadPage; }, heading, renderMerchants, renderMerchantContext, selectManagementMerchant, openMerchantVenues, refreshMerchants, managementMerchantId, managementMerchant, setPage: page => { state.page = page; }, api, merchantDialog, transferDialog, createDeviceDialog, configureDialog, venueDialog, renderVenues, renderToolbar, canManageVenues, canUseAdmin, canManageUsers, assignableRoles, roleLabel, completeLogin, boot, shell, deviceRow, deviceQrDialog, userRow, roleDialog, setContext: (merchant, merchants = []) => { state.merchantGeneration++; state.merchant = merchant; state.merchantId = merchant?.id || null; state.merchants = merchants; }, setUser: value => { state.user = value; }, advanceLogin: () => { state.loginGeneration++; }, getUser: () => state.user, getPage: () => state.page, getUserScope: () => state.filters.users.scope };', context);
+  vm.runInContext(source.replace(/\nboot\(\);\s*$/, '') + '\nconst originalLoadPage = loadPage; loadPage = () => { pageLoads++; }; globalThis.spec = { loadPage: originalLoadPage, useRealPages: () => { loadPage = originalLoadPage; }, heading, renderMerchants, renderMerchantContext, selectManagementMerchant, openMerchantVenues, refreshMerchants, managementMerchantId, managementMerchant, renderBranding, checkedBranding, venueAppearanceDialog, canManageBranding, canOpenPage, setPage: page => { state.page = page; }, api, merchantDialog, transferDialog, createDeviceDialog, configureDialog, venueDialog, renderVenues, renderToolbar, canManageVenues, canUseAdmin, canManageUsers, assignableRoles, roleLabel, completeLogin, boot, shell, deviceRow, deviceQrDialog, userRow, roleDialog, setContext: (merchant, merchants = []) => { state.merchantGeneration++; state.merchant = merchant; state.merchantId = merchant?.id || null; state.merchants = merchants; }, setUser: value => { state.user = value; }, advanceLogin: () => { state.loginGeneration++; }, getUser: () => state.user, getPage: () => state.page, getUserScope: () => state.filters.users.scope };', context);
   context.spec.setUser({ id: 10, role });
   return { context, spec: context.spec, document, app, calls, fetches, replies, windowEvents };
 }
@@ -1011,3 +1011,98 @@ for (const corrupt of [reply => { reply.device.id = 8; }, reply => { reply.url =
   await qrButton(dialog, '打印标签').emit('click'); assert.equal(f.context.window.printCalls, 0);
 }
 console.log('Device QR scope, safe labels, print readiness, retry and delayed-response isolation verified.');
+
+const brandingReply = (changes = {}) => ({ merchant: { id: 2, code: 'synthetic', name: 'Synthetic merchant' }, branding: { displayName: 'Synthetic brand', logoUrl: 'https://admin.example.test/api/v2/rental/branding/2/logo?v=4', version: 4, updatedAt: '2026-11-15T12:00:00.000Z', ...changes } });
+const appearanceReply = (changes = {}, venueChanges = {}) => ({ venue: { id: 11, merchantId: 2, name: 'Synthetic venue', ...venueChanges }, appearance: { theme: 'aero', heroImageUrl: 'https://admin.example.test/api/v2/rental/venues/11/hero?v=4', version: 4, updatedAt: '2026-11-15T12:00:00.000Z', ...changes } });
+function brandingFixture(role = 'adminer', render = true) {
+  const f = fixture(role), first = { id: 2, code: 'synthetic', name: 'Synthetic merchant' }, second = { id: 3, code: 'other', name: 'Other merchant' };
+  f.spec.setUser({ id: 10, role, merchantId: role === 'root' ? null : 2 }); f.spec.setContext(first, [first, second]); f.spec.setPage('branding');
+  const content = f.document.createElement('section'); f.app.append(content); if (render) f.spec.renderBranding(content, brandingReply());
+  const form = content.querySelector('form');
+  return { ...f, first, second, content, form, name: form?.querySelectorAll('input')[0], upload: form?.querySelectorAll('input').find(node => node.type === 'file'), logo: form?.querySelectorAll('input').find(node => node.type === 'url'), submit: form?.querySelectorAll('button').find(node => node.type === 'submit') };
+}
+async function appearanceFixture(role = 'adminer', appearance = appearanceReply()) {
+  const f = brandingFixture(role, false); f.spec.setPage('venues'); f.replies.push(appearance, brandingReply());
+  await f.spec.venueAppearanceDialog({ id: 11, merchantId: 2, name: 'Synthetic venue' });
+  const dialog = f.document.querySelector('.venue-appearance-dialog'), form = dialog?.querySelector('form');
+  return { ...f, dialog, form, hero: form?.querySelectorAll('input').find(node => node.type === 'url'), upload: form?.querySelectorAll('input').find(node => node.type === 'file'), submit: form?.querySelectorAll('button').find(node => node.type === 'submit') };
+}
+
+// Merchant-wide identity and venue-specific appearance have distinct administrators and forms.
+for (const role of ['manager', 'adminer', 'root']) {
+  const f = fixture(role); f.context.location.hash = '#branding'; f.spec.shell();
+  assert.equal(f.spec.canManageBranding(role), role !== 'manager'); assert.equal(f.app.querySelector('nav').querySelectorAll('a').some(node => node.dataset.page === 'branding'), role !== 'manager'); assert.equal(f.spec.getPage(), role === 'manager' ? 'overview' : 'branding');
+  const scoped = brandingFixture(role); scoped.spec.renderVenues(scoped.content, { items: [{ id: 11, merchantId: 2, name: 'Synthetic venue' }] }); assert.equal(scoped.content.querySelectorAll('button').some(node => node.textContent === '样式设置'), role !== 'manager');
+}
+{
+  const f = brandingFixture('manager'); assert.equal(f.form, null); await f.spec.venueAppearanceDialog({ id: 11, merchantId: 2, name: 'Synthetic venue' }); assert.equal(f.document.querySelector('dialog'), null);
+  const root = fixture('root'); root.spec.setPage('branding'); const main = root.document.createElement('main'); main.id = 'main-content'; root.app.append(main); await root.spec.loadPage(); assert.equal(root.calls.length, 0); assert.match(main.textContent, /请先选择所属商户/);
+}
+for (const role of ['adminer', 'root']) {
+  const f = brandingFixture(role); assert.equal(f.form.querySelectorAll('input').some(node => node.type === 'radio'), false); assert.equal(f.form.querySelectorAll('input').filter(node => node.type === 'file').length, 1); assert.doesNotMatch(f.form.textContent, /恢复默认主图/);
+  assert.equal(f.content.querySelector('.branding-phone').classList.contains('branding-preview-theme-aero'), true); assert.equal(f.content.querySelector('.branding-preview-product').getAttribute('src'), '/admin/assets/aero-glasses.png');
+  f.name.value = '<img src=x>'; await f.name.emit('input'); assert.equal(f.content.querySelector('.branding-preview-identity').querySelector('h3').textContent, '<img src=x>'); assert.equal(f.content.querySelector('.branding-preview-identity').querySelector('h3').querySelector('img'), null);
+  f.replies.push(brandingReply({ displayName: '<img src=x>', version: 5 })); await f.form.emit('submit');
+  const request = f.calls.find(call => call.method === 'PATCH'); assert.equal(request.headers['X-Merchant-Id'], '2'); assert.deepEqual(JSON.parse(request.body), { displayName: '<img src=x>', version: 4 }); assert.match(f.form.textContent, /品牌设置已保存/);
+}
+{
+  const f = brandingFixture(); f.logo.value = 'javascript:alert(1)'; await f.logo.emit('input'); await f.form.emit('submit'); assert.equal(f.calls.length, 0); assert.match(f.form.textContent, /HTTPS/);
+  f.logo.value = ''; await f.logo.emit('input'); f.context.fetch = async path => path.endsWith('/rental/capabilities') ? { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) } : { ok: false, status: 409, json: async () => ({ message: 'Conflict' }) }; await f.form.emit('submit'); assert.match(f.form.textContent, /其他管理员修改/); assert.equal(f.form.querySelectorAll('button').find(node => node.textContent === '重新加载最新配置').hidden, false);
+}
+{
+  const f = brandingFixture(), data = deferred(); f.context.FileReader = class { readAsDataURL() { data.promise.then(value => { this.result = value; this.onload(); }); } };
+  f.upload.files = [{ size: 20, type: 'image/png' }]; const pending = f.upload.emit('change'); assert.equal(f.submit.disabled, true); f.logo.value = 'https://images.example.test/new.png'; await f.logo.emit('input'); data.resolve('data:image/png;base64,c3ludGhldGlj'); await pending;
+  f.replies.push(brandingReply({ logoUrl: f.logo.value, version: 5 })); await f.form.emit('submit'); const payload = JSON.parse(f.calls.find(call => call.method === 'PATCH').body); assert.equal(payload.logoUrl, 'https://images.example.test/new.png'); assert.equal(payload.logoDataUrl, undefined); assert.equal(payload.theme, undefined); assert.equal(payload.heroImageUrl, undefined);
+}
+{
+  const f = brandingFixture(), data = deferred(); f.context.FileReader = class { readAsDataURL() { data.promise.then(value => { this.result = value; this.onload(); }); } }; f.upload.files = [{ size: 20, type: 'image/png' }]; const pending = f.upload.emit('change'); data.resolve('data:image/png;base64,c3ludGhldGlj'); await pending; f.replies.push(brandingReply({ version: 5 })); await f.form.emit('submit'); const payload = JSON.parse(f.calls.find(call => call.method === 'PATCH').body); assert.equal(payload.logoDataUrl, 'data:image/png;base64,c3ludGhldGlj'); assert.equal(payload.logoUrl, undefined);
+  f.upload.files = [{ size: 256 * 1024 + 1, type: 'image/png' }]; await f.upload.emit('change'); assert.match(f.form.textContent, /256 KB/);
+}
+for (const changed of ['merchant', 'role']) {
+  const f = brandingFixture('root'), pending = f.form.emit('submit'); if (changed === 'merchant') f.spec.setContext(f.second, [f.first, f.second]); else f.spec.setUser({ id: 10, role: 'manager', merchantId: 2 }); await pending; assert.equal(f.calls.some(call => call.method === 'PATCH'), false);
+}
+console.log('Merchant-wide name/logo scope, default previews, safe uploads and permission guards verified.');
+
+// Each venue has its own version, palette, hero image and scoped entry path; merchant identity is read-only.
+for (const role of ['adminer', 'root']) {
+  const f = await appearanceFixture(role); assert.match(f.form.textContent, /Synthetic merchant.*Synthetic venue/); assert.equal(f.form.querySelectorAll('input').find(node => node.readOnly).value, 'pages/index/index?merchantId=2&venueId=11');
+  assert.equal(f.dialog.querySelector('.branding-preview-identity').querySelector('h3').textContent, 'Synthetic brand'); assert.equal(f.form.querySelectorAll('input').filter(node => node.type === 'file').length, 1);
+  const radio = f.form.querySelectorAll('input').find(node => node.type === 'radio' && node.value === 'forest'); radio.checked = true; await radio.emit('change'); assert.equal(f.dialog.querySelector('.branding-phone').classList.contains('branding-preview-theme-forest'), true);
+  f.replies.push(appearanceReply({ theme: 'forest', version: 5 })); await f.form.emit('submit'); const request = f.calls.find(call => call.method === 'PATCH'); assert.equal(request.path, '/api/v2/rental/admin/venues/11/appearance'); assert.equal(request.headers['X-Merchant-Id'], '2'); assert.deepEqual(JSON.parse(request.body), { theme: 'forest', version: 4 }); assert.match(f.form.textContent, /景点样式已保存/);
+}
+{
+  const f = await appearanceFixture('adminer', appearanceReply({ theme: 'aero', heroImageUrl: '', version: 0 })); assert.equal(f.dialog.querySelector('.branding-preview-product').getAttribute('src'), '/admin/assets/aero-glasses.png'); assert.equal(f.dialog.querySelector('.branding-phone').classList.contains('branding-preview-theme-aero'), true);
+}
+{
+  const f = await appearanceFixture(), image = f.dialog.querySelector('.branding-preview-product'); assert.equal(image.getAttribute('src'), appearanceReply().appearance.heroImageUrl);
+  await f.form.querySelectorAll('button').find(node => node.textContent === '恢复默认主图').emit('click'); assert.equal(f.hero.value, ''); assert.equal(image.getAttribute('src'), '/admin/assets/aero-glasses.png'); assert.match(f.dialog.querySelector('.branding-preview-state').textContent, /未保存/);
+  f.replies.push(appearanceReply({ heroImageUrl: '', version: 5 })); await f.form.emit('submit'); const payload = JSON.parse(f.calls.find(call => call.method === 'PATCH').body); assert.equal(payload.heroImageUrl, ''); assert.equal(payload.logoUrl, undefined);
+}
+{
+  const f = await appearanceFixture(), image = f.dialog.querySelector('.branding-preview-product'); f.hero.value = 'https://images.example.test/hero.webp'; await f.hero.emit('input'); assert.equal(image.getAttribute('src'), f.hero.value); await image.emit('error'); assert.equal(image.getAttribute('src'), '/admin/assets/aero-glasses.png'); await image.emit('error'); assert.equal(image.hidden, true);
+  f.hero.value = 'data:image/svg+xml,test'; await f.hero.emit('input'); await f.form.emit('submit'); assert.equal(f.calls.some(call => call.method === 'PATCH'), false); assert.match(f.form.textContent, /AR 眼镜主图地址须为完整 HTTPS/);
+}
+{
+  const f = await appearanceFixture(), data = deferred(); f.context.FileReader = class { readAsDataURL() { data.promise.then(value => { this.result = value; this.onload(); }); } }; f.upload.files = [{ size: 300 * 1024, type: 'image/webp' }]; const pending = f.upload.emit('change'); assert.equal(f.submit.disabled, true); await f.form.emit('submit'); assert.equal(f.calls.some(call => call.method === 'PATCH'), false); data.resolve('data:image/webp;base64,aGVyby1zeW50aGV0aWM='); await pending; assert.equal(f.submit.disabled, false);
+  f.replies.push(appearanceReply({ version: 5 })); await f.form.emit('submit'); const payload = JSON.parse(f.calls.find(call => call.method === 'PATCH').body); assert.equal(payload.heroDataUrl, 'data:image/webp;base64,aGVyby1zeW50aGV0aWM='); assert.equal(payload.heroImageUrl, undefined); assert.equal(payload.displayName, undefined); assert.equal(payload.logoDataUrl, undefined);
+}
+for (const change of ['url', 'reset', 'merchant', 'role', 'close']) {
+  const f = await appearanceFixture('root'), data = deferred(); f.context.FileReader = class { readAsDataURL() { data.promise.then(value => { this.result = value; this.onload(); }); } }; f.upload.files = [{ size: 20, type: 'image/jpeg' }]; const pending = f.upload.emit('change');
+  if (change === 'url') { f.hero.value = 'https://images.example.test/new-hero.jpg'; await f.hero.emit('input'); } if (change === 'reset') await f.form.querySelectorAll('button').find(node => node.textContent === '撤销未保存修改').emit('click'); if (change === 'merchant') f.spec.setContext(f.second, [f.first, f.second]); if (change === 'role') f.spec.setUser({ id: 10, role: 'manager', merchantId: 2 }); if (change === 'close') await f.dialog.close();
+  data.resolve('data:image/jpeg;base64,c3ludGhldGlj'); await pending; assert.equal(f.hero.value, change === 'url' ? 'https://images.example.test/new-hero.jpg' : appearanceReply().appearance.heroImageUrl); assert.notEqual(f.dialog.querySelector('.branding-preview-product').getAttribute('src'), 'data:image/jpeg;base64,c3ludGhldGlj'); assert.equal(f.calls.some(call => call.method === 'PATCH'), false);
+}
+for (const file of [{ size: 512 * 1024 + 1, type: 'image/png' }, { size: 20, type: 'image/svg+xml' }]) { const f = await appearanceFixture(); f.upload.files = [file]; await f.upload.emit('change'); assert.match(f.form.textContent, /512 KB/); assert.equal(f.hero.value, appearanceReply().appearance.heroImageUrl); }
+{
+  const f = await appearanceFixture(); f.context.fetch = async path => path.endsWith('/rental/capabilities') ? { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) } : { ok: false, status: 409, json: async () => ({ message: 'Conflict' }) }; await f.form.emit('submit'); assert.match(f.form.textContent, /其他管理员修改/); assert.equal(f.form.querySelectorAll('button').find(node => node.textContent === '重新加载最新配置').hidden, false);
+}
+for (const change of ['merchant', 'role']) { const f = await appearanceFixture('root'), pending = f.form.emit('submit'); if (change === 'merchant') f.spec.setContext(f.second, [f.first, f.second]); else f.spec.setUser({ id: 10, role: 'manager', merchantId: 2 }); await pending; assert.equal(f.calls.some(call => call.method === 'PATCH'), false); }
+// Both initial reads and save responses must stay bound to the original venue and merchant.
+{
+  const f = brandingFixture('root', false), response = deferred(); f.spec.setPage('venues'); f.context.fetch = async path => path.endsWith('/branding') ? { ok: true, json: async () => brandingReply() } : response.promise;
+  const pending = f.spec.venueAppearanceDialog({ id: 11, merchantId: 2, name: 'Synthetic venue' }); f.spec.setContext(f.second, [f.first, f.second]); response.resolve({ ok: true, json: async () => appearanceReply() }); await pending; assert.equal(f.document.querySelector('.venue-appearance-dialog').querySelector('input'), null);
+}
+{
+  const f = await appearanceFixture('root'), response = deferred(); f.context.fetch = async path => path.endsWith('/rental/capabilities') ? { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) } : response.promise; const pending = f.form.emit('submit'); await Promise.resolve(); await Promise.resolve(); f.spec.setContext(f.second, [f.first, f.second]); response.resolve({ ok: true, json: async () => appearanceReply({ theme: 'sunset', version: 5 }) }); await pending; assert.doesNotMatch(f.form.textContent, /景点样式已保存/);
+}
+for (const corrupt of [response => { response.venue.id = 12; }, response => { response.venue.merchantId = 3; }]) { const reply = appearanceReply(); corrupt(reply); const f = await appearanceFixture('root', reply); assert.match(f.form.textContent, /景点样式响应无效/); assert.equal(f.form.querySelector('input'), null); }
+console.log('Venue appearance scope, default styling, safe independent hero uploads, conflicts and delayed-response isolation verified.');

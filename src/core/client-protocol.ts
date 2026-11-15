@@ -11,7 +11,7 @@ export const requireClientProtocol: RequestHandler = (req, res, next) => {
   const path = req.originalUrl.split('?')[0];
   const businessWrite = /^\/api\/v2\/rentals(?:\/|$)/.test(path)
     || /^\/api\/v2\/rental\/devices(?:\/|$)/.test(path)
-    || /^\/api\/v2\/rental\/admin\/(?:venues|merchants|devices|users)(?:\/|$)/.test(path);
+    || /^\/api\/v2\/rental\/admin\/(?:venues|merchants|devices|users|branding)(?:\/|$)/.test(path);
   if (!businessWrite) return next();
   const value = req.headers['x-client-protocol'];
   const protocol = typeof value === 'string' && /^\d{1,3}$/.test(value) ? Number(value) : 0;
