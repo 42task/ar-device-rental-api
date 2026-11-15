@@ -544,7 +544,77 @@ dialog::backdrop { background: #10244766; }
 .page-heading-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .venue-owner { margin: 0 0 16px; color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
 .merchant-actions { flex-wrap: wrap; }
+.branding-layout { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(300px, .9fr); gap: 32px; align-items: start; }
+.branding-editor { min-width: 0; }
+.branding-editor .venue-owner { margin: 24px 24px 0; font-size: 14px; }
+.branding-form { display: grid; gap: 20px; padding: 24px; }
+.branding-form .field { margin: 0; }
+.branding-form .field input { min-width: 0; width: 100%; }
+.branding-form input[type="file"] { padding: 8px; font-size: 13px; }
+.branding-logo-actions { display: flex; align-items: center; gap: 12px; margin-top: -12px; flex-wrap: wrap; }
+.branding-logo-actions .text-button { padding-left: 0; }
+.branding-logo-actions .muted { font-size: 12px; }
+.branding-themes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.branding-themes legend { margin-bottom: 12px; padding: 0; color: var(--text); font-weight: 600; }
+.branding-theme-option { display: flex; position: relative; align-items: center; gap: 10px; min-width: 0; padding: 14px 12px; border: 1px solid var(--line); border-radius: var(--radius); cursor: pointer; }
+.branding-theme-option:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: #f4f7ff; }
+.branding-theme-option:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
+.branding-theme-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.branding-theme-option strong { display: block; font-size: 14px; }
+.branding-theme-option small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.branding-swatch { flex: 0 0 26px; width: 26px; height: 34px; border-radius: 6px; border: 1px solid #00000012; background: linear-gradient(150deg, #1951f0 50%, #f7f9fd 50%); }
+.branding-theme-forest .branding-swatch { background: linear-gradient(150deg, #176b4b 50%, #f3f8f4 50%); }
+.branding-theme-sunset .branding-swatch { background: linear-gradient(150deg, #a8441e 50%, #fff8f2 50%); }
+.branding-theme-ink .branding-swatch { background: linear-gradient(150deg, #9bb8ff 50%, #111827 50%); }
+.branding-actions { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-top: 20px; border-top: 1px solid var(--line); }
+.branding-status { margin: 0; color: var(--success); font-size: 13px; }
+.branding-status:empty { display: none; }
+.branding-preview { min-width: 0; text-align: center; padding: 20px 0; }
+.branding-preview .eyebrow { margin: 0 0 4px; font-size: 11px; color: var(--muted); }
+.branding-preview > h2 { margin: 0 0 24px; font-size: 20px; }
+.branding-preview > .muted { max-width: 310px; margin: 12px auto 0; font-size: 12px; line-height: 1.8; }
+.branding-phone { --brand-accent: #1951f0; --brand-bg: #f7f9fd; --brand-surface: #fff; --brand-text: #13213b; --brand-muted: #68798f; --brand-button-text: #fff; width: min(100%, 310px); margin: 0 auto; border: 7px solid #dce3ee; border-radius: 34px; overflow: hidden; background: var(--brand-bg); color: var(--brand-text); box-shadow: 0 18px 44px #18315414; text-align: left; }
+.branding-preview-theme-forest { --brand-accent: #176b4b; --brand-bg: #f3f8f4; --brand-text: #133d2d; --brand-muted: #607769; }
+.branding-preview-theme-sunset { --brand-accent: #a8441e; --brand-bg: #fff8f2; --brand-text: #482c20; --brand-muted: #846b59; }
+.branding-preview-theme-ink { --brand-accent: #9bb8ff; --brand-bg: #111827; --brand-surface: #1f2937; --brand-text: #f2f6ff; --brand-muted: #b2bed2; --brand-button-text: #111827; }
+.branding-phone-nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 68px; padding: 18px 16px 12px; background: var(--brand-surface); font-size: 12px; }
+.branding-phone-nav > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.branding-capsule { white-space: nowrap; padding: 2px 8px; border: 1px solid var(--brand-muted); border-radius: 20px; opacity: .7; font-size: 10px; }
+.branding-phone-body { padding: 26px 20px 34px; }
+.branding-preview-identity { text-align: center; }
+.branding-preview-logo { display: flex; align-items: center; justify-content: center; width: 56px; height: 56px; margin: 0 auto 12px; border-radius: 15px; background: var(--brand-surface); color: var(--brand-accent); font-size: 18px; font-weight: 700; overflow: hidden; }
+.branding-preview-logo img { width: 100%; height: 100%; object-fit: contain; }
+.branding-preview-identity h3 { margin: 0; font-size: 20px; line-height: 1.4; overflow-wrap: anywhere; }
+.branding-preview-identity p { margin: 7px 0 0; color: var(--brand-muted); font-size: 11px; }
+.branding-preview-product { display: block; width: 100%; height: 90px; margin: 24px 0; object-fit: contain; }
+.branding-preview-scan { padding: 13px 6px; border-radius: 10px; background: var(--brand-accent); color: var(--brand-button-text); font-size: 14px; font-weight: 600; text-align: center; }
+.branding-preview-tip { margin-top: 10px; color: var(--brand-muted); font-size: 9px; text-align: center; }
+.branding-preview-order { display: flex; justify-content: space-between; gap: 10px; margin-top: 24px; padding: 15px 12px; border-radius: 10px; background: var(--brand-surface); font-size: 11px; }
+.branding-preview-order > :last-child { color: var(--brand-accent); }
+.branding-preview-state { margin: 18px 0 0; color: var(--muted); font-size: 12px; }
+.venue-appearance-dialog { width: min(1000px, calc(100% - 32px)); max-width: 1000px; }
+.venue-appearance-dialog .branding-form { padding: 0; min-width: 0; }
+.venue-appearance-dialog .branding-preview { padding-top: 0; }
+@media (max-width: 1150px) {
+  .branding-layout { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .branding-preview { padding-top: 0; }
+  .branding-phone { width: min(100%, 340px); }
+}
+@media (max-width: 480px) {
+  .branding-form { padding: 20px; }
+  .branding-editor .venue-owner { margin: 20px 20px 0; }
+  .branding-themes { grid-template-columns: minmax(0, 1fr); }
+  .branding-actions button { width: 100%; }
+}
 @media (max-width: 640px) {
+  .topbar { flex-wrap: wrap; }
+  .topbar-title { flex: 1 1 100%; min-width: 0; white-space: normal; }
+  .account { width: 100%; min-width: 0; justify-content: flex-end; }
+  .account .merchant-context { flex: 1 1 0; margin-right: auto; max-width: none; }
+  .account .merchant-name { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .account .merchant-context select { width: 100%; max-width: 180px; }
+  .account-name, .account .text-button { flex: 0 0 auto; }
+  .account-name > div:last-child { overflow: hidden; text-overflow: ellipsis; }
   .nav > .nav-link { flex: 1 0 70px; }
   .nav-group { display: flex; flex: 1 0 116px; flex-direction: column; }
   .nav .nav-group .nav-parent { flex: 0 0 auto; min-height: 36px; flex-direction: row; padding: 6px; gap: 5px; border-radius: 5px; }
