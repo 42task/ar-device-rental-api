@@ -16,13 +16,15 @@ class Element {
   set textContent(text) { this.ownText = String(text); this.children = []; }
   append(...nodes) { for (const value of nodes) { const node = typeof value === 'string' ? new Element('#text', value) : value; node.parent = this; this.children.push(node); } }
   replaceChildren(...nodes) { this.children = []; this.ownText = ''; this.append(...nodes); }
-  setAttribute(name, value) { this.attributes[name] = String(value); if (name === 'id') this.id = String(value); }
+  setAttribute(name, value) { this.attributes[name] = String(value); if (name === 'id') this.id = String(value); if (name === 'class') this.className = String(value); }
+  getAttribute(name) { return this.attributes[name] ?? null; }
   removeAttribute(name) { delete this.attributes[name]; delete this[name]; }
   get classList() {
     const node = this;
     return {
       contains(name) { return node.className.split(/\s+/).includes(name); },
       add(name) { const names = new Set(node.className.split(/\s+/).filter(Boolean)); names.add(name); node.className = [...names].join(' '); },
+      remove(name) { node.className = node.className.split(/\s+/).filter(value => value && value !== name).join(' '); },
       toggle(name, enabled) { const names = new Set(node.className.split(/\s+/).filter(Boolean)); const next = enabled ?? !names.has(name); if (next) names.add(name); else names.delete(name); node.className = [...names].join(' '); return next; },
     };
   }
@@ -39,24 +41,29 @@ class Element {
   addEventListener(type, handler, options = {}) { this.listeners.set(type, [...(this.listeners.get(type) || []), { handler, once: !!options.once }]); }
   async emit(type) { for (const listener of [...(this.listeners.get(type) || [])]) { if (listener.once) this.listeners.set(type, this.listeners.get(type).filter(value => value !== listener)); await listener.handler({ preventDefault() {}, currentTarget: this }); } }
   showModal() { this.open = true; }
-  close() { this.open = false; this.emit('close'); }
+  close() { this.open = false; return this.emit('close'); }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter(node => node !== this); }
 }
 
 function fixture(role = 'root') {
   const body = new Element('body'), app = new Element('div'); app.id = 'app'; body.append(app);
-  const document = { body, createElement: tag => new Element(tag), createTextNode: text => new Element('#text', text), querySelector: selector => body.querySelector(selector), querySelectorAll: selector => body.querySelectorAll(selector), title: '' };
-  const calls = [], replies = [], windowEvents = new Map();
+  const document = { body, createElement: tag => new Element(tag), createElementNS: (namespaceURI, tag) => Object.assign(new Element(tag), { namespaceURI }), createTextNode: text => new Element('#text', text), querySelector: selector => body.querySelector(selector), querySelectorAll: selector => body.querySelectorAll(selector), title: '' };
+  const calls = [], fetches = [], replies = [], windowEvents = new Map();
   const location = { origin: 'https://admin.example.test' }; let hash = '#overview';
   Object.defineProperty(location, 'hash', { get: () => hash, set: value => { hash = '#' + String(value).replace(/^#/, ''); } });
-  const context = vm.createContext({ document, window: { addEventListener: (type, handler) => windowEvents.set(type, handler) }, location, URL, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, fetch: async (path, options = {}) => { if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; calls.push({ path, ...options }); return { ok: true, json: async () => replies.length ? replies.shift() : path.startsWith('/api/v2/rental/admin/venues') ? { items: [{ id: 11, name: 'Synthetic venue', status: 'active', useFeeCents: 2000, depositCents: 10000, version: 3 }] } : ({ id: 11, role: JSON.parse(options.body || '{}').role }) }; }, pageLoads: 0 });
-  vm.runInContext(source.replace(/\nboot\(\);\s*$/, '') + '\nconst originalLoadPage = loadPage; loadPage = () => { pageLoads++; }; globalThis.spec = { loadPage: originalLoadPage, useRealPages: () => { loadPage = originalLoadPage; }, heading, renderMerchants, renderMerchantContext, selectManagementMerchant, openMerchantVenues, refreshMerchants, managementMerchantId, managementMerchant, setPage: page => { state.page = page; }, api, merchantDialog, transferDialog, createDeviceDialog, configureDialog, venueDialog, renderVenues, renderToolbar, canManageVenues, canUseAdmin, canManageUsers, assignableRoles, roleLabel, completeLogin, shell, userRow, roleDialog, setContext: (merchant, merchants = []) => { state.merchantGeneration++; state.merchant = merchant; state.merchantId = merchant?.id || null; state.merchants = merchants; }, setUser: value => { state.user = value; }, getUser: () => state.user, getPage: () => state.page, getUserScope: () => state.filters.users.scope };', context);
+  const window = { addEventListener: (type, handler) => windowEvents.set(type, handler), printCalls: 0, print() { this.printCalls++; } };
+  const context = vm.createContext({ document, window, location, URL, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, fetch: async (path, options = {}) => { fetches.push({ path, ...options }); if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; calls.push({ path, ...options }); return { ok: true, json: async () => replies.length ? replies.shift() : path.startsWith('/api/v2/rental/admin/venues') ? { items: [{ id: 11, name: 'Synthetic venue', status: 'active', useFeeCents: 2000, depositCents: 10000, version: 3 }] } : ({ id: 11, role: JSON.parse(options.body || '{}').role }) }; }, pageLoads: 0 });
+  vm.runInContext(source.replace(/\nboot\(\);\s*$/, '') + '\nconst originalLoadPage = loadPage; loadPage = () => { pageLoads++; }; globalThis.spec = { loadPage: originalLoadPage, useRealPages: () => { loadPage = originalLoadPage; }, heading, renderMerchants, renderMerchantContext, selectManagementMerchant, openMerchantVenues, refreshMerchants, managementMerchantId, managementMerchant, setPage: page => { state.page = page; }, api, merchantDialog, transferDialog, createDeviceDialog, configureDialog, venueDialog, renderVenues, renderToolbar, canManageVenues, canUseAdmin, canManageUsers, assignableRoles, roleLabel, completeLogin, boot, shell, deviceRow, deviceQrDialog, userRow, roleDialog, setContext: (merchant, merchants = []) => { state.merchantGeneration++; state.merchant = merchant; state.merchantId = merchant?.id || null; state.merchants = merchants; }, setUser: value => { state.user = value; }, advanceLogin: () => { state.loginGeneration++; }, getUser: () => state.user, getPage: () => state.page, getUserScope: () => state.filters.users.scope };', context);
   context.spec.setUser({ id: 10, role });
-  return { context, spec: context.spec, document, app, calls, replies, windowEvents };
+  return { context, spec: context.spec, document, app, calls, fetches, replies, windowEvents };
 }
 function controls(fixture) {
   const dialog = fixture.document.querySelector('dialog'), form = dialog.querySelector('form');
   return { dialog, form, select: form.querySelector('select'), reason: form.querySelector('textarea'), checked: form.querySelector('input'), submit: form.querySelectorAll('button').find(button => button.type === 'submit') };
+}
+function roleMerchantContext(fixture) {
+  const first = { id: 1, code: 'first', name: 'First', status: 'active' }, second = { id: 2, code: 'second', name: 'Second', status: 'active' };
+  fixture.spec.setContext(first, [first, second]); return { first, second };
 }
 function merchantField(form, label) {
   return form.querySelectorAll('label').find(node => node.children[0]?.textContent === label)?.querySelector('input,select,textarea') || null;
@@ -67,6 +74,22 @@ function assertNoEntryControls(form) {
   assert.deepEqual(form.querySelectorAll('input,select,textarea').filter(input => input.required).map(input => input.parent.children[0].textContent), ['商户名称', '商户编号']);
 }
 async function selectRole(controls, role) { controls.select.value = role; await controls.select.emit('change'); controls.checked.checked = true; await controls.checked.emit('change'); controls.reason.value = 'Synthetic role-change test'; }
+function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+// These are deliberately synthetic PEM-shaped strings, never usable payment keys.
+const syntheticPem = (kind, body = 'U1lOVEhFVElDLU9OTFk=') => `-----BEGIN ${kind}-----\n${body}\n-----END ${kind}-----`;
+async function credentialFixture() {
+  const f = fixture('root'), first = { id: 2, code: 'merchant_2', name: 'First' }, second = { id: 3, code: 'merchant_3', name: 'Second' };
+  f.spec.setContext(first, [first, second]);
+  f.replies.push({ merchant: { ...first, miniappOwnerId: 1, mchId: '2000000002', status: 'draft', payEnabled: false, configuration: {} } });
+  await f.spec.merchantDialog(2);
+  const dialog = f.document.querySelector('dialog'), form = dialog.querySelector('form'), uploads = form.querySelectorAll('input').filter(input => input.type === 'file');
+  assert.equal(uploads.length, 2);
+  return { ...f, first, second, dialog, form, privateFile: uploads[0], platformFile: uploads[1], privateKey: merchantField(form, '商户私钥（PEM）'), platformPublicKey: merchantField(form, '微信支付公钥 / 平台证书（PEM）') };
+}
+function chooseCredentialFile(input, text, options = {}) {
+  input.files = [{ size: text.length, text: async () => text, ...options }]; input.value = 'C:\\fakepath\\synthetic.pem';
+  return input.emit('change');
+}
 
 // All operational roles can establish a session; only adminer/root see users.
 for (const role of ['manager', 'adminer', 'root']) {
@@ -104,7 +127,7 @@ for (const role of ['manager', 'adminer', 'root']) {
   assert.throws(() => f.spec.completeLogin({ user: { id: 10, role: 'admin' } }, () => true), /没有管理权限/);
   assert.deepEqual(Array.from(f.spec.assignableRoles({ id: 10, role: 'admin' }, { id: 11, role: 'user' })), []);
   assert.deepEqual(Array.from(f.spec.assignableRoles({ id: 10, role: 'root' }, { id: 11, role: 'admin' })), []);
-  const root = fixture('root'); root.spec.roleDialog({ id: 11, role: 'manager', allowedRoles: ['user', 'manager', 'admin', 'adminer'] }); const c = controls(root);
+  const root = fixture('root'); roleMerchantContext(root); root.spec.roleDialog({ id: 11, role: 'manager', merchantId: 1, allowedRoles: ['user', 'manager', 'admin', 'adminer'] }); const c = controls(root);
   assert.deepEqual(c.select.querySelectorAll('option').map(option => option.value), ['user', 'manager', 'adminer']);
   await selectRole(c, 'adminer'); c.select.value = 'admin'; await c.form.emit('submit');
   assert.equal(root.calls.length, 0); assert.match(c.form.textContent, /重新核对/);
@@ -116,7 +139,7 @@ for (const role of ['manager', 'adminer', 'root']) {
   for (const user of [{ id: 10, role: 'adminer' }, { id: 11, role: 'adminer' }, { id: 12, role: 'root' }, { id: 13, role: 'user', allowedRoles: [] }]) assert.equal(f.spec.userRow(user).querySelectorAll('button').length, 0);
   for (const role of ['user', 'manager']) assert.equal(f.spec.userRow({ id: 11, role }).querySelectorAll('button').length, 1);
   const root = fixture('root');
-  assert.equal(root.spec.userRow({ id: 11, role: 'adminer' }).querySelectorAll('button').length, 2);
+  assert.equal(root.spec.userRow({ id: 11, role: 'adminer' }).querySelectorAll('button').length, 1);
   for (const user of [{ id: 10, role: 'root' }, { id: 11, role: 'root' }]) assert.equal(root.spec.userRow(user).querySelectorAll('button').length, 0);
   f.spec.roleDialog({ id: 11, role: 'adminer' }); assert.equal(f.document.querySelector('dialog'), null);
 }
@@ -146,7 +169,7 @@ for (const role of ['manager', 'adminer', 'root']) {
   }
 }
 
-// Both permission and merchant-assignment dialogs identify the target by the verified phone.
+// Root assigns the merchant and role together after identifying the target by the verified phone.
 for (const verified of [true, false]) {
   const user = { id: 11, role: 'user', nickname: 'Synthetic renter', tel: '+8613900139000', phoneVerified: verified, phoneNumber: verified ? '+8613800138000' : null };
   const checkIdentity = node => {
@@ -154,21 +177,21 @@ for (const verified of [true, false]) {
     if (verified) { assert.match(node.textContent, /手机号：\+8613800138000（微信已验证）/); assert.doesNotMatch(node.textContent, /未授权手机号/); }
     else { assert.match(node.textContent, /未授权手机号，请由用户本人在小程序授权/); assert.doesNotMatch(node.textContent, /微信已验证/); }
   };
-  const role = fixture('root'); role.spec.roleDialog(user); checkIdentity(controls(role).form);
-  const transfer = fixture('root'), first = { id: 1, name: 'First' }, second = { id: 2, name: 'Second' };
-  transfer.spec.setContext(first); transfer.replies.push({ items: [first, second], currentMerchantId: 1 });
-  await transfer.spec.transferDialog('users', user);
-  const form = transfer.document.querySelector('dialog').querySelector('form'); checkIdentity(form);
-  form.querySelector('select').value = '2'; form.querySelector('textarea').value = 'Synthetic assignment';
-  transfer.replies.push({ binding: { token: 'a'.repeat(64), appId: 'wxsynthetic', origin: 'https://synthetic.example.test', expiresAt: '2026-11-15T12:00:00.000Z' } });
-  await form.emit('submit'); assert.match(form.textContent, /等待原账号确认商户分配/); checkIdentity(form);
-  const written = transfer.calls.find(call => call.method === 'POST');
-  assert.deepEqual(JSON.parse(written.body), { merchantId: 2, reason: 'Synthetic assignment', role: 'user' });
+  const role = fixture('root'); const { second } = roleMerchantContext(role); role.spec.roleDialog(user); const c = controls(role); checkIdentity(c.form);
+  const merchant = merchantField(c.form, '所属商户'); assert.equal(merchant.value, '1');
+  merchant.value = '2'; await merchant.emit('change'); await selectRole(c, 'manager'); c.reason.value = 'Synthetic assignment';
+  role.replies.push({ user: { ...user, role: 'manager', merchantId: 2 }, merchant: second });
+  await c.form.emit('submit'); assert.equal(role.document.querySelector('dialog'), null); assert.equal(role.context.pageLoads, 1);
+  assert.match(role.document.querySelector('.toast').textContent, /所属商户与身份已更新/);
+  const written = role.calls.find(call => call.method === 'POST');
+  assert.equal(written.path, '/api/v2/rental/admin/users/11/merchant');
+  assert.deepEqual(JSON.parse(written.body), { merchantId: 2, reason: 'Synthetic assignment', role: 'manager' });
 }
 
 // Actual form submission grants only the selected, explicitly acknowledged role.
 {
   const f = fixture('adminer'); f.spec.roleDialog({ id: 11, role: 'user', allowedRoles: ['user', 'manager'] }); const c = controls(f);
+  assert.equal(merchantField(c.form, '所属商户'), null);
   assert.deepEqual(c.select.querySelectorAll('option').map(option => option.value), ['user', 'manager']);
   assert.equal(c.submit.disabled, true);
   await selectRole(c, 'manager'); assert.match(c.submit.textContent, /提升权限/);
@@ -178,9 +201,46 @@ for (const verified of [true, false]) {
   assert.equal(f.calls[0].credentials, 'same-origin');
 }
 {
-  const f = fixture('root'); f.spec.roleDialog({ id: 11, role: 'manager', allowedRoles: ['user', 'manager', 'adminer'] }); const c = controls(f);
+  const f = fixture('root'); roleMerchantContext(f); f.spec.roleDialog({ id: 11, role: 'manager', merchantId: 1, allowedRoles: ['user', 'manager', 'adminer'] }); const c = controls(f);
   assert.deepEqual(c.select.querySelectorAll('option').map(option => option.value), ['user', 'manager', 'adminer']);
-  await selectRole(c, 'adminer'); await c.form.emit('submit'); assert.equal(JSON.parse(f.calls[0].body).role, 'adminer');
+  await selectRole(c, 'adminer'); await c.form.emit('submit');
+  assert.equal(f.calls[0].path, '/api/v2/rental/admin/users/11/merchant'); assert.equal(f.calls[0].method, 'POST');
+  assert.deepEqual(JSON.parse(f.calls[0].body), { role: 'adminer', merchantId: 1, reason: 'Synthetic role-change test' });
+}
+
+// Changing only the merchant preserves the role, defaults to the employee's current merchant and requires fresh acknowledgement.
+{
+  const f = fixture('root'); roleMerchantContext(f); f.spec.roleDialog({ id: 11, role: 'manager', merchantId: 2 }); const c = controls(f);
+  const merchant = merchantField(c.form, '所属商户'); assert.equal(merchant.value, '2');
+  c.checked.checked = true; await c.checked.emit('change'); assert.equal(c.submit.disabled, true);
+  merchant.value = '1'; await merchant.emit('change'); assert.equal(c.checked.checked, false);
+  c.checked.checked = true; await c.checked.emit('change'); c.reason.value = 'Synthetic merchant reassignment';
+  assert.equal(c.submit.disabled, false); await c.form.emit('submit');
+  assert.deepEqual(JSON.parse(f.calls[0].body), { merchantId: 1, role: 'manager', reason: 'Synthetic merchant reassignment' });
+}
+
+// Removing staff access does not require an active destination merchant or transfer the employee's old scope.
+{
+  const f = fixture('root'); f.spec.setContext({ id: 2, code: 'paused', name: 'Paused', status: 'paused' }, [{ id: 2, code: 'paused', name: 'Paused', status: 'paused' }]);
+  f.spec.roleDialog({ id: 11, role: 'adminer', merchantId: 2 }); const c = controls(f), merchant = merchantField(c.form, '所属商户');
+  assert.equal(merchant.value, ''); await selectRole(c, 'user'); assert.equal(merchant.disabled, true); assert.equal(c.submit.disabled, false);
+  await c.form.emit('submit'); assert.deepEqual(JSON.parse(f.calls[0].body), { role: 'user', merchantId: 2, reason: 'Synthetic role-change test' });
+}
+
+// Scope, actor and session changes during capability checks cannot send an old identity assignment.
+for (const invalidation of ['merchant', 'actor', 'login', 'close']) {
+  const f = fixture('root'), { second } = roleMerchantContext(f), check = deferred(), started = deferred();
+  f.spec.roleDialog({ id: 11, role: 'user' }); const c = controls(f); await selectRole(c, 'manager');
+  f.context.fetch = async (path, options = {}) => {
+    if (path.endsWith('/rental/capabilities')) { started.resolve(); await check.promise; return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; }
+    f.calls.push({ path, ...options }); return { ok: true, json: async () => ({}) };
+  };
+  const pending = c.form.emit('submit'); await started.promise;
+  if (invalidation === 'merchant') f.spec.selectManagementMerchant(second);
+  if (invalidation === 'actor') f.spec.setUser({ id: 12, role: 'root' });
+  if (invalidation === 'login') f.spec.advanceLogin();
+  if (invalidation === 'close') await c.dialog.close();
+  check.resolve(); await pending; assert.equal(f.calls.some(call => call.method), false); assert.equal(f.context.pageLoads, 0);
 }
 
 // Demotion has distinct confirmation; switching choices clears acknowledgement.
@@ -201,6 +261,47 @@ for (const verified of [true, false]) {
 
 console.log('Four-role sessions, navigation, protected rows and role-change forms verified with isolated fixtures.');
 
+// Root enters the session's default merchant before the merchant list finishes loading.
+// Both QR login and restoring the cookie session use that same initial scope.
+for (const entryPoint of ['login', 'session']) {
+  const f = fixture('root'), first = { id: 1, code: 'default', name: '默认商户', status: 'active' }, second = { id: 2, code: 'second', name: 'Second', status: 'active' };
+  const session = { user: { id: 10, role: 'root', merchantId: null }, managementMerchant: null, merchant: first };
+  let release;
+  const delayed = new Promise(resolve => { release = resolve; });
+  f.context.fetch = async (path, options = {}) => {
+    f.calls.push({ path, ...options });
+    if (path.endsWith('/admin/merchants')) await delayed;
+    return { ok: true, json: async () => path.endsWith('/auth/session') ? session : path.endsWith('/admin/merchants') ? { items: [second, first], currentMerchantId: 1 } : path.endsWith('/admin/overview') ? { merchant: options.headers['X-Merchant-Id'] === '2' ? second : first, devices: {}, orders: {} } : { currentClientProtocol: 2, minClientProtocol: 2 } };
+  };
+  f.spec.useRealPages();
+  if (entryPoint === 'login') f.spec.completeLogin(session, () => true);
+  else await f.spec.boot();
+  assert.equal(f.spec.managementMerchantId(), 1);
+  assert.equal(f.calls.find(call => call.path.endsWith('/admin/overview')).headers['X-Merchant-Id'], '1');
+  assert.doesNotMatch(f.app.textContent, /请先选择所属商户/);
+  release(); await new Promise(resolve => setImmediate(resolve));
+  const select = f.app.querySelector('#merchant-context').querySelector('select');
+  assert.equal(select.value, '1');
+  assert.equal(f.app.querySelector('.nav-merchant-scope').textContent, '默认商户 · default');
+  select.value = '2'; await select.emit('change');
+  await f.spec.refreshMerchants();
+  assert.equal(f.spec.managementMerchantId(), 2);
+  assert.equal(f.app.querySelector('#merchant-context').querySelector('select').value, '2');
+  assert.equal(f.calls.filter(call => call.path.endsWith('/admin/overview')).at(-1).headers['X-Merchant-Id'], '2');
+  await f.spec.boot(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.spec.managementMerchantId(), 1);
+  assert.equal(f.app.querySelector('#merchant-context').querySelector('select').value, '1');
+  assert.equal(f.calls.filter(call => call.path.endsWith('/admin/overview')).at(-1).headers['X-Merchant-Id'], '1');
+}
+{
+  const f = fixture('adminer');
+  f.spec.completeLogin({ user: { id: 10, role: 'adminer', merchantId: null }, managementMerchant: null, merchant: { id: 1, name: '默认商户' } }, () => true);
+  await f.spec.loadPage();
+  assert.equal(f.spec.managementMerchantId(), null);
+  assert.equal(f.calls.some(call => call.path.endsWith('/admin/overview')), false);
+  assert.match(f.app.textContent, /请先选择所属商户/);
+}
+
 // Root selection and staff membership scope business requests; authentication remains entry-scoped.
 {
   const root = fixture('root'); root.spec.setContext({ id: 2, name: 'Synthetic merchant' });
@@ -220,6 +321,126 @@ console.log('Four-role sessions, navigation, protected rows and role-change form
   assert.equal(manager.calls[2].headers['X-Merchant-Id'], undefined);
   await manager.spec.merchantDialog(); assert.equal(manager.document.querySelector('dialog'), null);
 }
+
+// Managers choose a venue inside their fixed merchant before querying devices.
+const deviceVenueFixtures = [
+  { id: 21, merchantId: 2, name: 'North scenic venue', status: 'active' },
+  { id: 22, merchantId: 2, name: 'South scenic venue', status: 'paused' },
+];
+const venueDevice = (venueId, label = 'Venue device') => ({ device: { id: venueId, uuid: label, venueId, venueName: 'Venue ' + venueId, type: 'Rokid Studio2' }, venue: { id: venueId }, state: 'DISABLED', pricing: { enabled: false, useFeeCents: 100, depositCents: 500 } });
+function managerDevicesFixture(role = 'manager') {
+  const f = fixture(role), own = { id: 2, name: 'Own merchant', code: 'own' };
+  f.spec.completeLogin({ user: { id: 10, role, merchantId: 2, authVersion: 1 }, managementMerchant: own, merchant: own }, () => true);
+  f.spec.setPage('devices'); f.spec.useRealPages();
+  return f;
+}
+const currentVenueSelect = f => f.app.querySelectorAll('select').find(select => select.getAttribute('aria-label') === '选择当前景点');
+async function until(condition) {
+  for (let step = 0; step < 60 && !condition(); step++) await Promise.resolve();
+  assert.ok(condition(), 'Expected asynchronous page state was not reached.');
+}
+{
+  const f = managerDevicesFixture();
+  f.context.fetch = async (path, options = {}) => {
+    f.calls.push({ path, ...options });
+    const query = new URL(path, f.context.location.origin).searchParams;
+    return { ok: true, json: async () => path.endsWith('/venues') ? { items: deviceVenueFixtures } : { items: [venueDevice(Number(query.get('venueId')))], page: Number(query.get('page')), pageSize: 20, total: 41 } };
+  };
+  await f.spec.loadPage();
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].path, '/api/v2/rental/admin/venues'); assert.equal(f.calls[0].headers['X-Merchant-Id'], '2');
+  assert.match(f.app.textContent, /请选择当前景点/); assert.equal(f.app.querySelector('.devices-table'), null);
+  const select = currentVenueSelect(f); assert.equal(select.value, '');
+  assert.deepEqual(select.querySelectorAll('option').map(option => option.value), ['', '21', '22']); assert.match(select.textContent, /South scenic venue（已暂停）/);
+  select.value = '21'; await select.emit('change');
+  const requested = f.calls.find(call => call.path.includes('/devices?')); assert.equal(new URL(requested.path, f.context.location.origin).searchParams.get('venueId'), '21'); assert.equal(requested.headers['X-Merchant-Id'], '2');
+  assert.match(f.app.textContent, /当前景点：North scenic venue/); assert.equal(f.app.querySelector('.device-summary'), null); assert.equal(f.calls.some(call => call.path.endsWith('/overview')), false);
+  const searchForm = f.app.querySelector('.search-form'); searchForm.querySelector('input').value = 'scenic'; await searchForm.emit('submit');
+  await until(() => !!f.app.querySelector('.devices-table'));
+  let query = new URL(f.calls.filter(call => call.path.includes('/devices?')).at(-1).path, f.context.location.origin).searchParams;
+  assert.equal(query.get('venueId'), '21'); assert.equal(query.get('search'), 'scenic'); assert.equal(query.get('page'), '1');
+  await f.app.querySelector('.pagination-actions').querySelectorAll('button').find(button => button.textContent === '下一页').emit('click');
+  await until(() => !!f.app.querySelector('.devices-table'));
+  query = new URL(f.calls.filter(call => call.path.includes('/devices?')).at(-1).path, f.context.location.origin).searchParams;
+  assert.equal(query.get('venueId'), '21'); assert.equal(query.get('page'), '2');
+  const paused = currentVenueSelect(f); paused.value = '22'; await paused.emit('change');
+  query = new URL(f.calls.filter(call => call.path.includes('/devices?')).at(-1).path, f.context.location.origin).searchParams;
+  assert.equal(query.get('venueId'), '22'); assert.equal(query.get('page'), '1'); assert.match(f.app.textContent, /当前景点：South scenic venue/);
+  const injected = currentVenueSelect(f), before = f.calls.filter(call => call.path.includes('/devices?')).length;
+  injected.value = '999'; await injected.emit('change');
+  assert.equal(f.calls.filter(call => call.path.includes('/devices?')).length, before); assert.equal(f.app.querySelector('.devices-table'), null);
+}
+
+// A newer venue selection clears old rows immediately and cannot be overwritten by a late response.
+{
+  const f = managerDevicesFixture(), delayed = deferred(), started = deferred();
+  f.context.fetch = async (path, options = {}) => {
+    f.calls.push({ path, ...options });
+    if (path.endsWith('/venues')) return { ok: true, json: async () => ({ items: deviceVenueFixtures }) };
+    const venueId = Number(new URL(path, f.context.location.origin).searchParams.get('venueId'));
+    if (venueId === 21) { started.resolve(); await delayed.promise; }
+    return { ok: true, json: async () => ({ items: [venueDevice(venueId, venueId === 21 ? 'Old venue device' : 'Current venue device')], page: 1, total: 1 }) };
+  };
+  await f.spec.loadPage(); const select = currentVenueSelect(f);
+  select.value = '21'; const first = select.emit('change'); await started.promise; assert.equal(f.app.querySelector('.devices-table'), null);
+  select.value = '22'; await select.emit('change'); assert.match(f.app.textContent, /Current venue device/);
+  delayed.resolve(); await first; assert.match(f.app.textContent, /Current venue device/); assert.doesNotMatch(f.app.textContent, /Old venue device/);
+}
+
+// Selection is revalidated on every query; empty, failed or foreign venue lists never fall back to all devices.
+for (const mode of ['empty', 'foreign', 'failed']) {
+  const f = managerDevicesFixture();
+  f.context.fetch = async (path, options = {}) => {
+    f.calls.push({ path, ...options });
+    if (mode === 'failed') throw Error('Synthetic venue network failure');
+    return { ok: true, json: async () => ({ items: mode === 'empty' ? [] : [{ ...deviceVenueFixtures[0], merchantId: 3 }] }) };
+  };
+  await f.spec.loadPage(); assert.equal(f.calls.length, 1); assert.equal(f.app.querySelector('.devices-table'), null);
+  assert.match(f.app.textContent, mode === 'empty' ? /当前商户暂无景点/ : /数据暂时无法加载/);
+}
+{
+  const f = managerDevicesFixture(); let venues = deviceVenueFixtures;
+  f.context.fetch = async (path, options = {}) => {
+    f.calls.push({ path, ...options }); return { ok: true, json: async () => path.endsWith('/venues') ? { items: venues } : { items: [venueDevice(21)], page: 1, total: 1 } };
+  };
+  await f.spec.loadPage(); const select = currentVenueSelect(f); select.value = '21'; await select.emit('change');
+  const before = f.calls.filter(call => call.path.includes('/devices?')).length;
+  venues = [{ ...deviceVenueFixtures[1] }, { ...deviceVenueFixtures[1], id: 23 }]; await f.spec.loadPage();
+  assert.equal(f.calls.filter(call => call.path.includes('/devices?')).length, before); assert.equal(currentVenueSelect(f).value, ''); assert.equal(f.app.querySelector('.devices-table'), null);
+}
+
+// Account, role, authorization, merchant and login changes reject a device response from the old context.
+for (const invalidation of ['account', 'role', 'authorization', 'merchant', 'login']) {
+  const f = managerDevicesFixture(), delayed = deferred(), started = deferred();
+  f.context.fetch = async (path, options = {}) => {
+    f.calls.push({ path, ...options });
+    if (path.endsWith('/venues')) return { ok: true, json: async () => ({ items: [deviceVenueFixtures[0]] }) };
+    started.resolve(); await delayed.promise; return { ok: true, json: async () => ({ items: [venueDevice(21, 'Old scoped device')], page: 1, total: 1 }) };
+  };
+  const pending = f.spec.loadPage(); await started.promise;
+  if (invalidation === 'account') f.spec.setUser({ id: 11, role: 'manager', merchantId: 2, authVersion: 1 });
+  if (invalidation === 'role') f.spec.setUser({ id: 10, role: 'adminer', merchantId: 2, authVersion: 1 });
+  if (invalidation === 'authorization') f.spec.setUser({ id: 10, role: 'manager', merchantId: 2, authVersion: 2 });
+  if (invalidation === 'merchant') f.spec.setContext({ id: 3, name: 'Other merchant' });
+  if (invalidation === 'login') f.spec.advanceLogin();
+  delayed.resolve(); await pending; assert.doesNotMatch(f.app.textContent, /Old scoped device/); assert.equal(f.app.querySelector('.devices-table'), null);
+}
+
+// An unfiltered merchant response cannot be displayed as one selected venue.
+{
+  const f = managerDevicesFixture();
+  f.context.fetch = async (path, options = {}) => { f.calls.push({ path, ...options }); return { ok: true, json: async () => path.endsWith('/venues') ? { items: [deviceVenueFixtures[0]] } : { items: [venueDevice(22, 'Out-of-venue device')], page: 1, total: 1 } }; };
+  await f.spec.loadPage(); assert.equal(f.app.querySelector('.devices-table'), null); assert.doesNotMatch(f.app.textContent, /Out-of-venue device/); assert.match(f.app.textContent, /设备景点范围已变化/);
+}
+
+// Adminer keeps the whole merchant device view and does not need a venue picker.
+{
+  const f = managerDevicesFixture('adminer');
+  f.context.fetch = async (path, options = {}) => { f.calls.push({ path, ...options }); return { ok: true, json: async () => path.endsWith('/overview') ? { devices: { total: 2 } } : { items: [venueDevice(21), venueDevice(22)], page: 1, total: 2 } }; };
+  await f.spec.loadPage(); assert.equal(currentVenueSelect(f), undefined); assert.equal(f.calls.some(call => call.path.endsWith('/venues')), false);
+  const query = new URL(f.calls.find(call => call.path.includes('/devices?')).path, f.context.location.origin).searchParams;
+  assert.equal(query.has('venueId'), false); assert.equal(f.app.querySelector('tbody').querySelectorAll('tr').length, 2); assert.ok(f.app.querySelector('.device-summary'));
+}
+console.log('Manager venue selection, fixed merchant scope, filtered devices and delayed-response isolation verified.');
 
 // Creation never renders platform controls; only business details are required to save.
 for (const merchants of [[], [{ id: 1, name: 'Platform', miniappOwnerId: null, appId: 'wx03dbf50c15cac06f', origin: 'https://d.4mr.cn' }, { id: 3, name: 'Historical entry', miniappOwnerId: null, origin: 'https://d3.4mr.cn', appId: 'wx3333333333333333' }]]) {
@@ -286,6 +507,131 @@ for (const ownerId of [1, 3]) {
   assert.equal(saved.entryName, 'Renamed entry'); assert.equal(saved.entryStatus, 'paused'); assert.equal(saved.status, 'paused');
   assert.equal(saved.credentials.appSecret, 'synthetic-owner-app-secret'); assert.equal(saved.miniappOwnerId, null);
 }
+
+// PEM imports stay local, support both allowed formats and leave scalar credentials manual.
+for (const [privateKind, platformKind] of [['PRIVATE KEY', 'PUBLIC KEY'], ['RSA PRIVATE KEY', 'CERTIFICATE'], ['PRIVATE KEY', 'RSA PUBLIC KEY']]) {
+  const f = await credentialFixture(), before = f.fetches.length;
+  const privatePem = syntheticPem(privateKind), platformPem = syntheticPem(platformKind);
+  await chooseCredentialFile(f.privateFile, '\uFEFF' + privatePem.replace(/\n/g, '\r\n') + '\r\n');
+  await chooseCredentialFile(f.platformFile, platformPem);
+  assert.equal(f.privateKey.value, privatePem); assert.equal(f.platformPublicKey.value, platformPem);
+  assert.equal(f.privateFile.value, ''); assert.equal(f.platformFile.value, ''); assert.equal(f.fetches.length, before);
+  for (const label of ['API v3 密钥', '商户证书序列号', '微信支付公钥 ID / 平台证书序列号']) assert.equal(merchantField(f.form, label).type, 'password');
+}
+
+// Reject wrong blocks, malformed/multiple blocks, oversized files and unreadable files without erasing a draft.
+{
+  const f = await credentialFixture(), before = f.fetches.length;
+  f.privateKey.value = syntheticPem('PRIVATE KEY'); f.platformPublicKey.value = syntheticPem('PUBLIC KEY');
+  for (const [file, field, value] of [
+    [f.privateFile, f.privateKey, syntheticPem('PUBLIC KEY')],
+    [f.platformFile, f.platformPublicKey, syntheticPem('PRIVATE KEY')],
+    [f.privateFile, f.privateKey, syntheticPem('PRIVATE KEY').replace('END PRIVATE KEY', 'END RSA PRIVATE KEY')],
+    [f.privateFile, f.privateKey, syntheticPem('PRIVATE KEY') + '\n' + syntheticPem('PRIVATE KEY')],
+    [f.platformFile, f.platformPublicKey, syntheticPem('CERTIFICATE') + '\n' + syntheticPem('CERTIFICATE')],
+    [f.privateFile, f.privateKey, syntheticPem('PRIVATE KEY', 'invalid body!')],
+  ]) {
+    const previous = field.value; await chooseCredentialFile(file, value);
+    assert.equal(field.value, previous); assert.match(file.parent.textContent, /请选择/);
+  }
+  let reads = 0;
+  await chooseCredentialFile(f.privateFile, syntheticPem('PRIVATE KEY'), { size: 16001, text: async () => { reads++; return syntheticPem('PRIVATE KEY'); } });
+  assert.equal(reads, 0); assert.equal(f.privateKey.value, syntheticPem('PRIVATE KEY')); assert.match(f.privateFile.parent.textContent, /16 KB/);
+  await chooseCredentialFile(f.privateFile, syntheticPem('PRIVATE KEY', 'A'.repeat(16000)), { size: 1 });
+  assert.equal(f.privateKey.value, syntheticPem('PRIVATE KEY'));
+  await chooseCredentialFile(f.platformFile, syntheticPem('PUBLIC KEY'), { text: async () => { throw new Error('Synthetic file-read failure'); } });
+  assert.equal(f.platformPublicKey.value, syntheticPem('PUBLIC KEY')); assert.match(f.platformFile.parent.textContent, /无法读取/);
+  assert.equal(f.fetches.length, before);
+}
+
+// Reads have independent field revisions; a later file or manual edit wins over a delayed earlier file.
+{
+  const f = await credentialFixture(), privateRead = deferred(), platformRead = deferred(), before = f.fetches.length;
+  const privatePending = chooseCredentialFile(f.privateFile, '', { size: 100, text: () => privateRead.promise });
+  const platformPending = chooseCredentialFile(f.platformFile, '', { size: 100, text: () => platformRead.promise });
+  platformRead.resolve(syntheticPem('CERTIFICATE')); await platformPending;
+  assert.equal(f.platformPublicKey.value, syntheticPem('CERTIFICATE')); assert.equal(f.privateKey.value, '');
+  privateRead.resolve(syntheticPem('RSA PRIVATE KEY')); await privatePending;
+  assert.equal(f.privateKey.value, syntheticPem('RSA PRIVATE KEY')); assert.equal(f.fetches.length, before);
+  for (const [file, field, kind] of [[f.privateFile, f.privateKey, 'PRIVATE KEY'], [f.platformFile, f.platformPublicKey, 'PUBLIC KEY']]) {
+    const earlier = deferred(), pending = chooseCredentialFile(file, '', { size: 100, text: () => earlier.promise });
+    const newer = syntheticPem(kind, 'TkVXRVItU1lOVEhFVElD'); await chooseCredentialFile(file, newer);
+    earlier.resolve(syntheticPem(kind, 'T0xERVItU1lOVEhFVElD')); await pending; assert.equal(field.value, newer);
+    const delayed = deferred(), reading = chooseCredentialFile(file, '', { size: 100, text: () => delayed.promise });
+    field.value = 'Manually pasted synthetic draft'; await field.emit('input');
+    delayed.resolve(syntheticPem(kind)); await reading; assert.equal(field.value, 'Manually pasted synthetic draft');
+  }
+  assert.equal(f.fetches.length, before);
+}
+
+// Closing, changing actor/session, or switching away and back prevents delayed imports from filling an obsolete draft.
+for (const invalidation of ['close', 'merchant', 'actor', 'login']) {
+  const f = await credentialFixture(), read = deferred(), before = f.fetches.length;
+  f.privateKey.value = 'Previous synthetic draft'; f.platformPublicKey.value = 'Other synthetic draft';
+  const pending = chooseCredentialFile(f.privateFile, '', { size: 100, text: () => read.promise });
+  if (invalidation === 'close') {
+    f.platformFile.value = 'C:\\fakepath\\synthetic-platform.pem'; await f.dialog.close();
+    assert.equal(f.privateKey.value, ''); assert.equal(f.platformPublicKey.value, '');
+    assert.equal(f.privateFile.value, ''); assert.equal(f.platformFile.value, '');
+  }
+  if (invalidation === 'merchant') { f.spec.setContext(f.second, [f.first, f.second]); f.spec.setContext(f.first, [f.first, f.second]); }
+  if (invalidation === 'actor') f.spec.setUser({ id: 11, role: 'root' });
+  if (invalidation === 'login') f.spec.advanceLogin();
+  read.resolve(syntheticPem('PRIVATE KEY')); await pending;
+  assert.equal(f.privateKey.value, invalidation === 'close' ? '' : 'Previous synthetic draft'); assert.equal(f.fetches.length, before);
+  if (invalidation === 'close') { assert.equal(f.platformPublicKey.value, ''); assert.equal(f.privateFile.value, ''); assert.equal(f.platformFile.value, ''); assert.equal(f.document.querySelector('dialog'), null); }
+}
+
+// A pending read blocks save; after it completes the ordinary JSON request carries the original credential fields.
+{
+  const f = await credentialFixture(), read = deferred(), before = f.fetches.length;
+  const privatePem = syntheticPem('PRIVATE KEY'), platformPem = syntheticPem('PUBLIC KEY');
+  await chooseCredentialFile(f.platformFile, platformPem);
+  const pending = chooseCredentialFile(f.privateFile, '', { size: 100, text: () => read.promise });
+  await f.form.emit('submit'); assert.equal(f.fetches.length, before); assert.match(f.form.textContent, /文件正在读取/);
+  read.resolve(privatePem); await pending;
+  const manual = { apiV3Key: 'synthetic-manually-entered-key', serialNo: 'AABBCCDDEEFF', platformKeyId: 'PUB_KEY_ID_SYNTHETIC' };
+  for (const [label, value] of [['API v3 密钥', manual.apiV3Key], ['商户证书序列号', manual.serialNo], ['微信支付公钥 ID / 平台证书序列号', manual.platformKeyId]]) merchantField(f.form, label).value = value;
+  f.replies.push({ merchant: f.first }, { items: [f.first, f.second], currentMerchantId: 2 }); await f.form.emit('submit');
+  const writes = f.calls.filter(call => call.method); assert.equal(writes.length, 1);
+  assert.equal(writes[0].method, 'PATCH'); assert.equal(writes[0].path, '/api/v2/rental/admin/merchants/2');
+  assert.deepEqual(JSON.parse(writes[0].body).credentials, { privateKey: privatePem, ...manual, platformPublicKey: platformPem });
+  assert.equal(writes[0].headers['Content-Type'], 'application/json'); assert.equal(writes[0].beforeDispatch, undefined);
+  assert.equal(f.fetches.length, before + 3); assert.equal(f.privateKey.value, ''); assert.equal(f.platformPublicKey.value, '');
+}
+
+// Protocol checks must not dispatch a merchant save after the draft's scope, actor, session or open state changes.
+for (const invalidation of ['merchant', 'actor', 'login', 'close']) {
+  const f = await credentialFixture(), check = deferred(), started = deferred();
+  f.context.fetch = async (path, options = {}) => {
+    if (path.endsWith('/rental/capabilities')) { started.resolve(); await check.promise; return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) }; }
+    f.calls.push({ path, ...options }); return { ok: true, json: async () => ({}) };
+  };
+  const pending = f.form.emit('submit'); await started.promise;
+  if (invalidation === 'merchant') f.spec.selectManagementMerchant(f.second);
+  if (invalidation === 'actor') f.spec.setUser({ id: 11, role: 'root' });
+  if (invalidation === 'login') f.spec.advanceLogin();
+  if (invalidation === 'close') await f.dialog.close();
+  check.resolve(); await pending; assert.equal(f.calls.some(call => call.method), false);
+  assert.equal(f.context.pageLoads, 0); assert.equal(f.document.querySelector('.toast'), null);
+}
+
+// A dispatched save cannot duplicate or refresh/navigate a newly selected merchant when its response arrives late.
+{
+  const f = await credentialFixture(), response = deferred(), started = deferred(), before = f.calls.length;
+  f.context.fetch = async (path, options = {}) => {
+    if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) };
+    f.calls.push({ path, ...options }); started.resolve(); await response.promise; return { ok: true, json: async () => ({ merchant: f.first }) };
+  };
+  const pending = f.form.emit('submit'); await started.promise; await f.form.emit('submit');
+  f.spec.selectManagementMerchant(f.second); f.spec.setPage('venues'); f.context.location.hash = '#venues';
+  response.resolve(); await pending;
+  assert.equal(f.calls.length, before + 1); assert.equal(f.calls[before].method, 'PATCH');
+  assert.equal(f.spec.managementMerchantId(), 3); assert.equal(f.spec.getPage(), 'venues'); assert.equal(f.context.location.hash, '#venues');
+  assert.equal(f.context.pageLoads, 0); assert.equal(f.document.querySelector('.toast'), null);
+}
+console.log('Local PEM imports, credential-read races and merchant-save context guards verified.');
+
 // Device registration must not bind to a different root selection after the form opens.
 {
   const f = fixture('root'); f.spec.setContext({ id: 2, name: 'Second merchant' }); await f.spec.createDeviceDialog();
@@ -401,10 +747,10 @@ const syntheticVenue = { id: 11, merchantId: 2, name: 'Synthetic venue', address
   assert.equal(f.app.querySelector('h1').textContent, '商户管理'); assert.equal(f.app.querySelectorAll('article').length, 2);
 }
 
-// Staff take their scope from managementMerchant and see only their own merchant parent and venues.
-{
-  const f = fixture('adminer'), own = { id: 2, code: 'own', name: 'Own merchant' }, other = { id: 3, code: 'other', name: 'Other merchant' };
-  f.spec.completeLogin({ user: { id: 10, role: 'adminer', merchantId: 99 }, managementMerchant: own, merchant: { id: 1, name: 'Entry legacy alias' } }, () => true);
+// Both staff roles take their scope from managementMerchant and cannot switch merchants.
+for (const role of ['adminer', 'manager']) {
+  const f = fixture(role), own = { id: 2, code: 'own', name: 'Own merchant' }, other = { id: 3, code: 'other', name: 'Other merchant' };
+  f.spec.completeLogin({ user: { id: 10, role, merchantId: 99 }, managementMerchant: own, merchant: { id: 1, name: 'Entry legacy alias' } }, () => true);
   f.spec.setContext(other, [other]); f.spec.renderMerchantContext();
   assert.equal(f.spec.managementMerchantId(), 2); assert.equal(f.app.querySelector('#merchant-context').querySelector('select'), null);
   assert.match(f.app.querySelector('#merchant-context').textContent, /Own merchant/);
@@ -417,7 +763,9 @@ const syntheticVenue = { id: 11, merchantId: 2, name: 'Synthetic venue', address
   f.context.location.hash = '#venues'; await f.windowEvents.get('hashchange')();
   assert.equal(f.calls.find(call => call.path.endsWith('/admin/venues')).headers['X-Merchant-Id'], '2');
   assert.equal(f.app.querySelector('.breadcrumb').textContent, '我的商户 / Own merchant / 场地');
-  f.spec.venueDialog(); assert.match(f.document.querySelector('dialog').textContent, /所属商户：Own merchant（own \/ ID 2）/);
+  f.spec.venueDialog();
+  if (role === 'adminer') assert.match(f.document.querySelector('dialog').textContent, /所属商户：Own merchant（own \/ ID 2）/);
+  else { assert.equal(f.document.querySelector('dialog'), null); f.spec.roleDialog({ id: 11, role: 'user' }); assert.equal(f.document.querySelector('dialog'), null); }
   assert.equal(f.calls.some(call => call.path.includes('/rental/admin/merchants')), false);
   assert.equal(f.app.querySelectorAll('button').some(node => node.textContent === '新建商户' || node.textContent === '编辑配置'), false);
 }
@@ -594,3 +942,72 @@ console.log('Transfer venue scope, unavailable targets and delayed target respon
   const adminer = fixture('adminer'); assert.equal(adminer.spec.renderToolbar('users', { total: 0 }).querySelector('select'), null);
 }
 console.log('Protocol gating, complete payment-credential recovery and employee/platform scopes verified.');
+
+const qrDevice = { id: 7, uuid: 'camera%2F+01', name: '<img src=x onerror=alert(1)>', type: 'Rokid Studio2', merchantId: 2, merchantName: 'Synthetic merchant', venueName: 'Synthetic venue' };
+const qrReply = () => ({ device: { ...qrDevice }, url: 'https://d.4mr.cn/d?i=camera%252F%2B01&t=rs2', qr: { size: 21, modules: '1' + '0'.repeat(440) } });
+const qrButton = (dialog, label) => dialog.querySelectorAll('button').find(node => node.textContent === label);
+function qrFixture(role = 'root') {
+  const f = fixture(role);
+  f.spec.setUser({ id: 10, role, merchantId: role === 'root' ? null : 2 });
+  f.spec.setContext({ id: 2, name: 'Synthetic merchant' });
+  return f;
+}
+
+// Every device-management role can request a persisted device's code in its current scope.
+for (const role of ['manager', 'adminer', 'root']) {
+  const f = qrFixture(role);
+  f.replies.push(qrReply());
+  const row = f.spec.deviceRow({ device: qrDevice, pricing: {} });
+  const trigger = row.querySelectorAll('button').find(node => node.textContent === '二维码');
+  assert.ok(trigger, 'Missing device QR action for ' + role);
+  await trigger.emit('click');
+  const request = f.calls.find(call => call.path.endsWith('/devices/7/qrcode'));
+  assert.ok(request); assert.equal(request.method, undefined); assert.equal(request.headers['X-Merchant-Id'], '2'); assert.equal(request.credentials, 'same-origin');
+  assert.equal(f.calls.some(call => call.method), false);
+  const dialog = f.document.querySelector('.device-qr-dialog'), label = dialog.querySelector('.device-qr-label');
+  assert.match(label.textContent, /微信扫一扫租赁/); assert.ok(label.textContent.includes(qrDevice.uuid)); assert.ok(label.textContent.includes(qrDevice.name));
+  assert.equal(label.querySelector('img'), null); assert.equal(label.querySelector('script'), null);
+  assert.equal(label.querySelector('svg').namespaceURI, 'http://www.w3.org/2000/svg');
+  for (const label of ['打印标签', '下载 PNG', '下载 SVG']) assert.equal(qrButton(dialog, label).disabled, false);
+  await qrButton(dialog, '打印标签').emit('click'); assert.equal(f.context.window.printCalls, 1);
+  assert.equal(dialog.classList.contains('device-qr-print-target'), true); assert.ok(f.document.title.includes(qrDevice.uuid));
+  f.windowEvents.get('afterprint')(); assert.equal(dialog.classList.contains('device-qr-print-target'), false); assert.equal(f.document.title, '');
+}
+
+// Loading or a failed QR response cannot produce a printable placeholder; retry uses the same device.
+{
+  const f = qrFixture(), response = deferred();
+  f.context.fetch = async () => response.promise;
+  const pending = f.spec.deviceQrDialog({ device: qrDevice });
+  const dialog = f.document.querySelector('.device-qr-dialog');
+  for (const label of ['打印标签', '下载 PNG', '下载 SVG']) assert.equal(qrButton(dialog, label).disabled, true);
+  response.resolve({ ok: false, status: 503, json: async () => ({ message: 'Synthetic QR failure' }) }); await pending;
+  assert.match(dialog.textContent, /Synthetic QR failure/); assert.equal(dialog.querySelector('.device-qr-code'), null);
+  for (const label of ['打印标签', '下载 PNG', '下载 SVG']) assert.equal(qrButton(dialog, label).disabled, true);
+  f.context.fetch = async (path, options = {}) => { f.calls.push({ path, ...options }); return { ok: true, json: async () => qrReply() }; };
+  const retry = dialog.querySelectorAll('button').find(node => /重试|重新生成/.test(node.textContent)); assert.ok(retry); await retry.emit('click');
+  assert.equal(f.calls.at(-1).path, '/api/v2/rental/admin/devices/7/qrcode'); assert.ok(dialog.querySelector('.device-qr-code')); assert.equal(qrButton(dialog, '打印标签').disabled, false);
+}
+
+// A late response cannot populate a closed dialog or revive a different merchant's QR preview.
+for (const changeScope of [false, true]) {
+  const f = qrFixture(), response = deferred();
+  f.context.fetch = async () => response.promise;
+  const pending = f.spec.deviceQrDialog({ device: qrDevice });
+  const dialog = f.document.querySelector('.device-qr-dialog');
+  if (changeScope) f.spec.setContext({ id: 3, name: 'Other merchant' });
+  else await dialog.close();
+  response.resolve({ ok: true, json: async () => qrReply() }); await pending;
+  assert.equal(dialog.querySelector('.device-qr-code'), null);
+  assert.equal(qrButton(dialog, '打印标签').disabled, true);
+}
+
+// A mismatched device or broken response must never become a printable code for the selected row.
+for (const corrupt of [reply => { reply.device.id = 8; }, reply => { reply.url = 'https://d.4mr.cn/d?i=other-device&t=rs2'; }, reply => { reply.qr.modules = '1'; }]) {
+  const f = qrFixture(), reply = qrReply(); corrupt(reply); f.replies.push(reply);
+  await f.spec.deviceQrDialog({ device: qrDevice });
+  const dialog = f.document.querySelector('.device-qr-dialog');
+  assert.equal(dialog.querySelector('.device-qr-code'), null); assert.equal(qrButton(dialog, '打印标签').disabled, true);
+  await qrButton(dialog, '打印标签').emit('click'); assert.equal(f.context.window.printCalls, 0);
+}
+console.log('Device QR scope, safe labels, print readiness, retry and delayed-response isolation verified.');

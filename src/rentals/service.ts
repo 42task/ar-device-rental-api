@@ -2,17 +2,18 @@ import { randomBytes } from 'node:crypto';
 import type { Context, Row, Services } from '../core/contracts';
 import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
-import { hasDeviceManagement, requireManager } from '../core/roles';
+import { hasDeviceManagement, requireManager, requireRoot } from '../core/roles';
 import { DeviceService, deviceUuid } from '../devices/service';
 import { rentalOrderNumber, rentalRefundNumber } from './numbers';
 import type { RentalOptions, RentalPrincipal } from './types';
 import { currentMerchant, entryMerchant, withMerchant } from '../merchants/context';
 import type { WeChatClient } from '../payments/wechat';
 import { publicVenue } from '../venues';
-import { loadAccountPermissions } from '../auth/identity';
+import { legacyAccountAdapter, loadAccountPermissions } from '../auth/identity';
 import { refundStatusAfterObservation } from './refund-state';
 import { quoteForDevice, rentalCents as cents, venueForDevice } from './quotes';
 import { readDevicePage } from './device-queries';
+import { deviceQr } from '../devices/qr';
 
 const iso = (value: unknown): string | null => value === null || value === undefined ? null : new Date(Number(value)).toISOString();
 const id = (value: unknown): number => {
@@ -110,19 +111,24 @@ export class RentalService {
     const user = row ? await loadAccountPermissions(db, row) : null;
     if (!user || Number(user.auth_version) !== Number(principal.authVersion ?? principal.user.auth_version)) throw new ApiError(403, '用户归属已变更，请重新登录');
   }
-  private async currentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<boolean> {
-    if (!manager(principal)) return false;
+  private async currentManagerUser(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<Row | null> {
+    if (!manager(principal)) return null;
     const merchant = currentMerchant();
     const row = merchant
       ? await db.one('SELECT id,role,merchant_id,auth_version FROM ar_user WHERE id=?' + (lock ? ' FOR UPDATE' : ''), [principal.user.id])
       : await db.one('SELECT id,role FROM ar_user WHERE id = ? AND appid = ?' + (lock ? ' FOR UPDATE' : ''), [principal.user.id, principal.appid]);
     const current = row ? await loadAccountPermissions(db, row) : null;
-    return !!current && hasDeviceManagement(current) && (!merchant || Number(current.auth_version) === Number(principal.authVersion ?? principal.user.auth_version)
-      && (current.role === 'root' || Number(current.merchant_id) === merchant.id));
+    return current && hasDeviceManagement(current) && (!merchant || Number(current.auth_version) === Number(principal.authVersion ?? principal.user.auth_version)
+      && (current.role === 'root' || Number(current.merchant_id) === merchant.id)) ? current : null;
   }
-  private async requireCurrentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<void> {
+  private async currentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<boolean> {
+    return !!await this.currentManagerUser(principal, db, lock);
+  }
+  private async requireCurrentManager(principal: RentalPrincipal, db = this.services.db, lock = false): Promise<Row> {
     requireManager(principal.user);
-    if (!await this.currentManager(principal, db, lock)) throw new ApiError(403, '管理员权限已变更，请重新登录');
+    const current = await this.currentManagerUser(principal, db, lock);
+    if (!current) throw new ApiError(403, '管理员权限已变更，请重新登录');
+    return current;
   }
   private refundActions(row: Row | null, canManage: boolean): Row {
     const unsettled = !!row?.out_refund_no && row.refund_status !== 'SUCCESS';
@@ -156,7 +162,7 @@ export class RentalService {
   }
   private displayDevice(device: Row): Row {
     const merchant = currentMerchant();
-    return { ...DeviceService.display(device), ...(device.merchant_id === undefined ? {} : { merchantId: Number(device.merchant_id), merchantName: Number(device.merchant_id) === merchant?.id ? merchant.name : undefined }) };
+    return { ...DeviceService.display(device), ...(device.merchant_id === undefined ? {} : { merchantId: Number(device.merchant_id), merchantName: device.merchant_name ?? (Number(device.merchant_id) === merchant?.id ? merchant.name : undefined) }) };
   }
   async context(principal: RentalPrincipal, uuid: unknown): Promise<Row> {
     return this.withDeviceMerchant(principal, 'uuid', uuid, false, () => this.contextInMerchant(principal, uuid));
@@ -541,12 +547,46 @@ export class RentalService {
     return this.context(principal, device.uuid);
   }
   async devices(principal: RentalPrincipal, query: Row): Promise<Row> {
-    this.assertPrincipal(principal); await this.requireCurrentManager(principal);
+    this.assertPrincipal(principal);
+    if (query.scope !== undefined && !['merchant', 'all'].includes(query.scope)) throw new ApiError(422, '设备查询范围无效');
+    const merchant = currentMerchant(), allMerchants = query.scope === 'all';
+    let current: Row;
+    if (allMerchants) {
+      requireRoot(principal.user);
+      if (!merchant && !legacyAccountAdapter(principal.user)) throw new ApiError(503, '缺少商户管理范围');
+      // A stale or forged root principal must never expand a manager's scope.
+      const actor = merchant
+        ? await this.services.db.one('SELECT id,role,merchant_id,auth_version FROM ar_user WHERE id=?', [principal.user.id])
+        : await this.services.db.one('SELECT id,role FROM ar_user WHERE id=? AND appid=?', [principal.user.id, principal.appid]);
+      if (!actor || actor.role !== 'root' || merchant && Number(actor.auth_version) !== Number(principal.authVersion ?? principal.user.auth_version)) {
+        throw new ApiError(403, '平台管理员权限已变更，请重新登录');
+      }
+      current = actor;
+    } else current = await this.requireCurrentManager(principal);
+    if (allMerchants && query.venueId !== undefined) throw new ApiError(422, '全部商户范围不能同时指定景点');
+    if (current.role === 'manager' && query.venueId === undefined) throw new ApiError(422, '请先选择当前商户下的景点');
+    let venueId: number | undefined;
+    if (query.venueId !== undefined) {
+      try { venueId = id(query.venueId); }
+      catch { throw new ApiError(422, '景点编号无效，请重新选择景点'); }
+      if (!merchant && !legacyAccountAdapter(current)) throw new ApiError(503, '缺少商户管理范围');
+      const venue = await this.services.db.one('SELECT id,merchant_id FROM ar_venue WHERE id=?', [venueId]);
+      if (!venue || merchant && Number(venue.merchant_id) !== merchant.id) throw new ApiError(404, '所选景点不属于当前商户或已不可用');
+    }
     const { page, pageSize } = pagination(query);
     const search = typeof query.search === 'string' ? query.search.trim().slice(0, 100) : '';
-    const merchant = currentMerchant();
-    const result = await readDevicePage(this.services.db, { merchantId: merchant?.id, search, page, pageSize });
+    const result = await readDevicePage(this.services.db, { merchantId: allMerchants ? undefined : merchant?.id, venueId,
+      allMerchants: allMerchants && !!merchant, search, page, pageSize });
     return { items: result.items.map(item => ({ device: this.displayDevice(item.device), venue: publicVenue(item.venue), pricing: item.pricing, state: item.state })), page, pageSize, total: result.total };
+  }
+  async deviceQrcode(principal: RentalPrincipal, deviceId: unknown): Promise<Row> {
+    this.assertPrincipal(principal); await this.requireCurrentManager(principal);
+    const merchant = currentMerchant();
+    const device = await this.services.db.one(`SELECT d.*,v.name AS venue_name FROM ar_device d
+      LEFT JOIN ar_venue v ON v.id=d.venue_id AND v.merchant_id=d.merchant_id
+      WHERE d.id=?` + (merchant ? ' AND d.merchant_id=?' : ''), [id(deviceId), ...(merchant ? [merchant.id] : [])]);
+    if (!device) throw new ApiError(404, '设备不存在');
+    return { device: this.displayDevice(device), ...deviceQr(device.uuid, device.device_type, merchant?.origin) };
   }
   async paymentNotification(ctx: Context): Promise<Row> {
     const { notice, client, configId } = await this.notification(ctx);
