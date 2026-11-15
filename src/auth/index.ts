@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import jwt, { type JwtPayload } from 'jsonwebtoken';
 import type { Context, Row } from '../core/contracts';
@@ -59,10 +59,10 @@ export class RentalAuth {
     const make = (purpose: 'access' | 'refresh', seconds: number) => jwt.sign({ uid: Number(user.id), appid: this.appId, ...(entryMerchant() ? { iid: Number(user.identity_id), auth_version: Number(user.auth_version ?? 0) } : {}), purpose, iat: now, nbf: now, exp: now + seconds }, this.jwtSecret!, { algorithm: 'HS256', issuer: this.issuer, audience: this.audience, jwtid: randomBytes(16).toString('hex') });
     return { accessToken: make('access', accessSeconds), refreshToken: make('refresh', 2592000), expires: new Date((now + accessSeconds) * 1000).toISOString() };
   }
-  private async response(user: Row, assigned = false): Promise<Row> {
+  private async response(user: Row): Promise<Row> {
     const entry = entryMerchant();
     const managementMerchant = entry && userRole(user) !== 'root' && user.merchant_id != null ? await this.managementMerchant(user.merchant_id) : null;
-    const merchant = managementMerchant ?? (assigned && user.binding_merchant ? user.binding_merchant : publicMerchant());
+    const merchant = managementMerchant ?? publicMerchant();
     return { token: this.issue(user), user: publicUser(user), openid: user.openid, unionid: user.unionid ?? null, appId: this.appId,
       ...(entry ? { entry: this.publicEntry(), managementMerchant, merchant } : {}) };
   }
@@ -114,11 +114,11 @@ export class RentalAuth {
   }
   async login(code: unknown, bindToken?: unknown): Promise<Row> {
     this.configured();
+    if (bindToken !== undefined) throw new ApiError(422, '商户分配确认已停用，请由最高管理员直接分配商户与身份');
     if (typeof code !== 'string' || !code.trim() || Buffer.byteLength(code) > 1024) throw new ApiError(400, '微信登录 code 无效');
     const identity = await this.client.codeSession(code);
     if (!validIdentity(identity.openid) || identity.unionid !== undefined && identity.unionid !== null && !validIdentity(identity.unionid)) throw new ApiError(401, '微信登录身份无效');
-    if (entryMerchant()) return this.merchantLogin(identity, bindToken);
-    if (bindToken !== undefined) throw new ApiError(422, '当前登录入口不支持商户绑定');
+    if (entryMerchant()) return this.merchantLogin(identity);
     let user: Row | undefined;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -145,14 +145,12 @@ export class RentalAuth {
     if (this.rootPhone) user = await initializeRootFromVerifiedPhone(this.db, user, this.appId, this.rootPhone);
     return this.response(user);
   }
-  private async merchantLogin(identity: Row, bindToken?: unknown): Promise<Row> {
+  private async merchantLogin(identity: Row): Promise<Row> {
     const entry = entryMerchant()!;
-    if (bindToken !== undefined && (typeof bindToken !== 'string' || !/^[a-f0-9]{64}$/.test(bindToken))) throw new ApiError(422, '商户绑定凭据无效');
     let user: Row | undefined;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         user = await this.db.transaction(async tx => {
-          if (typeof bindToken === 'string') return this.completeMerchantBinding(tx, bindToken, identity);
           const linked = await tx.one('SELECT * FROM ar_user_wechat_identity WHERE appid=? AND openid=? FOR UPDATE', [entry.appId, identity.openid]);
           let account: Row | null;
           if (linked) {
@@ -184,7 +182,7 @@ export class RentalAuth {
     }
     if (!user) throw new ApiError(503, '微信登录暂时不可用');
     if (this.rootPhone && this.legacyEntryMerchantId === 1) user = await initializeRootFromVerifiedPhone(this.db, user, entry.appId, this.rootPhone);
-    return this.response(user, typeof bindToken === 'string');
+    return this.response(user);
   }
   private async assertUserTransferable(db: Database, userId: number): Promise<void> {
     const unfinished = await db.one(`SELECT id FROM ar_rental_order WHERE user_id=? AND
@@ -204,99 +202,42 @@ export class RentalAuth {
       else await db.insert('ar_merchant_membership', { user_id: userId, merchant_id: merchantId, role, status: 'active', authorization_version: 1, updated_ms: now });
     } else if (existing) await db.execute("UPDATE ar_merchant_membership SET status='revoked',authorization_version=authorization_version+1,updated_ms=? WHERE user_id=?", [now, userId]);
   }
-  private validInvitation(request: Row | null, now: number): request is Row {
-    return !!request && Number(request.expires_ms) > now && request.consumed_ms == null
-      && Number.isSafeInteger(request.source_auth_version) && request.source_auth_version >= 0 && /^wx[0-9a-f]{16}$/i.test(request.source_appid || '');
-  }
-  private async completeMerchantBinding(db: Database, token: string, identity: Row): Promise<Row> {
-    const entry = entryMerchant()!, now = this.now();
-    if (!await db.one('SELECT id FROM ar_admin_guard WHERE id=1 FOR UPDATE')) throw new ApiError(503, '请先初始化数据库');
-    const request = await db.one('SELECT * FROM ar_user_merchant_binding WHERE id=? FOR UPDATE', [createHash('sha256').update(token).digest('hex')]);
-    if (!this.validInvitation(request, now)) throw new ApiError(409, '商户绑定凭据已失效，请联系最高管理员重新分配');
-    if (!Number(request.source_confirmed_ms)) throw new ApiError(403, '请先使用原账号在原商户小程序确认分配');
-    const actor = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [request.created_by]);
-    if (!actor) throw new ApiError(403, '分配授权已失效');
-    requireRoot(actor);
-    const rawUser = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [request.user_id]);
-    const user = rawUser ? await loadAccountPermissions(db, rawUser) : null;
-    if (!user || userRole(user) === 'root' || (user.merchant_id ?? null) !== (request.source_merchant_id ?? null)
-      || Number(user.auth_version) !== request.source_auth_version) throw new ApiError(409, '账号归属或授权已变化，请联系最高管理员重新分配');
-    if (!['user', 'manager', 'adminer'].includes(request.target_role)) throw new ApiError(409, '商户绑定授权无效');
-    const merchant = await db.one('SELECT * FROM ar_merchant WHERE id=? FOR UPDATE', [request.target_merchant_id]);
-    if (!merchant) throw new ApiError(409, '目标商户配置已变化，请重新登录');
-    if (merchant.app_id !== entry.appId) throw new ApiError(403, '请在目标商户的小程序完成绑定');
-    if (merchant.status !== 'active') throw new ApiError(403, '目标商户暂未开放服务');
-    const linked = await db.one('SELECT * FROM ar_user_wechat_identity WHERE appid=? AND openid=? FOR UPDATE', [entry.appId, identity.openid]);
-    const legacy = await db.one('SELECT id FROM ar_user WHERE appid=? AND openid=? FOR UPDATE', [entry.appId, identity.openid]);
-    if (linked && Number(linked.user_id) !== Number(user.id) || legacy && Number(legacy.id) !== Number(user.id)) throw new ApiError(409, '目标微信身份已绑定其他账号，不能自动合并');
-    if (request.source_appid === entry.appId && (!linked || Number(linked.user_id) !== Number(user.id))) throw new ApiError(403, '请由原微信账号本人完成员工授权');
-    await this.assertUserTransferable(db, Number(user.id));
-    await db.execute("UPDATE ar_user_wechat_identity SET status='disabled' WHERE user_id=?", [user.id]);
-    if (linked) await db.execute("UPDATE ar_user_wechat_identity SET status='active',unionid=? WHERE id=?", [identity.unionid ?? linked.unionid ?? null, linked.id]);
-    else await db.insert('ar_user_wechat_identity', { user_id: user.id, appid: entry.appId, openid: identity.openid, unionid: identity.unionid ?? null, status: 'active' });
-    await this.membership(db, Number(user.id), Number(merchant.id), request.target_role, now);
-    await db.execute('UPDATE ar_user SET merchant_id=?,role=?,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP(3) WHERE id=?', [['manager', 'adminer'].includes(request.target_role) ? merchant.id : null, request.target_role, user.id]);
-    await this.invalidateAuthorizations(db, Number(user.id), now);
-    await db.execute('UPDATE ar_user_merchant_binding SET consumed_ms=? WHERE id=?', [now, request.id]);
-    await db.execute('UPDATE ar_user_merchant_binding SET expires_ms=? WHERE user_id=? AND id<>? AND consumed_ms IS NULL', [now, user.id, request.id]);
-    const reason = String(request.reason || '最高管理员分配商户').slice(0, 255);
-    await db.insert('ar_role_audit', { actor_user_id: actor.id, target_user_id: user.id, previous_role: user.role, next_role: request.target_role, source: 'merchant-transfer', reason, merchant_id: merchant.id });
-    await db.insert('ar_merchant_audit', { actor_user_id: actor.id, merchant_id: merchant.id, previous_merchant_id: request.source_merchant_id, target_id: user.id, action: 'USER_TRANSFERRED', reason, created_ms: now });
-    const resolved = await findIdentityUser(db, Number(user.id), entry.appId);
-    if (!resolved) throw new ApiError(409, '商户绑定未完成，请重试');
-    requireAccountScope(resolved);
-    return { ...resolved, binding_merchant: { id: Number(merchant.id), code: merchant.code, name: merchant.name, status: merchant.status, origin: merchant.origin, appId: merchant.app_id, configId: Number(merchant.active_config_id) } };
-  }
   private async assignMerchant(ctx: Context): Promise<Row> {
     if (!entryMerchant()) throw new ApiError(503, '请通过商户管理入口操作');
     const principal = await this.authenticate(ctx); requireRoot(principal.user);
     const userId = Number(ctx.params.id), merchantId = Number(ctx.body.merchantId), role = ctx.body.role;
     const reason = typeof ctx.body.reason === 'string' ? ctx.body.reason.trim().slice(0, 255) : '';
     if (!Number.isSafeInteger(userId) || userId < 1 || !Number.isSafeInteger(merchantId) || merchantId < 1 || !['user', 'manager', 'adminer'].includes(role) || !reason) throw new ApiError(422, '请选择账号、目标商户和身份，并填写分配原因');
-    const token = randomBytes(32).toString('hex'), now = this.now(), expires = now + 30 * 60_000;
     return this.db.transaction(async db => {
       if (!await db.one('SELECT id FROM ar_admin_guard WHERE id=1 FOR UPDATE')) throw new ApiError(503, '请先初始化数据库');
       const actor = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [principal.user.id]);
       if (!actor) throw new ApiError(403, '最高管理员身份已失效');
       requireRoot(actor);
+      if (Number(actor.auth_version ?? 0) !== principal.authVersion) throw new ApiError(401, '账号授权已变更，请重新登录');
       const rawUser = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [userId]);
       const user = rawUser ? await loadAccountPermissions(db, rawUser) : null;
       if (!user) throw new ApiError(404, '用户不存在');
       if (userRole(user) === 'root' || Number(user.id) === Number(actor.id)) throw new ApiError(403, '不能分配最高管理员或当前账号');
       const merchant = await db.one('SELECT * FROM ar_merchant WHERE id=? FOR UPDATE', [merchantId]);
-      if (!merchant || merchant.status !== 'active') throw new ApiError(422, '目标商户不存在或尚未开放服务');
-      if (Number(user.merchant_id) === merchantId) throw new ApiError(409, '该账号已属于目标商户，请直接管理身份');
-      const sourceIdentity = await db.one("SELECT * FROM ar_user_wechat_identity WHERE user_id=? AND status='active' ORDER BY id DESC LIMIT 1", [userId]);
-      if (!sourceIdentity) throw new ApiError(409, '请该用户先使用原微信身份登录');
-      await this.assertUserTransferable(db, userId);
-      await db.execute('UPDATE ar_user_merchant_binding SET expires_ms=? WHERE user_id=? AND consumed_ms IS NULL', [now, userId]);
-      await db.insert('ar_user_merchant_binding', { id: createHash('sha256').update(token).digest('hex'), user_id: userId, source_merchant_id: user.merchant_id, source_appid: sourceIdentity.appid, source_auth_version: Number(user.auth_version ?? 0), target_merchant_id: merchantId, target_role: role, created_by: actor.id, reason, created_ms: now, expires_ms: expires, consumed_ms: null });
-      return { user: publicUser(user), binding: { token, merchantId, appId: merchant.app_id, origin: merchant.origin, expiresAt: new Date(expires).toISOString() } };
-    });
-  }
-  private async confirmMerchantBinding(ctx: Context): Promise<Row> {
-    const entry = entryMerchant();
-    if (!entry) throw new ApiError(503, '请通过原商户小程序确认分配');
-    const principal = await this.authenticateBearer(ctx), token = ctx.body.bindToken;
-    if (userRole(principal.user) === 'root') throw new ApiError(403, '请由被分配账号本人在原商户小程序确认');
-    if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new ApiError(422, '商户绑定凭据无效');
-    return this.db.transaction(async db => {
-      if (!await db.one('SELECT id FROM ar_admin_guard WHERE id=1 FOR UPDATE')) throw new ApiError(503, '请先初始化数据库');
-      const request = await db.one('SELECT * FROM ar_user_merchant_binding WHERE id=? FOR UPDATE', [createHash('sha256').update(token).digest('hex')]);
+      if (!merchant) throw new ApiError(422, '目标商户不存在');
+      const assignedMerchant = role === 'user' ? null : merchantId;
+      if (assignedMerchant !== null && !await db.one("SELECT id FROM ar_user_wechat_identity WHERE user_id=? AND appid=? AND status='active'", [userId, merchant.app_id])) throw new ApiError(409, '该账号尚无目标小程序的已验证微信身份，请选择已在该小程序登录的账号');
+      const result = (updated: Row): Row => ({ user: publicUser(updated), merchant: {
+        id: Number(merchant.id), code: merchant.code, name: merchant.name, status: merchant.status, origin: merchant.origin, appId: merchant.app_id,
+        ...(merchant.active_config_id ? { configId: Number(merchant.active_config_id) } : {}),
+      } });
+      if (userRole(user) === role && (user.merchant_id ?? null) === assignedMerchant) return result(user);
+      if (role !== 'user' && merchant.status !== 'active') throw new ApiError(422, '目标商户尚未开放服务');
+      // The user lock serializes rental creation. A non-locking order read avoids
+      // reversing the order -> user lock sequence used by return/refund handling.
+      if (user.merchant_id != null && assignedMerchant !== null && user.merchant_id !== assignedMerchant) await this.assertUserTransferable(db, userId);
       const now = this.now();
-      if (!this.validInvitation(request, now)) throw new ApiError(409, '商户绑定凭据已失效，请联系最高管理员重新分配');
-      if (Number(request.user_id) !== Number(principal.user.id)) throw new ApiError(403, '请由被分配账号本人在原商户小程序确认');
-      const user = await findIdentityUser(db, Number(principal.user.id), entry.appId, principal.identityId, true);
-      if (!user || Number(user.auth_version ?? 0) !== principal.authVersion) throw new ApiError(401, '原账号归属已变更，请重新登录');
-      requireAccountScope(user);
-      if (userRole(user) === 'root' || (user.merchant_id ?? null) !== (request.source_merchant_id ?? null)
-        || Number(user.auth_version) !== request.source_auth_version) throw new ApiError(403, '原账号已无法确认该分配');
-      if (request.source_appid !== entry.appId) throw new ApiError(403, '请在原账号的小程序确认分配');
-      await this.assertUserTransferable(db, Number(user.id));
-      const target = await db.one('SELECT * FROM ar_merchant WHERE id=?', [request.target_merchant_id]);
-      if (!target || target.status !== 'active') throw new ApiError(409, '目标商户暂未开放服务');
-      if (!Number(request.source_confirmed_ms)) await db.execute('UPDATE ar_user_merchant_binding SET source_confirmed_ms=? WHERE id=?', [now, request.id]);
-      return { binding: { merchantId: Number(target.id), appId: target.app_id, origin: target.origin, expiresAt: new Date(Number(request.expires_ms)).toISOString() } };
+      await this.membership(db, userId, merchantId, role, now);
+      await db.execute('UPDATE ar_user SET merchant_id=?,role=?,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP(3) WHERE id=?', [assignedMerchant, role, userId]);
+      await this.invalidateAuthorizations(db, userId, now);
+      await db.insert('ar_role_audit', { actor_user_id: actor.id, target_user_id: userId, previous_role: user.role, next_role: role, source: 'merchant-transfer', reason, merchant_id: merchantId });
+      await db.insert('ar_merchant_audit', { actor_user_id: actor.id, merchant_id: merchantId, previous_merchant_id: user.merchant_id, target_id: userId, action: 'USER_TRANSFERRED', reason, created_ms: now });
+      return result({ ...user, role, merchant_id: assignedMerchant });
     });
   }
   async refresh(value: unknown): Promise<Row> { return this.response(await this.verify(value, 'refresh')); }
@@ -355,10 +296,10 @@ export class RentalAuth {
       const raw = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [targetId]);
       if (!raw) throw new ApiError(404, '用户不存在');
       const target = await loadAccountPermissions(db, raw);
-      if (target.merchant_id != null && Number(target.merchant_id) !== merchant.id) throw new ApiError(409, '该员工属于其他商户，请先签发商户分配并由本人确认');
+      if (target.merchant_id != null && Number(target.merchant_id) !== merchant.id) throw new ApiError(409, '该员工属于其他商户，请由最高管理员直接调整商户与身份');
       if (actor.role !== 'root' && target.merchant_id == null) throw new ApiError(403, '只能管理本商户已有员工');
       if (!assignableRoles(actor, target).includes(nextRole)) throw new ApiError(403, '不能修改自身、同级或更高身份，也不能授予超出权限的身份');
-      if (nextRole !== 'user' && target.merchant_id == null && !await db.one("SELECT id FROM ar_user_wechat_identity WHERE user_id=? AND appid=? AND status='active'", [targetId, merchant.appId])) throw new ApiError(409, '请通过目标小程序的商户分配确认身份');
+      if (nextRole !== 'user' && target.merchant_id == null && !await db.one("SELECT id FROM ar_user_wechat_identity WHERE user_id=? AND appid=? AND status='active'", [targetId, merchant.appId])) throw new ApiError(409, '该账号尚无目标小程序的已验证微信身份，请选择已在该小程序登录的账号');
       if (target.role === nextRole && nextRole !== 'user') return { ...publicUser(target), allowedRoles: assignableRoles(actor, target) };
       const now = this.now();
       await this.membership(db, targetId, merchant.id, nextRole, now);
@@ -418,7 +359,7 @@ export class RentalAuth {
     const route = (method: string, path: string, handler: (ctx: Context) => Promise<Row>) => router.add(method, path, ctx => { ctx.res.setHeader('Cache-Control', 'no-store'); return handler(ctx); });
     route('POST', '/v2/rental/auth/login', async ctx => ({ success: true, data: await this.login(ctx.body.code, ctx.body.bindToken) }));
     route('POST', '/v2/rental/auth/refresh', async ctx => ({ success: true, data: await this.refresh(ctx.body.refreshToken) }));
-    route('POST', '/v2/rental/auth/merchant-binding/confirm', ctx => this.confirmMerchantBinding(ctx));
+    route('POST', '/v2/rental/auth/merchant-binding/confirm', async () => { throw new ApiError(410, '商户分配确认已停用，请由最高管理员直接分配商户与身份'); });
     route('GET', '/v2/rental/admin/users', ctx => this.users(ctx));
     route('PUT', '/v2/rental/admin/users/:id/role', ctx => this.setRole(ctx));
     route('POST', '/v2/rental/admin/users/:id/merchant', ctx => this.assignMerchant(ctx));

@@ -65,7 +65,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       await db?.close(); await admin.query(`DROP DATABASE IF EXISTS ${database}`); await admin.end();
     }
   }, 30_000);
-  it('keeps default identities, isolates another merchant, and binds a transferred account without moving history', async () => {
+  it('isolates independent identities and assigns only verified accounts without moving history', async () => {
     if (!['127.0.0.1', 'localhost'].includes(process.env.MYSQL_HOST || '') || process.env.MYSQL_DATABASE !== 'ar_rental_test') throw Error('Use a dedicated loopback test MySQL instance.');
     const settings = { host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT), user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD };
     const admin = await mysql.createConnection(settings), database = 'ar_merchants_test_' + randomBytes(8).toString('hex');
@@ -92,10 +92,10 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
         platformKeyId: 'PUB_KEY_ID_SYNTHETIC', serialNo: '1234567890ABCDEF' };
       const auth = new RentalAuth(db, client, { jwtSecret: 'synthetic-merchant-test-signing-key-at-least-32-bytes' });
       const { app } = createApplication({ db, client, auth, merchants: registry });
-      const login = async (code: string, host?: string, bindToken?: string) => {
+      const login = async (code: string, host?: string) => {
         let req = request(app).post('/api/v2/rental/auth/login');
         if (host) req = req.set('Host', host);
-        return req.send({ code, ...(bindToken ? { bindToken } : {}) });
+        return req.send({ code });
       };
       const rootLogin = await login('root'); expect(rootLogin.status).toBe(200);
       const rootId = rootLogin.body.data.user.id, rootToken = 'Bearer ' + rootLogin.body.data.token.accessToken;
@@ -156,15 +156,23 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       expect((await request(app).get('/api/v2/rental/merchant').set('Host', 'unregistered.example.com')).status).toBe(404);
       expect((await request(app).get('/api/v2/rental/merchant').set('Host', 'd.4mr.cn').set('X-Forwarded-Host', 'd1.4mr.cn')).body.merchant.id).toBe(1);
       const transfer = await request(app).post(`/api/v2/rental/admin/users/${b.body.data.user.id}/merchant`).set('Authorization', rootToken).send({ merchantId: 1, role: 'manager', reason: '合成账号调拨' });
-      expect(transfer.status).toBe(200);
-      expect((await login('transferred-b', undefined, transfer.body.binding.token)).status).not.toBe(200);
-      const confirmed = await request(app).post('/api/v2/rental/auth/merchant-binding/confirm').set('Host', 'd1.4mr.cn').set('Authorization', bToken).send({ bindToken: transfer.body.binding.token });
-      expect(confirmed.status).toBe(200);
-      const rebound = await login('transferred-b', undefined, transfer.body.binding.token);
-      expect(rebound.status).toBe(200);
-      expect(rebound.body.data.user).toMatchObject({ id: b.body.data.user.id, merchantId: 1 });
+      expect(transfer.status).toBe(409);
+      expect(await db.one('SELECT role,merchant_id,auth_version FROM ar_user WHERE id=?', [b.body.data.user.id])).toEqual({ role: 'user', merchant_id: null, auth_version: 0 });
+      expect(await db.query('SELECT * FROM ar_user_wechat_identity WHERE user_id=? AND appid=?', [b.body.data.user.id, appId])).toHaveLength(0);
+      expect(await db.query('SELECT * FROM ar_user_merchant_binding WHERE user_id=?', [b.body.data.user.id])).toHaveLength(0);
+      expect((await request(app).get('/api/v2/rentals').set('Host', 'd1.4mr.cn').set('Authorization', bToken)).status).toBe(200);
+      const localAssignment = await request(app).post(`/api/v2/rental/admin/users/${b.body.data.user.id}/merchant`).set('Authorization', rootToken).send({ merchantId: secondId, role: 'manager', reason: '指定已验证微信身份所属商户及角色' });
+      expect(localAssignment.status).toBe(200);
+      expect(localAssignment.body).toMatchObject({ user: { id: b.body.data.user.id, merchantId: secondId, role: 'manager' }, merchant: { id: secondId, appId: second.appId } });
+      expect(localAssignment.body).not.toHaveProperty('binding');
       expect((await request(app).get('/api/v2/rentals').set('Host', 'd1.4mr.cn').set('Authorization', bToken)).status).toBe(401);
-      expect((await login('transferred-b', undefined, transfer.body.binding.token)).status).not.toBe(200);
+      const refreshed = await login('user-b', 'd1.4mr.cn');
+      expect(refreshed.status).toBe(200);
+      expect(refreshed.body.data.user).toMatchObject({ id: b.body.data.user.id, merchantId: secondId, role: 'manager' });
+      expect(await db.one('SELECT appid,openid,auth_version FROM ar_user WHERE id=?', [b.body.data.user.id])).toEqual({ appid: second.appId, openid: b.body.data.openid, auth_version: 1 });
+      const legacyToken = 'd'.repeat(64);
+      expect((await request(app).post('/api/v2/rental/auth/merchant-binding/confirm').set('Host', 'd1.4mr.cn').set('Authorization', 'Bearer ' + refreshed.body.data.token.accessToken).send({ bindToken: legacyToken })).status).toBe(410);
+      expect((await request(app).post('/api/v2/rental/auth/login').send({ code: 'transferred-b', bindToken: legacyToken })).status).toBe(422);
       const historical = await db.insert('ar_rental_order', { device_id: secondDevice, device_uuid: 'second-device', device_name: '合成历史设备',
         user_id: b.body.data.user.id, merchant_id: secondId, payment_config_id: replacementAccount.body.merchant.configId,
         appid: second.appId, payer_openid: b.body.data.openid, mch_id: '2000000002', use_fee_cents: 5, deposit_cents: 25,

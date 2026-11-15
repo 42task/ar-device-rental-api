@@ -219,6 +219,7 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: #f5f8fe; }
 .cell-main { color: var(--text); font-size: 14px; font-weight: 500; }
 .cell-sub { margin-top: 5px; max-width: 280px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.order-refund .cell-sub { max-width: none; }
 .device-identity { min-width: 140px; max-width: 300px; }
 .device-identity .cell-main { font-family: var(--mono); user-select: text; white-space: normal; overflow-wrap: anywhere; line-height: 1.7; }
 .device-model { font-size: 14px; }
@@ -271,6 +272,10 @@ dialog::backdrop { background: #10244766; }
 .field { display: grid; gap: 8px; font-size: 14px; font-weight: 500; }
 .field input, .field select, .field textarea { width: 100%; font-weight: 400; }
 .field small { color: var(--muted); font-size: 12px; font-weight: 400; line-height: 1.8; }
+.credential-upload { display: grid; gap: 6px; margin-top: -8px; min-width: 0; }
+.credential-upload input { width: 100%; font-size: 13px; }
+.credential-upload small { color: var(--muted); font-size: 12px; line-height: 1.8; }
+.credential-upload input::file-selector-button { margin-right: 10px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 4px; background: #f2f6ff; color: var(--accent); font: inherit; cursor: pointer; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .checkbox-field { display: flex; align-items: center; gap: 10px; font-size: 14px; line-height: 1.8; }
 .checkbox-field input { width: 18px; height: 18px; min-height: 18px; flex-shrink: 0; accent-color: var(--accent); }
@@ -489,6 +494,36 @@ dialog::backdrop { background: #10244766; }
 .merchant-card dd, .binding-value { overflow-wrap: anywhere; user-select: text; }
 .merchant-actions { display: flex; justify-content: space-between; gap: 12px; padding: 0 24px 24px; }
 .row-actions { white-space: nowrap; }
+.device-qr-dialog { max-width: min(600px, calc(100% - 32px)); }
+.device-qr-dialog .dialog-body { display: grid; gap: 20px; }
+.device-qr-label { width: 300px; max-width: 100%; margin: 0 auto; padding: 20px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: #000; text-align: center; overflow-wrap: anywhere; }
+.device-qr-brand { font-size: 12px; letter-spacing: 2px; }
+.device-qr-heading { margin: 6px 0 10px; font-size: 22px; font-weight: 700; }
+.device-qr-code { display: block; width: 100%; height: auto; aspect-ratio: 1; margin: 0 auto 12px; }
+.device-qr-name { font-size: 18px; font-weight: 650; }
+.device-qr-uuid { margin: 6px 0; font-family: var(--mono); font-size: 12px; user-select: text; }
+.device-qr-model, .device-qr-location { font-size: 13px; }
+.device-qr-location { margin-top: 8px; }
+.device-qr-link { margin: 0; }
+.device-qr-link input { width: 100%; min-width: 0; font-family: var(--mono); font-size: 12px; }
+.device-qr-tools { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; }
+@media print {
+  @page { margin: 10mm; }
+  :root { background: #fff; }
+  body.printing-device-qr { min-width: 0; background: #fff; }
+  body.printing-device-qr > :not(.device-qr-print-target) { display: none !important; }
+  .device-qr-print-target { position: static !important; display: block !important; width: 100%; max-width: none; max-height: none; margin: 0; padding: 0; border: 0; border-radius: 0; overflow: visible; background: #fff; }
+  .device-qr-print-target::backdrop { display: none; background: transparent; }
+  .device-qr-print-target .dialog-head, .device-qr-print-target .dialog-body > :not(.device-qr-label) { display: none !important; }
+  .device-qr-print-target .dialog-body { display: block; padding: 0; max-height: none; overflow: visible; }
+  .device-qr-print-target .device-qr-label { width: 70mm; max-width: 100%; padding: 5mm; margin: 0 auto; border: 1px dashed #777; border-radius: 0; break-inside: avoid; page-break-inside: avoid; }
+  .device-qr-print-target .device-qr-brand { font-size: 9pt; }
+  .device-qr-print-target .device-qr-heading { margin: 2mm 0; font-size: 16pt; }
+  .device-qr-print-target .device-qr-code { width: 48mm; max-width: 100%; margin-bottom: 3mm; }
+  .device-qr-print-target .device-qr-name { font-size: 13pt; }
+  .device-qr-print-target .device-qr-uuid { font-size: 9pt; }
+  .device-qr-print-target .device-qr-model, .device-qr-print-target .device-qr-location { font-size: 10pt; }
+}
 @media (max-width: 760px) {
   .merchant-context { max-width: 180px; }
   .merchant-context-label { display: none; }

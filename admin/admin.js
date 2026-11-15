@@ -15,7 +15,7 @@ async function requireClientProtocol() {
   if (CLIENT_PROTOCOL < clientCapabilities.minClientProtocol) { const error = new Error('当前后台需要更新，请刷新页面后重试。历史订单仍可查询。'); error.status = 426; error.code = 'CLIENT_UPGRADE_REQUIRED'; throw error; }
 }
 const app = document.querySelector('#app');
-const state = { user: null, merchant: null, managementMerchant: null, merchants: [], merchantId: null, merchantGeneration: 0, merchantRefreshGeneration: 0, page: 'overview', sequence: 0, timer: null, challenge: null, loginGeneration: 0, filters: { devices: { page: 1, search: '' }, orders: { page: 1, search: '', status: '' }, users: { page: 1, search: '', scope: 'employees' } } };
+const state = { user: null, merchant: null, managementMerchant: null, merchants: [], merchantId: null, merchantGeneration: 0, merchantRefreshGeneration: 0, deviceVenue: { scope: '', items: [], selectedId: null }, page: 'overview', sequence: 0, timer: null, challenge: null, loginGeneration: 0, filters: { devices: { page: 1, search: '' }, orders: { page: 1, search: '', status: '' }, users: { page: 1, search: '', scope: 'employees' } } };
 const deviceLabels = { AVAILABLE: ['可租赁', 'green'], RESERVED: ['待支付占用', 'amber'], RENTED: ['租赁中', 'blue'], SETTLING: ['结算中', 'amber'], DISABLED: ['已停租', ''] };
 const orderLabels = { PENDING_PAYMENT: ['待支付', 'amber'], ACTIVE: ['租赁中', 'blue'], ENDED: ['已结束', 'green'], CANCELLED: ['已取消', ''], COMPENSATING: ['补偿退款中', 'amber'] };
 const refundLabels = { PENDING: '待退款', PROCESSING: '退款处理中', SUCCESS: '退款成功', ABNORMAL: '退款异常', CLOSED: '退款关闭' };
@@ -24,7 +24,7 @@ let dialogSequence = 0;
 const pages = { overview: ['运营总览', 'OVERVIEW', '设备与租赁状态，一目了然。'], venues: ['场地', 'VENUES', '场地隶属当前商户，设备按所属场地的租金与押金收费。'], devices: ['设备管理', 'DEVICES', '设备绑定本商户场地，商户归属由场地继承；管理设备租赁开关。'], orders: ['租赁订单', 'RENTALS', '查看当前商户租赁记录及服务端确认的支付、退款状态。'], users: ['权限管理', 'ACCESS', '按当前商户及权限管理用户身份。'], merchants: ['商户管理', 'MERCHANTS', '管理商户资料及收款配置，统一使用平台小程序入口。'] };
 const roles = {
   user: { label: '普通用户', rank: 0, description: '可以租赁设备、查询自己的订单与退款进度，不能管理设备或办理退款。' },
-  manager: { label: '设备管理员', rank: 1, description: '可以管理设备与费用；在小程序确认归还，并选择退押金或全额退款。' },
+  manager: { label: '设备管理员', rank: 1, description: '可在所属商户选择景点并查看该景点设备；在小程序管理设备、确认归还及退款。' },
   adminer: { label: '商户管理员', rank: 2, description: '管理所属商户的设备和业务，可在普通用户与设备管理员之间变更身份；不能修改商户管理员或 ROOT。' },
   root: { label: 'ROOT · 超级管理员', rank: 3, description: '最高管理权限，可将其他非 ROOT 账号设为普通用户、设备管理员或商户管理员。ROOT 身份仅由指定手机号验证确认，此页面不能授予或修改。' },
 };
@@ -43,10 +43,22 @@ function managementMerchant() {
   return listed || (state.merchant?.id === id && (!state.merchants.length || state.user?.role !== 'root') ? state.merchant : null);
 }
 function merchantLabel(merchant) { return (merchant.name || '商户 #' + merchant.id) + '（' + (merchant.code ? merchant.code + ' / ' : '') + 'ID ' + merchant.id + '）'; }
+function deviceContextScope() { return state.user ? [state.user.id, state.user.role, state.user.authVersion ?? state.user.auth_version ?? '', managementMerchantId(), state.loginGeneration, state.merchantGeneration].join(':') : ''; }
+function managerDeviceScope() { return state.user?.role === 'manager' ? deviceContextScope() : ''; }
+function managerDeviceVenue() {
+  return state.deviceVenue.scope === managerDeviceScope() ? state.deviceVenue.items.find(venue => venue.id === state.deviceVenue.selectedId) || null : null;
+}
+function renderManagerVenuePrompt(content) {
+  const card = el('div', 'card'), empty = el('div', 'empty');
+  card.append(renderToolbar('devices', { total: 0 }));
+  append(empty, el('h3', '', state.deviceVenue.items.length ? '请选择当前景点' : '当前商户暂无景点'), el('p', '', state.deviceVenue.items.length ? '选择后仅显示该景点的设备，可随时切换当前商户下的其他景点。' : '请由商户管理员先创建景点，再管理该景点的设备。'));
+  card.append(empty); content.replaceChildren(card);
+}
 function merchantParentTitle() { return state.user?.role === 'root' ? '商户管理' : '我的商户'; }
 function applyManagementSession(session) {
   state.user = session.user;
-  const merchant = Object.hasOwn(session, 'managementMerchant') ? session.managementMerchant : session.merchant;
+  // Root has no staff membership; the session merchant is the entry's default scope.
+  const merchant = session.user.role === 'root' ? session.merchant : Object.hasOwn(session, 'managementMerchant') ? session.managementMerchant : session.merchant;
   state.managementMerchant = session.user.role === 'root' ? null : merchant || null;
   state.merchant = merchant || null; state.merchantId = merchant?.id || null; state.merchantGeneration++;
 }
@@ -320,6 +332,10 @@ async function loadPage() {
   const page = state.page;
   const sequence = ++state.sequence;
   const selectedMerchantId = managementMerchantId();
+  const deviceScope = page === 'devices' ? deviceContextScope() : '';
+  const currentDevices = () => sequence === state.sequence && deviceScope && deviceScope === deviceContextScope();
+  const managerScope = page === 'devices' ? managerDeviceScope() : '';
+  const currentManagerDevices = () => currentDevices() && managerScope && managerScope === managerDeviceScope();
   const main = document.querySelector('#main-content'); if (!main) return;
   for (const link of document.querySelectorAll('.nav a')) {
     link.classList.toggle('active', link.dataset.page === page || link.classList.contains('nav-parent') && page === 'venues');
@@ -343,13 +359,30 @@ async function loadPage() {
       if (sequence === state.sequence && result.merchant && result.merchant.id !== selectedMerchantId) throw new Error('商户范围已变化，请重新选择后加载');
       if (sequence === state.sequence && result.merchant) { state.merchant = result.merchant; state.merchantId = result.merchant.id; renderMerchantContext(); }
       if (sequence === state.sequence && state.user) renderOverview(content, result);
+    } else if (page === 'devices' && managerScope) {
+      if (state.deviceVenue.scope !== managerScope) {
+        state.deviceVenue = { scope: managerScope, items: [], selectedId: null };
+        state.filters.devices.page = 1;
+      }
+      const venues = await api('/rental/admin/venues', { headers: { 'X-Merchant-Id': String(selectedMerchantId) } });
+      if (!currentManagerDevices()) return;
+      if (!Array.isArray(venues.items) || venues.items.some(venue => !Number.isSafeInteger(venue.id) || venue.id < 1 || venue.merchantId !== selectedMerchantId || !['active', 'paused'].includes(venue.status))) throw new Error('景点列表暂时不可用，请重新加载');
+      state.deviceVenue.items = venues.items;
+      if (!managerDeviceVenue()) { state.deviceVenue.selectedId = venues.items.length === 1 ? venues.items[0].id : null; state.filters.devices.page = 1; }
+      const venue = managerDeviceVenue();
+      if (!venue) { renderManagerVenuePrompt(content); return; }
+      const query = new URLSearchParams({ ...state.filters.devices, venueId: String(venue.id), 'per-page': '20' });
+      const result = await api('/rental/admin/devices?' + query, { headers: { 'X-Merchant-Id': String(selectedMerchantId) } });
+      if (!currentManagerDevices() || managerDeviceVenue()?.id !== venue.id) return;
+      if (!Array.isArray(result.items) || result.items.some(item => (item.device?.venueId ?? item.venue?.id) !== venue.id)) throw new Error('设备景点范围已变化，请重新加载');
+      renderList(content, page, result, null);
     } else {
       const filters = state.filters[page]; const query = new URLSearchParams({ ...filters, 'per-page': '20' });
       const [result, snapshot] = await Promise.all([api('/rental/admin/' + page + '?' + query), page === 'devices' ? api('/rental/admin/overview').catch(() => null) : Promise.resolve(null)]);
-      if (sequence === state.sequence && state.user) renderList(content, page, result, snapshot);
+      if (sequence === state.sequence && state.user && (page !== 'devices' || currentDevices())) renderList(content, page, result, snapshot);
     }
   } catch (error) {
-    if (sequence !== state.sequence || !state.user) return;
+    if (sequence !== state.sequence || !state.user || page === 'devices' && !currentDevices()) return;
     const empty = el('div', 'empty card'); append(empty, el('h3', '', '数据暂时无法加载'), el('p', '', error.message), button('重新加载', () => loadPage(), 'secondary')); content.replaceChildren(empty);
   }
 }
@@ -387,6 +420,20 @@ function renderToolbar(page, result) {
   const submit = button('搜索', null, 'secondary'); submit.type = 'submit'; append(form, searchField, submit);
   form.addEventListener('submit', event => { event.preventDefault(); state.filters[page].search = search.value.trim(); state.filters[page].page = 1; loadPage(); });
   bar.append(form);
+  if (page === 'devices' && state.user.role === 'manager') {
+    const scope = managerDeviceScope(), venue = el('select'); venue.setAttribute('aria-label', '选择当前景点');
+    const placeholder = el('option', '', state.deviceVenue.items.length ? '请选择当前景点' : '当前商户暂无景点'); placeholder.value = ''; venue.append(placeholder);
+    for (const value of state.deviceVenue.items) { const option = el('option', '', value.name + (value.status === 'paused' ? '（已暂停）' : '')); option.value = String(value.id); venue.append(option); }
+    venue.value = managerDeviceVenue() ? String(state.deviceVenue.selectedId) : ''; venue.disabled = !state.deviceVenue.items.length;
+    venue.addEventListener('change', async () => {
+      if (!scope || scope !== managerDeviceScope() || state.page !== 'devices') return;
+      const id = Number(venue.value);
+      state.deviceVenue.selectedId = state.deviceVenue.items.some(value => value.id === id) ? id : null;
+      state.filters.devices.page = 1;
+      await loadPage();
+    });
+    bar.append(venue);
+  }
   if (page === 'orders') {
     const select = el('select'); select.setAttribute('aria-label', '筛选订单状态');
     for (const [value, label] of [['', '全部订单状态'], ...Object.entries(orderLabels).map(([value, pair]) => [value, pair[0]])]) {
@@ -400,7 +447,7 @@ function renderToolbar(page, result) {
     for (const [value, label] of [['employees', '本商户员工'], ['platform', '未分配商户的消费者']]) { const option = el('option', '', label); option.value = value; scope.append(option); }
     scope.value = state.filters.users.scope || 'employees'; scope.addEventListener('change', () => { state.filters.users.scope = scope.value; state.filters.users.page = 1; loadPage(); }); bar.append(scope);
   }
-  if (page === 'devices') bar.append(button('登记设备', createDeviceDialog, '', 'plus'));
+  if (page === 'devices') { const create = button('登记设备', createDeviceDialog, '', 'plus'); create.disabled = state.user.role === 'manager' && !managerDeviceVenue(); bar.append(create); }
   else bar.append(el('span', 'muted', '共 ' + Number(result.total || 0) + ' 条记录'));
   return bar;
 }
@@ -430,7 +477,9 @@ function renderList(content, page, result, snapshot) {
     if (page === 'devices' && !state.filters.devices.search) empty.append(button('登记第一台设备', createDeviceDialog, 'secondary'));
     card.append(empty);
   }
-  card.append(pagination(page, result)); content.replaceChildren(...(page === 'devices' ? [deviceSummary(snapshot), card] : [card]));
+  card.append(pagination(page, result));
+  const deviceScope = state.user.role === 'manager' ? el('p', 'notice', '当前景点：' + (managerDeviceVenue()?.name || '未选择') + ' · 本次查询 ' + Number(result.total || 0) + ' 台设备') : deviceSummary(snapshot);
+  content.replaceChildren(...(page === 'devices' ? [deviceScope, card] : [card]));
   if (page === 'orders') content.append(el('p', 'footer-note', '此处仅查看订单。办理归还、退款和异常处理请使用小程序；支付与退款状态以服务端校验为准。'));
   if (page === 'users') content.append(el('p', 'footer-note', (state.user.role === 'root' ? '你可以将其他非 ROOT 账号设为普通用户、设备管理员或商户管理员。' : '你只能在普通用户与设备管理员之间变更身份；同级商户管理员与 ROOT 受保护。') + '当前账号不能修改自己的身份。普通用户无设备管理及退款权限，降级后的后续请求按最新身份校验。'));
 }
@@ -447,14 +496,25 @@ function deviceRow(item) {
   const identity = textCell(device.uuid, device.name && device.name !== device.uuid ? device.name : ''); identity.classList.add('device-identity');
   const status = append(el('td'), badge(item.state, deviceLabels)); if (!pricing.enabled) status.append(el('div', 'cell-sub', '租赁未开放'));
   const actions = el('td', 'row-actions'); actions.append(button('配置', () => configureDialog(item), 'table-action'));
+  actions.append(button('二维码', () => deviceQrDialog(item), 'table-action'));
   if (state.user.role === 'root') actions.append(button('调拨', () => transferDialog('devices', device), 'text-button'));
   append(row, identity, el('td', 'device-model', device.type || '—'), textCell(device.venueName || item.venue?.name || '待绑定场地'), status, el('td', 'numeric', '¥' + money(pricing.useFeeCents)), el('td', 'numeric', '¥' + money(pricing.depositCents)), actions);
   return row;
 }
 function orderRow(order) {
   const row = el('tr');
-  append(row, textCell('#' + order.id + '  ·  ' + (order.deviceName || order.uuid), [order.venueName, order.uuid].filter(Boolean).join(' · ')), append(el('td'), badge(order.status, orderLabels)), textCell('¥' + money(order.totalCents), '租金 ¥' + money(order.useFeeCents) + ' · 押金 ¥' + money(order.depositCents)), el('td', '', refundLabels[order.refundStatus] || '—'), el('td', 'numeric', time(order.createdAt)), append(el('td'), button('详情', () => orderDialog(order.id), 'text-button')));
+  const refund = refundSummary(order);
+  const refundCell = textCell(refund.title, refund.detail); refundCell.className = 'order-refund';
+  append(row, textCell('#' + order.id + '  ·  ' + (order.deviceName || order.uuid), [order.venueName, order.uuid].filter(Boolean).join(' · ')), append(el('td'), badge(order.status, orderLabels)), textCell('¥' + money(order.totalCents), '租金 ¥' + money(order.useFeeCents) + ' · 押金 ¥' + money(order.depositCents)), refundCell, el('td', 'numeric', time(order.createdAt)), append(el('td'), button('详情', () => orderDialog(order.id), 'text-button')));
   return row;
+}
+function refundSummary(order) {
+  const mode = order.refundMode === 'deposit' ? '仅退押金' : order.refundMode === 'full' ? '全额退款' : order.refundStatus ? '退款方式未记录' : '—';
+  const status = order.refundStatus === 'SUCCESS' && order.refundAmountCents === 0 ? '无需退款' : refundLabels[order.refundStatus] || (order.refundStatus ? '退款状态未知' : '—');
+  if (!order.refundStatus) return { mode, status, title: '—', detail: '' };
+  const amount = (status === '无需退款' ? '退款金额 ' : order.refundStatus === 'SUCCESS' ? '已退 ' : '应退 ') + '¥' + money(order.refundAmountCents);
+  const scope = order.refundMode === 'deposit' ? '保留租金 ¥' + money(order.useFeeCents) : order.refundMode === 'full' ? '含租金和押金' : '';
+  return { mode, status, title: mode + ' · ' + status, detail: amount + (scope ? ' · ' + scope : '') };
 }
 function verifiedUserPhone(user) {
   return user.phoneVerified === true && typeof user.phoneNumber === 'string' && /^\+[1-9][0-9]{6,14}$/.test(user.phoneNumber) ? user.phoneNumber : '';
@@ -471,7 +531,6 @@ function userRow(user) {
   const actions = el('td');
   const protectedLabel = user.role === 'root' ? 'ROOT 身份受保护' : String(user.id) === String(state.user.id) ? '当前账号' : user.role === 'adminer' ? '同级身份受保护' : '不可修改';
   actions.append(assignableRoles(state.user, user).length ? button('管理身份', () => roleDialog(user), 'text-button') : el('span', 'muted', protectedLabel));
-  if (state.user.role === 'root' && user.role !== 'root' && String(user.id) !== String(state.user.id)) actions.append(button('分配商户', () => transferDialog('users', user), 'text-button'));
   row.append(actions); return row;
 }
 function dialog(title) {
@@ -479,6 +538,83 @@ function dialog(title) {
   const close = button('关闭', () => node.close(), 'text-button dialog-close', 'x'); close.setAttribute('aria-label', '关闭'); append(head, titleNode, close);
   const body = el('div', 'dialog-body'); append(node, head, body); document.body.append(node); node.addEventListener('close', () => node.remove(), { once: true }); node.showModal();
   return { node, body, close };
+}
+function deviceQrSvg(qr, uuid) {
+  if (!Number.isInteger(qr?.size) || qr.size < 21 || qr.size > 177 || (qr.size - 21) % 4 !== 0
+    || typeof qr.modules !== 'string' || qr.modules.length !== qr.size * qr.size || /[^01]/.test(qr.modules)) throw new Error('二维码响应无效，请重试');
+  const ns = 'http://www.w3.org/2000/svg', extent = qr.size + 8;
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('xmlns', ns); svg.setAttribute('class', 'device-qr-code'); svg.setAttribute('viewBox', '0 0 ' + extent + ' ' + extent);
+  svg.setAttribute('width', '1024'); svg.setAttribute('height', '1024'); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', '设备 ' + uuid + ' 的租赁二维码'); svg.setAttribute('shape-rendering', 'crispEdges');
+  const background = document.createElementNS(ns, 'rect'); background.setAttribute('width', extent); background.setAttribute('height', extent); background.setAttribute('fill', '#fff');
+  const runs = [];
+  for (let y = 0; y < qr.size; y++) for (let x = 0; x < qr.size;) {
+    if (qr.modules[y * qr.size + x] !== '1') { x++; continue; }
+    const start = x; while (x < qr.size && qr.modules[y * qr.size + x] === '1') x++;
+    runs.push('M' + (start + 4) + ' ' + (y + 4) + 'h' + (x - start) + 'v1h-' + (x - start) + 'z');
+  }
+  const path = document.createElementNS(ns, 'path'); path.setAttribute('fill', '#000'); path.setAttribute('d', runs.join(''));
+  return append(svg, background, path);
+}
+function downloadQrFile(blob, filename) {
+  const url = URL.createObjectURL(blob), link = el('a'); link.href = url; link.download = filename;
+  document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+async function deviceQrDialog(item) {
+  const ui = dialog('设备二维码'); ui.node.classList.add('device-qr-dialog');
+  const merchantId = managementMerchantId(), generation = state.merchantGeneration;
+  const current = () => ui.node.open && !!state.user && generation === state.merchantGeneration && merchantId === managementMerchantId();
+  const status = el('p', 'muted', '正在生成设备二维码…'); status.setAttribute('role', 'status');
+  const error = message(''), label = el('section', 'device-qr-label'); label.hidden = true;
+  const linkField = el('label', 'field device-qr-link'); append(linkField, el('span', '', '扫码链接'));
+  const linkInput = el('input'); linkInput.readOnly = true; linkInput.setAttribute('aria-label', '设备扫码链接'); linkField.append(linkInput); linkField.hidden = true;
+  const help = el('p', 'notice device-qr-help', '打印标签后贴在对应设备上，用户用微信扫一扫或小程序扫码进入租赁。打印时保留二维码四周白边，建议使用原始大小。PNG / SVG 为纯二维码，可用于自行排版。');
+  let result = null, svg = null;
+  const fileName = () => 'device-' + result.device.id + '-' + result.device.uuid.replace(/[^\p{L}\p{N}_-]/gu, '_').slice(0, 60);
+  const originalTitle = document.title;
+  const cleanPrint = () => { document.body.classList.remove('printing-device-qr'); ui.node.classList.remove('device-qr-print-target'); document.title = originalTitle; };
+  ui.node.addEventListener('close', cleanPrint, { once: true });
+  const print = button('打印标签', () => {
+    if (!result || !current()) return;
+    document.body.classList.add('printing-device-qr'); ui.node.classList.add('device-qr-print-target'); document.title = '设备标签 · ' + result.device.uuid;
+    window.addEventListener('afterprint', cleanPrint, { once: true });
+    try { window.print(); } catch { cleanPrint(); error.textContent = '无法打开打印，请下载 SVG 后打印'; }
+  });
+  const svgDownload = button('下载 SVG', () => {
+    if (!result || !current()) return;
+    try { downloadQrFile(new Blob([new XMLSerializer().serializeToString(svg)], { type: 'image/svg+xml;charset=utf-8' }), fileName() + '.svg'); }
+    catch { error.textContent = 'SVG 下载失败，请重试'; }
+  }, 'secondary');
+  const pngDownload = button('下载 PNG', () => {
+    if (!result || !current()) return;
+    try {
+      const qr = result.qr, extent = qr.size + 8, scale = Math.ceil(1024 / extent), canvas = el('canvas'); canvas.width = canvas.height = extent * scale;
+      const context = canvas.getContext('2d'); if (!context) throw new Error('Canvas unavailable');
+      context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height); context.fillStyle = '#000';
+      for (let y = 0; y < qr.size; y++) for (let x = 0; x < qr.size; x++) if (qr.modules[y * qr.size + x] === '1') context.fillRect((x + 4) * scale, (y + 4) * scale, scale, scale);
+      canvas.toBlob(blob => { if (!current()) return; if (blob) downloadQrFile(blob, fileName() + '.png'); else error.textContent = 'PNG 下载失败，请重试'; }, 'image/png');
+    } catch { error.textContent = 'PNG 下载失败，请重试，或下载 SVG'; }
+  }, 'secondary');
+  const retry = button('重新生成', () => load(), 'secondary'); retry.hidden = true;
+  const tools = append(el('div', 'device-qr-tools'), print, pngDownload, svgDownload, retry);
+  append(ui.body, status, label, linkField, help, error, tools);
+  async function load() {
+    result = null; label.hidden = linkField.hidden = true; status.hidden = false; status.textContent = '正在生成设备二维码…'; error.textContent = ''; retry.hidden = true;
+    for (const action of [print, pngDownload, svgDownload]) action.disabled = true;
+    try {
+      const value = await api('/rental/admin/devices/' + encodeURIComponent(item.device.id) + '/qrcode');
+      if (!current()) return;
+      if (!value.device || value.device.id !== item.device.id || typeof value.device.uuid !== 'string' || !value.device.uuid || typeof value.url !== 'string') throw new Error('设备二维码响应无效，请重试');
+      const url = new URL(value.url);
+      if (url.protocol !== 'https:' || url.pathname !== '/d' || url.searchParams.get('i') !== value.device.uuid) throw new Error('设备扫码链接无效，请重试');
+      svg = deviceQrSvg(value.qr, value.device.uuid); result = value;
+      label.replaceChildren(el('p', 'device-qr-brand', 'AR设备租赁'), el('h3', 'device-qr-heading', '微信扫一扫租赁'), svg, el('p', 'device-qr-name', value.device.name || value.device.uuid), el('p', 'device-qr-uuid', 'UUID：' + value.device.uuid), el('p', 'device-qr-model', value.device.type || ''));
+      const location = [value.device.merchantName, value.device.venueName].filter(Boolean).join(' · '); if (location) label.append(el('p', 'device-qr-location', location));
+      linkInput.value = value.url; label.hidden = linkField.hidden = false; status.hidden = true;
+      for (const action of [print, pngDownload, svgDownload]) action.disabled = false;
+    } catch (failure) { if (!current()) return; status.hidden = true; error.textContent = failure.message || '二维码生成失败，请重试'; retry.hidden = false; }
+  }
+  await load();
 }
 function field(form, label, options = {}) {
   const wrapper = el('label', 'field'); wrapper.append(el('span', '', label)); const input = el(options.tag || 'input');
@@ -638,7 +774,8 @@ async function orderDialog(id) {
     if (!ui.node.open) return;
     if (!order) throw new Error('订单详情格式无效');
     const details = el('dl', 'details');
-    const entries = [['订单编号', '#' + order.id], ['商户', order.merchantName || merchantName()], ['场地', order.venueName || '—'], ['设备名称', order.deviceName || '—'], ['设备 UUID', order.uuid], ['租赁状态', orderLabels[order.status]?.[0] || order.status], ['支付状态', paymentLabels[order.paymentStatus] || order.paymentStatus], ['租金', '¥' + money(order.useFeeCents)], ['押金', '¥' + money(order.depositCents)], ['订单合计', '¥' + money(order.totalCents)], ['退款方式', order.refundMode === 'deposit' ? '退押金' : order.refundMode === 'full' ? '全额退款' : '—'], ['退款金额', '¥' + money(order.refundAmountCents)], ['退款状态', refundLabels[order.refundStatus] || '—'], ['创建时间', time(order.createdAt)], ['支付时间', time(order.paidAt)], ['开始时间', time(order.startedAt)], ['结束时间', time(order.endedAt)], ['结算时间', time(order.settledAt)]];
+    const refund = refundSummary(order);
+    const entries = [['订单编号', '#' + order.id], ['商户', order.merchantName || merchantName()], ['场地', order.venueName || '—'], ['设备名称', order.deviceName || '—'], ['设备 UUID', order.uuid], ['租赁状态', orderLabels[order.status]?.[0] || order.status], ['支付状态', paymentLabels[order.paymentStatus] || order.paymentStatus], ['租金', '¥' + money(order.useFeeCents)], ['押金', '¥' + money(order.depositCents)], ['订单合计', '¥' + money(order.totalCents)], ['退款方式', refund.mode], ['退款金额', '¥' + money(order.refundAmountCents)], ['退款状态', refund.status], ...(order.refundStatus && order.refundMode === 'deposit' ? [['保留租金', '¥' + money(order.useFeeCents)]] : []), ['创建时间', time(order.createdAt)], ['支付时间', time(order.paidAt)], ['开始时间', time(order.startedAt)], ['结束时间', time(order.endedAt)], ['结算时间', time(order.settledAt)]];
     for (const [label, value] of entries) append(details, el('dt', '', label), el('dd', '', value ?? '—'));
     ui.body.replaceChildren(details, el('p', 'notice', '订单状态以服务端验证结果为准。办理归还和退款请使用小程序管理页面。'));
   } catch (error) { if (ui.node.open) ui.body.replaceChildren(message(error.message)); }
@@ -684,7 +821,7 @@ function renderMerchants(content) {
     const card = el('article', 'card merchant-card'); const head = el('div', 'card-heading');
     append(head, el('h2', '', merchant.name), badge(merchant.status, statuses));
     const details = el('dl', 'details');
-    for (const [label, value] of [['商户编号', merchant.code], ['小程序入口', Number(merchant.id) === 1 ? '平台总入口' : merchant.miniappOwnerId ? '共用平台小程序' : '历史独立入口'], ['入口域名', merchant.origin], ['小程序 AppID', merchant.appId], ['收款商户号', merchant.mchId || '待配置'], ['支付功能', merchant.paymentReady ? '已就绪' : '未就绪']]) append(details, el('dt', '', label), el('dd', '', value));
+    for (const [label, value] of [['商户编号', merchant.code], ['收款商户号', merchant.mchId || '待配置'], ['支付功能', merchant.paymentReady ? '已就绪' : '未就绪']]) append(details, el('dt', '', label), el('dd', '', value));
     const actions = el('div', 'merchant-actions');
     if (state.user.role === 'root') actions.append(button('编辑配置', () => merchantDialog(merchant.id), 'secondary', 'settings'));
     actions.append(button(canManageVenues(state.user.role) ? '管理场地' : '查看场地', () => openMerchantVenues(merchant), 'secondary', 'home'));
@@ -700,12 +837,15 @@ function renderMerchants(content) {
 async function merchantDialog(id) {
   if (state.user?.role !== 'root') return;
   const ui = formDialog(id ? '编辑商户配置' : '新建商户', '保存商户');
+  const actorId = state.user.id, loginGeneration = state.loginGeneration, merchantGeneration = state.merchantGeneration;
+  const sameContext = () => state.user?.role === 'root' && state.user.id === actorId && state.loginGeneration === loginGeneration && state.merchantGeneration === merchantGeneration;
+  const currentDraft = () => ui.node.open && sameContext();
   let merchant = {};
   if (id) {
     ui.form.append(el('div', 'loading', '正在读取商户配置…'));
     try { merchant = (await api('/rental/admin/merchants/' + encodeURIComponent(id))).merchant; if (!merchant) throw new Error('商户配置响应无效'); }
     catch (error) { ui.form.replaceChildren(message(error.message)); return; }
-    if (!ui.node.open || state.user?.role !== 'root') return; ui.form.replaceChildren();
+    if (!currentDraft()) return; ui.form.replaceChildren();
   }
   const name = field(ui.form, '商户名称', { required: true, maxLength: 128, value: merchant.name || '' });
   const code = field(ui.form, '商户编号', { required: true, maxLength: 64, value: merchant.code || '', placeholder: '例如 merchant2', help: '使用小写字母、数字、下划线或短横线。' });
@@ -739,7 +879,8 @@ async function merchantDialog(id) {
   const flags = merchant.configuration || {};
   ui.form.append(el('h3', '', canManageEntry ? '小程序入口与商户收款凭据' : '商户自己的收款账户及凭据'), el('p', 'notice', '支付商户号与支付凭据属于商户自己的收款账户。敏感凭据仅提交到服务端保存，页面不回显。编辑时留空保留原值；支付配置齐全后才能收款。'));
   const replacementLabel = el('label', 'checkbox-field'); const replacement = el('input'); replacement.type = 'checkbox'; append(replacementLabel, replacement, document.createTextNode('完整替换支付凭据（用于旧配置无法读取时恢复）')); ui.form.append(replacementLabel);
-  const secretFields = {};
+  const secretFields = {}, credentialFiles = [];
+  let pendingCredentialFiles = 0;
   for (const [key, label, configured, multiline] of [
     ['appSecret', '小程序 AppSecret', flags.hasAppSecret],
     ['privateKey', '商户私钥（PEM）', flags.hasPrivateKey, true],
@@ -749,7 +890,34 @@ async function merchantDialog(id) {
     ['platformPublicKey', '微信支付公钥 / 平台证书（PEM）', flags.hasPlatformKeys, true],
   ]) {
     if (key === 'appSecret' && !canManageEntry) continue;
-    secretFields[key] = field(ui.form, label, { ...(multiline ? { tag: 'textarea', rows: 4 } : { type: 'password' }), autoComplete: 'new-password', maxLength: multiline ? 16384 : 256, placeholder: configured ? '已配置；留空保留' : '填写配置值', help: configured ? '服务端已有配置。' : '' });
+    secretFields[key] = field(ui.form, label, { ...(multiline ? { tag: 'textarea', rows: 4 } : { type: 'password' }), autoComplete: 'new-password', maxLength: multiline ? 16000 : 256, placeholder: configured ? '已配置；留空保留' : '填写配置值', help: configured ? '服务端已有配置。' : '' });
+    if (!multiline) continue;
+    const input = secretFields[key], upload = el('div', 'credential-upload'), fileInput = el('input'), feedback = el('small');
+    fileInput.type = 'file'; fileInput.accept = key === 'privateKey' ? '.pem,.key' : '.pem,.crt,.cer';
+    fileInput.setAttribute('aria-label', '从文件导入' + label);
+    feedback.textContent = key === 'privateKey' ? '选择 apiclient_key.pem，或在上方粘贴私钥。' : '选择微信支付公钥或平台证书 PEM，并填写对应的 ID / 序列号。';
+    feedback.setAttribute('role', 'status'); feedback.setAttribute('aria-live', 'polite');
+    append(upload, fileInput, feedback); ui.form.append(upload); credentialFiles.push(fileInput);
+    let readGeneration = 0;
+    input.addEventListener('input', () => { readGeneration++; feedback.textContent = ''; fileInput.value = ''; });
+    fileInput.addEventListener('change', async () => {
+      const generation = ++readGeneration, file = fileInput.files?.[0];
+      if (!file || !currentDraft() || ui.submit.disabled) return;
+      const stillCurrent = () => generation === readGeneration && currentDraft() && !ui.submit.disabled;
+      pendingCredentialFiles++; feedback.textContent = '正在读取文件…';
+      try {
+        if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > 16000) throw new Error('请选择不超过 16 KB 的 PEM 文本文件。');
+        let value;
+        try { value = await file.text(); } catch { throw new Error('无法读取文件，请重新选择或直接粘贴内容。'); }
+        if (!stillCurrent()) return;
+        value = value.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim();
+        const pem = /^-----BEGIN ([A-Z ]+)-----\n([A-Za-z0-9+/=\n]+)\n-----END \1-----$/.exec(value);
+        const allowed = key === 'privateKey' ? ['PRIVATE KEY', 'RSA PRIVATE KEY'] : ['PUBLIC KEY', 'RSA PUBLIC KEY', 'CERTIFICATE'];
+        if (value.length > 16000 || !pem || !allowed.includes(pem[1])) throw new Error(key === 'privateKey' ? '请选择商户私钥 PEM 文件（apiclient_key.pem）。' : '请选择微信支付公钥或平台证书 PEM 文件。');
+        input.value = value; feedback.textContent = '文件已读入，点击「保存商户」后提交。';
+      } catch (error) { if (stillCurrent()) feedback.textContent = error.message; }
+      finally { pendingCredentialFiles--; if (generation === readGeneration) fileInput.value = ''; }
+    });
   }
   let updateEntry = () => {};
   if (canManageEntry) {
@@ -773,6 +941,8 @@ async function merchantDialog(id) {
   ui.ready();
   ui.form.addEventListener('submit', async event => {
     event.preventDefault(); if (ui.submit.disabled || state.user?.role !== 'root') return; ui.error.textContent = '';
+    if (!currentDraft()) { ui.error.textContent = '登录或商户范围已变化，请关闭后重新打开商户配置。'; return; }
+    if (pendingCredentialFiles) { ui.error.textContent = '文件正在读取，请稍后保存。'; return; }
     const miniappOwnerId = canManageEntry ? entry.value === '' ? null : Number(entry.value) : id ? merchant.miniappOwnerId : 1;
     if (canManageEntry && miniappOwnerId !== null && (!Number.isSafeInteger(miniappOwnerId) || !owners.some(value => Number(value.id) === miniappOwnerId))) { ui.error.textContent = '请选择有效的小程序入口'; return; }
     let normalizedOrigin;
@@ -787,18 +957,18 @@ async function merchantDialog(id) {
     const payload = { name: name.value.trim(), code: code.value.trim(), miniappOwnerId, ...(miniappOwnerId === null ? { origin: normalizedOrigin, appId: appId.value.trim(), entryName: entryName.value.trim() || name.value.trim(), entryStatus: entryStatus.value } : {}), mchId: mchId.value.trim(), payEnabled: enabled.checked, ...(replacement.checked ? { replaceCredentials: true } : {}), ...(status ? { status: status.value } : {}), ...(Object.keys(credentials).length ? { credentials } : {}) };
     ui.busy(true);
     try {
-      await write('/rental/admin/merchants' + (id ? '/' + encodeURIComponent(id) : ''), payload, id ? 'PATCH' : 'POST');
+      await api('/rental/admin/merchants' + (id ? '/' + encodeURIComponent(id) : ''), { method: id ? 'PATCH' : 'POST', body: JSON.stringify(payload), beforeDispatch: () => { if (!currentDraft()) throw new Error('登录或商户范围已变化，请重新打开商户配置。'); } });
       for (const input of Object.values(secretFields)) input.value = '';
-      ui.node.close(); toast(id ? '商户配置已保存' : '商户已创建，请完成商户自己收款账户的授权与支付配置'); await refreshMerchants(); if (state.page === 'merchants') loadPage(); else navigate('merchants');
-    } catch (error) { ui.error.textContent = error.message; }
+      if (!currentDraft()) return;
+      ui.node.close(); toast(id ? '商户配置已保存' : '商户已创建，请完成商户自己收款账户的授权与支付配置'); await refreshMerchants(); if (!sameContext()) return; if (state.page === 'merchants') loadPage(); else navigate('merchants');
+    } catch (error) { if (currentDraft()) ui.error.textContent = error.message; }
     finally { ui.busy(false); updateEntry(); }
   });
-  ui.node.addEventListener('close', () => { for (const input of Object.values(secretFields)) input.value = ''; }, { once: true });
+  ui.node.addEventListener('close', () => { for (const input of [...Object.values(secretFields), ...credentialFiles]) input.value = ''; }, { once: true });
 }
 async function transferDialog(kind, target) {
-  if (state.user?.role !== 'root' || kind === 'users' && target.role === 'root') return;
-  const ui = formDialog(kind === 'devices' ? '调拨设备' : '分配用户到商户', '确认分配');
-  if (kind === 'users') ui.form.append(el('p', 'role-copy', userIdentity(target)));
+  if (kind !== 'devices' || state.user?.role !== 'root') return;
+  const ui = formDialog('调拨设备', '确认分配');
   try { await refreshMerchants(); } catch (error) { ui.form.append(message(error.message)); return; }
   if (!ui.node.open || state.user?.role !== 'root') return;
   const sourceMerchant = state.merchantId;
@@ -806,7 +976,8 @@ async function transferDialog(kind, target) {
   const merchant = field(ui.form, '目标商户', { tag: 'select', required: true });
   for (const value of state.merchants.filter(value => String(value.id) !== String(sourceMerchant))) { const option = el('option', '', value.name + ' · ' + value.code); option.value = String(value.id); merchant.append(option); }
   merchant.value = merchant.querySelectorAll('option')[0]?.value || '';
-  let venue, venueMessage, venueItems = [], venueGeneration = 0, venueLoading = false, loadedMerchantId = null;
+  const venue = field(ui.form, '目标场地', { tag: 'select', required: true }), venueMessage = el('p', 'notice'); ui.form.append(venueMessage);
+  let venueItems = [], venueGeneration = 0, venueLoading = false, loadedMerchantId = null;
   const loadTargetVenues = async () => {
     const generation = ++venueGeneration, targetId = Number(merchant.value); venueLoading = true; loadedMerchantId = null; venueItems = [];
     venue.replaceChildren(); venue.disabled = true; ui.submit.disabled = true;
@@ -822,69 +993,77 @@ async function transferDialog(kind, target) {
     } catch (error) { if (ui.node.open && generation === venueGeneration) venueMessage.textContent = error.message; }
     finally { if (ui.node.open && generation === venueGeneration) { venueLoading = false; venue.disabled = !venueItems.length; ui.submit.disabled = !venueItems.length; } }
   };
-  if (kind === 'devices') {
-    venue = field(ui.form, '目标场地', { tag: 'select', required: true }); venueMessage = el('p', 'notice'); ui.form.append(venueMessage);
-    merchant.addEventListener('change', loadTargetVenues);
-  }
-  let role;
-  if (kind === 'users') { role = field(ui.form, '目标商户身份', { tag: 'select' }); for (const value of ['user', 'manager', 'adminer']) { const option = el('option', '', roleLabel(value)); option.value = value; role.append(option); } role.value = target.role; }
-  else ui.form.append(el('p', 'notice', '设备须无进行中的租赁、待确认支付或未完成退款。调拨后暂停开放；共用同一小程序入口可保留二维码，切换独立入口需更换二维码。核对目标商户及费用后重新开放。'));
+  merchant.addEventListener('change', loadTargetVenues);
+  ui.form.append(el('p', 'notice', '设备须无进行中的租赁、待确认支付或未完成退款。调拨后暂停开放；共用同一小程序入口可保留二维码，切换独立入口需更换二维码。核对目标商户及费用后重新开放。'));
   const reason = field(ui.form, '分配原因', { tag: 'textarea', rows: 3, required: true, maxLength: 255 }); ui.ready();
   ui.submit.disabled = !merchant.querySelectorAll('option').length;
   ui.form.addEventListener('submit', async event => {
     event.preventDefault(); if (ui.submit.disabled || state.user?.role !== 'root') return; ui.error.textContent = '';
     if (String(state.merchantId) !== String(sourceMerchant)) { ui.error.textContent = '当前商户已变化，请关闭后重新操作'; return; }
-    const merchantId = Number(merchant.value);
+    const merchantId = Number(merchant.value), venueId = Number(venue.value);
     if (!Number.isSafeInteger(merchantId) || merchantId <= 0 || merchantId === Number(sourceMerchant) || !reason.value.trim()) { ui.error.textContent = '请选择目标商户并填写原因'; return; }
-    const venueId = kind === 'devices' ? Number(venue.value) : undefined;
-    if (kind === 'devices' && (venueLoading || loadedMerchantId !== merchantId || !venueItems.some(item => item.id === venueId))) { ui.error.textContent = '请选择目标商户的有效场地'; return; }
-    if (role && !['user', 'manager', 'adminer'].includes(role.value)) { ui.error.textContent = '目标身份无效'; return; }
+    if (venueLoading || loadedMerchantId !== merchantId || !venueItems.some(item => item.id === venueId)) { ui.error.textContent = '请选择目标商户的有效场地'; return; }
     ui.busy(true);
     try {
-      const result = await write('/rental/admin/' + kind + '/' + encodeURIComponent(target.id) + '/merchant', { merchantId, ...(kind === 'devices' ? { venueId } : {}), reason: reason.value.trim(), ...(role ? { role: role.value } : {}) });
-      if (kind === 'users') {
-        const binding = result.binding;
-        if (!binding || !/^[A-Za-z0-9_-]{32,256}$/.test(binding.token) || typeof binding.appId !== 'string') throw new Error('绑定入口响应无效，请查询分配状态后重试');
-        ui.form.replaceChildren(el('h3', '', '等待原账号确认商户分配'), el('p', 'role-copy', userIdentity(target)), el('p', 'notice', '请仅将下方绑定凭据交给目标用户本人。由被分配账号在小程序首页进入「确认商户分配」，填写凭据并主动确认。共用小程序将在当前页面完成分配；独立入口会打开目标小程序绑定页。关闭此窗口后不再显示。'));
-        const details = el('dl', 'details');
-        for (const [label, value] of [['目标小程序', binding.appId], ['目标域名', binding.origin], ['有效期至', time(binding.expiresAt)], ['绑定凭据', binding.token], ['小程序页面', 'pages/merchant/bind?bindToken=' + encodeURIComponent(binding.token)]]) append(details, el('dt', '', label), el('dd', 'binding-value', value));
-        ui.form.append(details, button('完成', () => { ui.node.close(); loadPage(); }, 'secondary'));
-      } else { ui.node.close(); toast(result.requiresNewQr === false ? '设备已调拨并暂停开放，原二维码可继续使用；请核对目标商户及费用后重新开放' : '设备已调拨并暂停开放，请更换目标入口二维码、核对费用后重新开放'); loadPage(); }
+      const result = await write('/rental/admin/devices/' + encodeURIComponent(target.id) + '/merchant', { merchantId, venueId, reason: reason.value.trim() });
+      ui.node.close(); toast(result.requiresNewQr === false ? '设备已调拨并暂停开放，原二维码可继续使用；请核对目标商户及费用后重新开放' : '设备已调拨并暂停开放，请更换目标入口二维码、核对费用后重新开放'); loadPage();
     } catch (error) { ui.error.textContent = error.message; }
-    finally { ui.busy(false); if (kind === 'devices') { venue.disabled = !venueItems.length; ui.submit.disabled = venueLoading || !venueItems.length; } }
+    finally { ui.busy(false); venue.disabled = !venueItems.length; ui.submit.disabled = venueLoading || !venueItems.length; }
   });
-  if (kind === 'devices' && merchant.value) await loadTargetVenues();
+  if (merchant.value) await loadTargetVenues();
 }
 function roleDialog(user) {
   const allowed = assignableRoles(state.user, user);
   if (!allowed.length) { toast('当前身份不能修改该账号'); return; }
+  const root = state.user.role === 'root', actorId = state.user.id, actorRole = state.user.role, loginGeneration = state.loginGeneration, merchantGeneration = state.merchantGeneration;
   const ui = formDialog('管理用户身份', '确认变更');
-  ui.form.append(el('p', 'role-copy', userIdentity(user) + '当前身份：' + roleLabel(user.role) + '。' + (state.user.role === 'root' ? '你可以调整此账号的普通用户、设备管理员或商户管理员身份。' : '你只能在普通用户与设备管理员之间变更身份。')));
+  const currentDraft = () => ui.node.open && state.user?.id === actorId && state.user?.role === actorRole && state.loginGeneration === loginGeneration && state.merchantGeneration === merchantGeneration;
+  ui.form.append(el('p', 'role-copy', userIdentity(user) + '当前身份：' + roleLabel(user.role) + '。' + (root ? '选择所属商户与身份后直接生效，无需员工确认。历史订单与资金记录保留原商户归属。' : '你只能在普通用户与设备管理员之间变更身份，所属商户保持不变。')));
   const target = field(ui.form, '目标身份', { tag: 'select', required: true });
   for (const role of allowed) { const option = el('option', '', roleLabel(role)); option.value = role; target.append(option); }
   target.value = user.role;
+  let merchant;
+  const merchantChoices = (state.merchants.length ? state.merchants : state.merchant ? [state.merchant] : []).filter(value => value.status === 'active');
+  if (root) {
+    merchant = field(ui.form, '所属商户', { tag: 'select', required: true, help: '设备管理员与商户管理员仅管理所选商户；普通用户不保留员工归属。' });
+    const placeholder = el('option', '', merchantChoices.length ? '请选择所属商户' : '暂无可用商户，请先启用商户'); placeholder.value = ''; merchant.append(placeholder);
+    for (const value of merchantChoices) { const option = el('option', '', merchantLabel(value)); option.value = String(value.id); merchant.append(option); }
+    const preferred = merchantChoices.find(value => value.id === user.merchantId) || merchantChoices.find(value => value.id === state.merchantId);
+    merchant.value = preferred ? String(preferred.id) : '';
+  }
   const permission = el('p', 'role-copy'); ui.form.append(permission);
   const effect = el('p', 'notice role-change-notice'); ui.form.append(effect);
-  const reason = field(ui.form, '变更原因', { tag: 'textarea', maxLength: 255, rows: 3, required: true, placeholder: '填写授权或撤销原因，将记录到操作审计' });
+  const reason = field(ui.form, '变更原因', { tag: 'textarea', maxLength: 255, rows: 3, required: true, placeholder: '填写授权、调整归属或撤销原因，将记录到操作审计' });
   const acknowledgement = el('label', 'checkbox-field'); const checked = el('input'); checked.type = 'checkbox'; checked.required = true;
-  append(acknowledgement, checked, el('span', '', '我已核对目标账号及所选身份的权限范围。')); ui.form.append(acknowledgement); ui.ready();
+  append(acknowledgement, checked, el('span', '', root ? '我已核对目标账号、所属商户及身份权限。' : '我已核对目标账号及所选身份的权限范围。')); ui.form.append(acknowledgement); ui.ready();
+  const validMerchant = () => !root || target.value === 'user' || merchantChoices.some(value => value.id === Number(merchant.value));
+  const changed = () => allowed.includes(target.value) && (target.value !== user.role || root && target.value !== 'user' && Number(merchant.value) !== Number(user.merchantId));
   const update = () => {
-    const next = Object.hasOwn(roles, target.value) ? roles[target.value] : null; const changed = allowed.includes(target.value) && target.value !== user.role;
-    const demotion = changed && next.rank < roles[user.role].rank;
+    const next = Object.hasOwn(roles, target.value) ? roles[target.value] : null, hasChange = changed();
+    const demotion = hasChange && next.rank < roles[user.role].rank;
     permission.textContent = next ? next.description : '请选择当前权限允许的身份。';
-    effect.textContent = !changed ? '选择新的目标身份后，核对权限范围并填写变更原因。' : '将从「' + roleLabel(user.role) + '」调整为「' + roleLabel(target.value) + '」。' + (demotion ? '确认后，该账号的后续请求将立即按降低后的权限校验。' : '确认后，该账号将获得以上管理能力，请只向可信任人员授权。');
-    ui.submit.querySelector('span').textContent = changed ? demotion ? '确认降低权限' : '确认提升权限' : '确认变更';
+    if (merchant) merchant.disabled = target.value === 'user';
+    const selected = root && merchantChoices.find(value => value.id === Number(merchant.value));
+    effect.textContent = !hasChange ? '选择新的身份或所属商户后，核对权限范围并填写变更原因。' : '将从「' + roleLabel(user.role) + '」调整为「' + roleLabel(target.value) + '」。' + (root ? target.value === 'user' ? '确认后撤销员工归属。' : '所属商户：' + (selected ? selected.name : '待选择') + '。' : '') + (demotion ? '确认后，该账号的后续请求将立即按降低后的权限校验。' : '确认后直接生效，请只向可信任人员授权。');
+    ui.submit.querySelector('span').textContent = hasChange ? demotion ? '确认降低权限' : root ? '确认商户与身份' : '确认提升权限' : '确认变更';
     ui.submit.classList.toggle('danger-button', demotion);
-    ui.submit.disabled = !changed || !checked.checked;
+    ui.submit.disabled = !currentDraft() || !hasChange || !validMerchant() || !checked.checked;
   };
-  target.addEventListener('change', () => { checked.checked = false; update(); }); checked.addEventListener('change', update); update();
+  const change = () => { checked.checked = false; update(); };
+  target.addEventListener('change', change); if (merchant) merchant.addEventListener('change', change); checked.addEventListener('change', update); update();
   ui.form.addEventListener('submit', async event => {
     event.preventDefault(); if (ui.submit.disabled) return; ui.error.textContent = '';
     const nextRole = target.value;
-    if (!assignableRoles(state.user, user).includes(nextRole) || nextRole === user.role || !checked.checked) { ui.error.textContent = '请重新核对目标身份与权限范围'; return; }
-    if (!reason.value.trim()) { ui.error.textContent = '请填写权限变更原因'; return; } ui.busy(true);
-    try { await write('/rental/admin/users/' + encodeURIComponent(user.id) + '/role', { role: nextRole, reason: reason.value.trim() }, 'PUT'); ui.node.close(); toast('已调整为' + roleLabel(nextRole)); loadPage(); }
-    catch (error) { ui.error.textContent = error.message; }
+    if (!currentDraft()) { ui.error.textContent = '登录或商户范围已变化，请重新打开身份管理。'; return; }
+    if (!assignableRoles(state.user, user).includes(nextRole) || !changed() || !validMerchant() || !checked.checked) { ui.error.textContent = '请重新核对所属商户、目标身份与权限范围'; return; }
+    if (!reason.value.trim()) { ui.error.textContent = '请填写权限变更原因'; return; }
+    const path = '/rental/admin/users/' + encodeURIComponent(user.id) + (root ? '/merchant' : '/role');
+    const payload = { role: nextRole, reason: reason.value.trim(), ...(root ? { merchantId: nextRole === 'user' ? Number(user.merchantId || state.merchantId) : Number(merchant.value) } : {}) }; ui.busy(true);
+    try {
+      await api(path, { method: root ? 'POST' : 'PUT', body: JSON.stringify(payload), beforeDispatch: () => { if (!currentDraft()) throw new Error('登录或商户范围已变化，请重新打开身份管理。'); } });
+      if (!currentDraft()) return;
+      ui.node.close(); toast(root ? nextRole === 'user' ? '已撤销员工身份' : '所属商户与身份已更新' : '已调整为' + roleLabel(nextRole)); loadPage();
+    } catch (error) { if (currentDraft()) ui.error.textContent = error.message; }
     finally { ui.busy(false); update(); }
   });
 }
