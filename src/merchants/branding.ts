@@ -26,10 +26,10 @@ export class BrandingService {
     if (Number(user.auth_version ?? 0) !== Number(principal.authVersion ?? principal.user.auth_version ?? 0)) throw new ApiError(401, '账号归属已变更，请重新登录');
   }
   private view(merchant: Row, branding: Row | null): Row {
-    const current = currentMerchant(), entry = entryMerchant();
+    const current = currentMerchant();
     const origin = current?.id === Number(merchant.id) ? current.origin : entryMerchant()?.origin;
     return { merchant: { id: Number(merchant.id), name: merchant.name, code: merchant.code }, branding: {
-      displayName: branding?.display_name ?? (merchant.code === 'default' && Number(merchant.id) === entry?.legacyMerchantId ? entry.name : merchant.name),
+      displayName: branding?.display_name ?? (merchant.code === 'default' && Number(merchant.id) === 1 ? 'AR设备租赁' : merchant.name),
       logoUrl: branding?.logo_data ? `${origin}/api/v2/rental/branding/${merchant.id}/logo?v=${branding.version}` : branding?.logo_url ?? '',
       version: Number(branding?.version ?? 0), updatedAt: branding ? new Date(Number(branding.updated_ms)).toISOString() : null,
     } };

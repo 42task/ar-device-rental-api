@@ -39,14 +39,19 @@ function fixture() {
 }
 
 describe('merchant branding authority and public projection', () => {
-  it('keeps the existing application display name for the unconfigured default merchant', async () => {
+  it('keeps the built-in name for the unconfigured platform merchant even when entry metadata uses its internal name', async () => {
     const f = fixture();
-    await f.db.execute("UPDATE ar_merchant SET code='default' WHERE id=1");
+    f.first.name = '默认商户';
+    await f.db.execute("UPDATE ar_merchant SET code='default',name='默认商户' WHERE id=1");
     const result = await f.scope(1, () => f.service.public(1));
-    expect(result.branding.displayName).toBe(f.first.name);
+    expect(result.branding.displayName).toBe('AR设备租赁');
     expect(result.branding).not.toHaveProperty('theme');
     expect(result.branding).not.toHaveProperty('heroImageUrl');
     expect((await f.scope(1, () => f.service.public(2))).branding.displayName).toBe('商户二');
+    const actor = await f.principal(2);
+    await f.scope(1, () => f.service.save(actor, { ...f.input, displayName: '自定义品牌' }));
+    expect((await f.scope(1, () => f.service.public(1))).branding).toMatchObject({ displayName: '自定义品牌', version: 1 });
+    expect((await f.db.one('SELECT name FROM ar_merchant WHERE id=1'))!.name).toBe('默认商户');
   });
   it('provides safe defaults and keeps each merchant independent with optimistic versions', async () => {
     const f = fixture(), actor = await f.principal(2), root = await f.principal(1);
