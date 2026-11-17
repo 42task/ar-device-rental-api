@@ -91,6 +91,28 @@ function button(label, action, className = '', iconName) { const node = el('butt
 function append(parent, ...nodes) { for (const node of nodes) if (node) parent.append(node); return parent; }
 function badge(value, labels) { const pair = labels[value] || [value || '—', '']; return el('span', 'status ' + pair[1], pair[0]); }
 function textCell(primary, secondary) { const cell = el('td'); append(cell, el('div', 'cell-main', primary)); if (secondary) append(cell, el('div', 'cell-sub', secondary)); return cell; }
+function userAvatarUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048 || /[\x00-\x20\x7f]/.test(value)) return '';
+  if (/^\/api\/v2\/rental\/profile\/avatars\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)?$/.test(value)) return value;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password && !url.hash ? url.href : '';
+  } catch { return ''; }
+}
+function userAvatar(user, className = '') {
+  const node = el('span', 'user-avatar ' + className); node.setAttribute('aria-hidden', 'true'); node.append(icon('user'));
+  const source = userAvatarUrl(user.avatar);
+  if (source) {
+    const image = el('img', 'user-avatar-image'); image.alt = ''; image.width = image.height = 36; image.loading = 'lazy'; image.decoding = 'async'; image.referrerPolicy = 'no-referrer';
+    image.addEventListener('error', () => image.remove(), { once: true }); image.setAttribute('src', source); node.append(image);
+  }
+  return node;
+}
+function userCell(user) {
+  const cell = el('td'), identity = el('div', 'user-identity'), copy = el('div', 'user-copy');
+  const name = el('div', 'cell-main', userName(user)); name.title = name.textContent;
+  append(copy, name, el('div', 'cell-sub', 'ID ' + user.id)); append(identity, userAvatar(user), copy); cell.append(identity); return cell;
+}
 function message(text, className = 'error') { const node = el('div', className, text); node.setAttribute('role', 'alert'); return node; }
 function toast(text) { document.querySelector('.toast')?.remove(); const node = el('div', 'toast', text); node.setAttribute('role', 'status'); document.body.append(node); setTimeout(() => node.remove(), 4500); }
 function stopPolling() { clearTimeout(state.timer); state.timer = null; }
@@ -287,7 +309,7 @@ function shell() {
   const accountName = el('div', 'account-name');
   append(accountName, el('div', '', state.user.nickname || '管理员 #' + state.user.id), el('div', '', roleLabel(state.user.role)));
   const merchantContext = el('div', 'merchant-context'); merchantContext.id = 'merchant-context';
-  append(account, merchantContext, date, icon('cube', 'muted', 'account-icon'), accountName, button('退出', logout, 'text-button', 'logout'));
+  append(account, merchantContext, date, userAvatar(state.user, 'account-avatar'), accountName, button('退出', logout, 'text-button', 'logout'));
   const main = el('main', 'content'); main.id = 'main-content';
   append(top, crumb, account); append(work, top, main); append(shellNode, sidebar, work); app.replaceChildren(shellNode);
   const requested = location.hash.slice(1);
@@ -538,7 +560,7 @@ function userIdentity(user) {
 function userRow(user) {
   const row = el('tr');
   const phone = verifiedUserPhone(user);
-  append(row, textCell(userName(user), 'ID ' + user.id), textCell(phone || '未授权手机号', phone ? '微信已验证' : '需本人在小程序授权'), append(el('td'), badge(user.role, { root: [roleLabel('root'), 'green'], adminer: [roleLabel('adminer'), 'blue'], manager: [roleLabel('manager'), 'blue'], user: [roleLabel('user'), ''] })));
+  append(row, userCell(user), textCell(phone || '未授权手机号', phone ? '微信已验证' : '需本人在小程序授权'), append(el('td'), badge(user.role, { root: [roleLabel('root'), 'green'], adminer: [roleLabel('adminer'), 'blue'], manager: [roleLabel('manager'), 'blue'], user: [roleLabel('user'), ''] })));
   const actions = el('td');
   const protectedLabel = user.role === 'root' ? 'ROOT 身份受保护' : String(user.id) === String(state.user.id) ? '当前账号' : user.role === 'adminer' ? '同级身份受保护' : '不可修改';
   actions.append(assignableRoles(state.user, user).length ? button('管理身份', () => roleDialog(user), 'text-button') : el('span', 'muted', protectedLabel));
@@ -867,7 +889,6 @@ function renderBranding(content, result) {
   const reset = button('撤销未保存修改', () => { if (!current() || saving || forbidden) return; name.value = saved.displayName; logo.reset(saved.logoUrl); error.textContent = success.textContent = ''; refresh(); }, 'secondary');
   const reload = button('重新加载最新配置', () => { if (current() && !saving) loadPage(); }, 'secondary'); reload.hidden = true;
   append(form, error, reload, append(el('div', 'branding-actions'), reset, submit), success);
-  field(form, '商户首页路径', { readOnly: true, value: 'pages/index/index?merchantId=' + merchantId, help: '制作本商户的小程序码时可使用此页面路径。' });
   form.append(el('p', 'footer-note', '微信客户端显示的小程序注册名称和图标需在微信公众平台维护。'));
   append(card, append(el('div', 'card-heading'), el('h2', '', '商户通用品牌')), el('p', 'venue-owner', '所属商户：' + merchantLabel(result.merchant)), form); append(layout, card, preview.node); content.replaceChildren(layout);
   function refresh() { preview.update({ displayName: name.value, logoUrl: logo.source() }, {}, name.value.trim() !== saved.displayName || logo.dirty(saved.logoUrl)); for (const input of form.querySelectorAll('input,button')) input.disabled = saving || forbidden; submit.disabled = saving || forbidden || logo.reading; }
@@ -902,7 +923,6 @@ async function venueAppearanceDialog(venue) {
   const themes = el('fieldset', 'branding-themes'); themes.append(el('legend', '', '景点小程序风格')); const choices = [];
   for (const [key, [label, description]] of Object.entries(brandingThemes)) { const wrapper = el('label', 'branding-theme-option branding-theme-' + key), radio = el('input'); radio.type = 'radio'; radio.name = 'venue-theme'; radio.value = key; radio.checked = key === saved.theme; choices.push(radio); append(wrapper, radio, el('span', 'branding-swatch'), append(el('span'), el('strong', '', label), el('small', '', description))); themes.append(wrapper); radio.addEventListener('change', () => { if (!current() || saving || forbidden) return; if (radio.checked) for (const other of choices) if (other !== radio) other.checked = false; refresh(); }); } ui.form.append(themes);
   const hero = brandingImageEditor(ui.form, { value: saved.heroImageUrl, uploadLabel: 'AR 眼镜主图', urlLabel: '主图图片地址', label: 'AR 眼镜主图', maxKB: 512, clearLabel: '恢复默认主图', help: '填写 HTTPS 图片地址，或上传景点主图。留空使用默认 AR 眼镜图片。', current, locked: () => saving || forbidden, report: text => { ui.error.textContent = text; }, changed: () => refresh() });
-  field(ui.form, '景点首页路径', { readOnly: true, value: 'pages/index/index?merchantId=' + merchantId + '&venueId=' + venueId, help: '制作该景点的小程序码时使用此路径。' });
   const success = el('p', 'branding-status'); success.setAttribute('role', 'status');
   const reset = button('撤销未保存修改', () => { if (!current() || saving || forbidden) return; hero.reset(saved.heroImageUrl); for (const radio of choices) radio.checked = radio.value === saved.theme; ui.error.textContent = success.textContent = ''; refresh(); }, 'secondary');
   const reload = button('重新加载最新配置', () => { if (current() && !saving) { ui.node.close(); venueAppearanceDialog(venue); } }, 'secondary'); reload.hidden = true; append(ui.form, reset, reload, success); ui.ready();
