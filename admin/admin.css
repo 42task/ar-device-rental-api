@@ -141,7 +141,6 @@ h3 { font-size: 15px; line-height: 1.5; font-weight: 600; }
 .topbar-title strong { padding-left: 18px; border-left: 1px solid var(--line); color: var(--muted); font-size: 13px; font-weight: 400; }
 .account { display: flex; align-items: center; gap: 12px; }
 .topbar-date { color: var(--muted); font-family: var(--mono); font-size: 13px; padding-right: 20px; margin-right: 4px; border-right: 1px solid var(--line); white-space: nowrap; }
-.account-icon { width: 22px; height: 22px; flex-basis: 22px; }
 .account-name { font-size: 12px; line-height: 1.55; }
 .account-name > div:first-child { color: var(--text); font-size: 13px; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-name > div:last-child { color: var(--muted); }
@@ -219,6 +218,12 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: #f5f8fe; }
 .cell-main { color: var(--text); font-size: 14px; font-weight: 500; }
 .cell-sub { margin-top: 5px; max-width: 280px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-identity { display: flex; align-items: center; gap: 12px; }
+.user-avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; flex: 0 0 36px; border-radius: 50%; overflow: hidden; background: #edf2fa; }
+.user-avatar-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.user-copy { min-width: 0; }
+.user-copy .cell-main { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-avatar.account-avatar { width: 32px; height: 32px; flex-basis: 32px; }
 .order-refund .cell-sub { max-width: none; }
 .device-identity { min-width: 140px; max-width: 300px; }
 .device-identity .cell-main { font-family: var(--mono); user-select: text; white-space: normal; overflow-wrap: anywhere; line-height: 1.7; }
@@ -337,7 +342,6 @@ dialog::backdrop { background: #10244766; }
   .page-heading p { font-size: 14px; }
   .page-heading > button { font-size: 14px; min-height: 44px; padding-inline: 14px; }
   .account-name > div:first-child { max-width: 100px; }
-  .account-icon { display: none; }
   .summary-strip { width: 100%; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .summary-item { display: block; padding-inline: 16px; }
   .summary-item dd { margin-top: 6px; }
@@ -374,7 +378,8 @@ dialog::backdrop { background: #10244766; }
   .topbar-brand { display: none; }
   .topbar-title strong { padding-left: 0; border-left: 0; font-size: 12px; }
   .account { gap: 7px; }
-  .account-name > div:first-child { display: none; }
+  .account-name > div:first-child { max-width: 86px; font-size: 12px; }
+  .user-avatar.account-avatar { width: 28px; height: 28px; flex-basis: 28px; }
   .account-name > div:last-child { font-size: 12px; max-width: 120px; white-space: nowrap; }
   .account .text-button { min-height: 36px; padding: 5px; }
   .account .text-button .icon { display: none; }

@@ -577,7 +577,8 @@ export class RentalService {
     const search = typeof query.search === 'string' ? query.search.trim().slice(0, 100) : '';
     const result = await readDevicePage(this.services.db, { merchantId: allMerchants ? undefined : merchant?.id, venueId,
       allMerchants: allMerchants && !!merchant, search, page, pageSize });
-    return { items: result.items.map(item => ({ device: this.displayDevice(item.device), venue: publicVenue(item.venue), pricing: item.pricing, state: item.state })), page, pageSize, total: result.total };
+    return { items: result.items.map(item => ({ device: this.displayDevice(item.device), venue: publicVenue(item.venue), pricing: item.pricing, state: item.state })),
+      page, pageSize, total: result.total, scope: allMerchants ? 'all' : 'merchant', ...(allMerchants ? {} : { merchantId: merchant?.id ?? null }) };
   }
   async deviceQrcode(principal: RentalPrincipal, deviceId: unknown): Promise<Row> {
     this.assertPrincipal(principal); await this.requireCurrentManager(principal);

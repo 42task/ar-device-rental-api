@@ -1,6 +1,7 @@
 import { ApiError } from './errors';
 
 export const MAX_LOGO_BYTES = 256 * 1024;
+export const MAX_AVATAR_BYTES = 256 * 1024;
 export const MAX_HERO_BYTES = 512 * 1024;
 export type ImageAsset = { data: Buffer; mime: string };
 
@@ -19,6 +20,7 @@ function parseImageDataUrl(value: unknown, maxBytes: number, label: string): Ima
   return { data, mime };
 }
 export const parseLogoDataUrl = (value: unknown): ImageAsset => parseImageDataUrl(value, MAX_LOGO_BYTES, 'Logo ');
+export const parseAvatarDataUrl = (value: unknown): ImageAsset => parseImageDataUrl(value, MAX_AVATAR_BYTES, '头像');
 export const parseHeroDataUrl = (value: unknown): ImageAsset => parseImageDataUrl(value, MAX_HERO_BYTES, '主图');
 
 function validateImageUrl(value: unknown, label: string): string {

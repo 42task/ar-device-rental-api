@@ -169,6 +169,27 @@ for (const role of ['manager', 'adminer', 'root']) {
   }
 }
 
+// Saved profile photos are decorative; names remain text and a failed photo keeps its fallback.
+{
+  const f = fixture('adminer'), nickname = '<img src=x onerror=alert(1)>', avatar = '/api/v2/rental/profile/avatars/synthetic-profile-token';
+  const user = { id: 11, role: 'user', nickname, avatar };
+  const row = f.spec.userRow(user), photo = row.querySelector('.user-avatar-image');
+  assert.equal(row.querySelector('.cell-main').textContent, nickname); assert.equal(row.querySelector('.cell-main').title, nickname);
+  assert.equal(photo.getAttribute('src'), avatar); assert.equal(photo.referrerPolicy, 'no-referrer'); assert.equal(photo.alt, '');
+  assert.equal(row.querySelector('.user-avatar').getAttribute('aria-hidden'), 'true'); assert.equal(row.querySelectorAll('img').length, 2); assert.equal(row.querySelector('script'), null);
+  await photo.emit('error'); assert.equal(row.querySelector('.user-avatar-image'), null); assert.ok(row.querySelector('.user-avatar').querySelector('.icon'));
+  const https = f.spec.userRow({ ...user, avatar: 'https://images.example.test/profile.webp' });
+  assert.equal(https.querySelector('.user-avatar-image').getAttribute('src'), 'https://images.example.test/profile.webp');
+  for (const source of [null, '', 'javascript:alert(1)', 'data:image/svg+xml,test', 'http://images.example.test/avatar.png', '//images.example.test/avatar.png', '/admin/admin.js', '/api/v2/rental/profile/avatars/../secret', 'https://name:password@images.example.test/avatar.png', 'https://images.example.test/avatar.png#fragment', 'https://images.example.test/white space.png']) {
+    const rejected = f.spec.userRow({ ...user, avatar: source });
+    assert.equal(rejected.querySelector('.user-avatar-image'), null); assert.ok(rejected.querySelector('.user-avatar').querySelector('.icon'));
+  }
+  f.spec.setUser({ ...user, id: 10, role: 'adminer' }); f.spec.shell();
+  assert.equal(f.app.querySelector('.account-name').children[0].textContent, nickname);
+  assert.equal(f.app.querySelector('.account-avatar').querySelector('.user-avatar-image').getAttribute('src'), avatar);
+}
+console.log('User profile names, safe avatar URLs, broken-image fallbacks and account display verified.');
+
 // Root assigns the merchant and role together after identifying the target by the verified phone.
 for (const verified of [true, false]) {
   const user = { id: 11, role: 'user', nickname: 'Synthetic renter', tel: '+8613900139000', phoneVerified: verified, phoneNumber: verified ? '+8613800138000' : null };
@@ -1063,9 +1084,9 @@ for (const changed of ['merchant', 'role']) {
 }
 console.log('Merchant-wide name/logo scope, default previews, safe uploads and permission guards verified.');
 
-// Each venue has its own version, palette, hero image and scoped entry path; merchant identity is read-only.
+// Each venue has its own version, palette and hero image; merchant identity is read-only.
 for (const role of ['adminer', 'root']) {
-  const f = await appearanceFixture(role); assert.match(f.form.textContent, /Synthetic merchant.*Synthetic venue/); assert.equal(f.form.querySelectorAll('input').find(node => node.readOnly).value, 'pages/index/index?merchantId=2&venueId=11');
+  const f = await appearanceFixture(role); assert.match(f.form.textContent, /Synthetic merchant.*Synthetic venue/); assert.doesNotMatch(f.form.textContent, /景点首页路径|pages\/index\/index\?/);
   assert.equal(f.dialog.querySelector('.branding-preview-identity').querySelector('h3').textContent, 'Synthetic brand'); assert.equal(f.form.querySelectorAll('input').filter(node => node.type === 'file').length, 1);
   const radio = f.form.querySelectorAll('input').find(node => node.type === 'radio' && node.value === 'forest'); radio.checked = true; await radio.emit('change'); assert.equal(f.dialog.querySelector('.branding-phone').classList.contains('branding-preview-theme-forest'), true);
   f.replies.push(appearanceReply({ theme: 'forest', version: 5 })); await f.form.emit('submit'); const request = f.calls.find(call => call.method === 'PATCH'); assert.equal(request.path, '/api/v2/rental/admin/venues/11/appearance'); assert.equal(request.headers['X-Merchant-Id'], '2'); assert.deepEqual(JSON.parse(request.body), { theme: 'forest', version: 4 }); assert.match(f.form.textContent, /景点样式已保存/);

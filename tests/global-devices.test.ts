@@ -52,16 +52,17 @@ describe('explicit root device listing across merchants', () => {
   it('paginates all merchants in one query and reports each actual merchant and public venue', async () => {
     const f = fixture(), query = vi.spyOn(f.db, 'query'), execute = vi.spyOn(f.db, 'execute');
     const first = await f.scoped(1, () => f.service.devices(f.root, { scope: 'all', pageSize: 2 }));
-    expect(first).toMatchObject({ page: 1, pageSize: 2, total: 3, items: [
+    expect(first).toMatchObject({ scope: 'all', page: 1, pageSize: 2, total: 3, items: [
       { device: { id: 13, merchantId: 1, merchantName: '默认商户' }, state: 'DISABLED' },
       { device: { id: 12, merchantId: 2, merchantName: '测试商户' }, state: 'AVAILABLE' },
     ] });
+    expect(first).not.toHaveProperty('merchantId');
     expect(query).toHaveBeenCalledTimes(3);
     expect(execute).not.toHaveBeenCalled();
     expect(first.items[1].venue).toEqual({ id: 202, name: '测试场地', address: '', description: '' });
     expect(first.items[1].device).not.toHaveProperty('rental_exists');
     const second = await f.scoped(1, () => f.service.devices(f.root, { scope: 'all', pageSize: 2, page: 2 }));
-    expect(second).toMatchObject({ page: 2, total: 3, items: [{ device: { id: 11, merchantName: '默认商户' } }] });
+    expect(second).toMatchObject({ scope: 'all', page: 2, total: 3, items: [{ device: { id: 11, merchantName: '默认商户' } }] });
   });
 
   it('searches literal wildcard characters across merchants before applying pagination', async () => {
@@ -74,11 +75,11 @@ describe('explicit root device listing across merchants', () => {
 
   it('keeps the default and explicit merchant scope on the selected merchant for root and staff', async () => {
     const f = fixture();
-    expect(await f.scoped(1, () => f.service.devices(f.root, {}))).toMatchObject({ total: 2 });
+    expect(await f.scoped(1, () => f.service.devices(f.root, {}))).toMatchObject({ scope: 'merchant', merchantId: 1, total: 2 });
     expect(await f.scoped(2, () => f.service.devices(f.root, { scope: 'merchant' })))
-      .toMatchObject({ total: 1, items: [{ device: { id: 12, merchantName: '测试商户' } }] });
-    expect(await f.scoped(1, () => f.service.devices(f.manager, { venueId: 101 }))).toMatchObject({ total: 2 });
-    expect(await f.scoped(2, () => f.service.devices(f.adminer, { scope: 'merchant' }))).toMatchObject({ total: 1 });
+      .toMatchObject({ scope: 'merchant', merchantId: 2, total: 1, items: [{ device: { id: 12, merchantName: '测试商户' } }] });
+    expect(await f.scoped(1, () => f.service.devices(f.manager, { venueId: 101 }))).toMatchObject({ scope: 'merchant', merchantId: 1, total: 2 });
+    expect(await f.scoped(2, () => f.service.devices(f.adminer, { scope: 'merchant' }))).toMatchObject({ scope: 'merchant', merchantId: 2, total: 1 });
     await expect(f.scoped(2, () => f.service.devices(f.manager, {}))).rejects.toMatchObject({ status: 403 });
   });
 

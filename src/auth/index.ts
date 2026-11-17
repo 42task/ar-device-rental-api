@@ -63,7 +63,7 @@ export class RentalAuth {
     const entry = entryMerchant();
     const managementMerchant = entry && userRole(user) !== 'root' && user.merchant_id != null ? await this.managementMerchant(user.merchant_id) : null;
     const merchant = managementMerchant ?? publicMerchant();
-    return { token: this.issue(user), user: publicUser(user), openid: user.openid, unionid: user.unionid ?? null, appId: this.appId,
+    return { token: this.issue(user), user: publicUser(user), openid: user.openid, unionid: user.unionid ?? null, appId: this.appId, authVersion: Number(user.auth_version ?? 0),
       ...(entry ? { entry: this.publicEntry(), managementMerchant, merchant } : {}) };
   }
   publicEntry(): Row | null {
@@ -272,7 +272,7 @@ export class RentalAuth {
         WHERE u.role<>'root' AND u.id<>? AND ${scope === 'employees' ? 'm.merchant_id=?' : "NOT EXISTS(SELECT 1 FROM ar_merchant_membership x WHERE x.user_id=u.id AND x.status='active') AND EXISTS(SELECT 1 FROM ar_user_wechat_identity i WHERE i.user_id=u.id AND i.appid=? AND i.status='active')"}`;
       const parameters: unknown[] = [phoneApp, actor.id, scope === 'employees' ? merchant.id : merchant.appId];
       const pattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
-      const filter = search ? ' AND (u.nickname LIKE ? OR p.phone_e164 LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
+      const filter = search ? ' AND (u.nickname LIKE ? OR CAST(p.phone_e164 AS CHAR) LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
       if (search) parameters.push(pattern, pattern, search);
       const count = await db.one('SELECT COUNT(*) AS total' + from + filter, parameters);
       const rows = await db.query(`SELECT u.*,p.phone_e164 AS verified_phone,p.country_code AS phone_country_code${scope === 'employees' ? ',m.role AS member_role,m.merchant_id AS member_merchant_id' : ''}${from}${filter} ORDER BY u.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, parameters);
@@ -317,7 +317,7 @@ export class RentalAuth {
     requireMerchantManagementScope(principal.user);
     const page = Math.max(1, Math.min(1000000, Math.floor(Number(ctx.query.page)) || 1)), pageSize = 20;
     const search = typeof ctx.query.search === 'string' ? ctx.query.search.trim().slice(0, 100) : '';
-    const searchSql = search ? ' AND (u.nickname LIKE ? OR u.tel LIKE ? OR p.phone_e164 LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
+    const searchSql = search ? ' AND (u.nickname LIKE ? OR u.tel LIKE ? OR CAST(p.phone_e164 AS CHAR) LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
     const pattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
     const merchant = currentMerchant();
     const prefix = merchant ? [merchant.appId, merchant.id, principal.user.id] : [this.appId, principal.user.id];
