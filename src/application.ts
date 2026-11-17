@@ -10,6 +10,7 @@ import { AdminAuth } from './admin/auth';
 import { registerManagement } from './admin/management';
 import { SCHEMA_VERSION } from './core/migrations';
 import { PhoneBinding } from './auth/phone';
+import { registerProfile } from './auth/profile';
 import { MerchantRegistry, merchantId } from './merchants/registry';
 import { publicMerchant, withMerchant } from './merchants/context';
 import { registerMerchants } from './merchants/management';
@@ -42,7 +43,7 @@ export function createApplication(options: ApplicationOptions = {}) {
   const brandingJson = express.json({ limit: '384kb', verify: verifyBody });
   const appearanceJson = express.json({ limit: '768kb', verify: verifyBody });
   app.use((req, res, next) => {
-    const parser = req.method === 'PATCH' && /^\/api\/v2\/rental\/admin\/branding\/?$/.test(req.path) ? brandingJson
+    const parser = req.method === 'PATCH' && /^\/api\/v2\/rental\/(?:admin\/branding|profile)\/?$/.test(req.path) ? brandingJson
       : req.method === 'PATCH' && /^\/api\/v2\/rental\/admin\/venues\/[1-9][0-9]*\/appearance\/?$/.test(req.path) ? appearanceJson : standardJson;
     parser(req, res, next);
   });
@@ -106,6 +107,7 @@ export function createApplication(options: ApplicationOptions = {}) {
     registerVenueAppearance(router, db, auth);
   }
   auth.registerAuth(router);
+  registerProfile(router, db, auth);
   phone.register(router);
   admin.register(router);
   registerVenues(router, db, auth);

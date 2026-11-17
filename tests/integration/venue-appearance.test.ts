@@ -125,11 +125,11 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('MySQL independent venue ap
     const saved = await f.http('patch', '/api/v2/rental/admin/branding', own.token, 1).send({ displayName: 'Synthetic brand', version: 0, logoDataUrl: png });
     expect(saved.status).toBe(200);
     const before = await f.db.query('SELECT * FROM ar_merchant_branding');
-    await f.db.execute('DROP TABLE ar_venue_appearance'); await f.db.execute('DELETE FROM ar_schema_migration WHERE version=15'); await f.db.execute('UPDATE ar_schema_meta SET version=14');
+    await f.db.execute('DROP TABLE ar_venue_appearance'); await f.db.execute('DELETE FROM ar_schema_migration WHERE version>=15'); await f.db.execute('UPDATE ar_schema_meta SET version=14');
     await migrate(f.db); await migrate(f.db);
     expect(await f.db.query('SELECT * FROM ar_merchant_branding')).toEqual(before);
     expect(await f.db.query('SELECT * FROM ar_venue_appearance')).toHaveLength(0);
     expect((await f.http('get', '/api/v2/rental/admin/branding', own.token, 1)).body).toEqual(saved.body);
-    expect((await f.db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(15);
+    expect((await f.db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(SCHEMA_VERSION);
   }), 30_000);
 });

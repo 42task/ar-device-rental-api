@@ -1,10 +1,10 @@
 # AR设备租赁 API
 
-独立的 Node.js 24 / TypeScript / Express 5 后端，为原生微信小程序 **AR设备租赁**（`wx03dbf50c15cac06f`）提供登录、设备、租赁、微信支付与退款接口。使用全新 MySQL 8.4 数据库，所有业务表以 `ar_` 开头，不连接旧 `wechat` 服务或旧数据库，也不需要 Redis。
+独立的 Node.js 24 / TypeScript / Express 5 后端，为原生微信小程序 **AR设备租赁**（`wx03dbf50c15cac06f`）提供登录、设备、租赁、微信支付与退款接口。使用独立 MySQL 8 数据库（CI 使用 8.4，当前线上为 TDSQL-C MySQL 8.0.30），所有业务表以 `ar_` 开头，不连接旧 `wechat` 服务或旧数据库，也不需要 Redis。
 
 公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://d.4mr.cn/d?i=UUID&t=rs2`；扫码入口与 API 域名分别配置。同一工程的小程序源码位于 [apps/miniprogram](../miniprogram)。
 
-所有当前商户通过同一个小程序及 `d.4mr.cn` 总入口接入，新建商户默认共享入口 1，不单独填写 AppID、域名或 AppSecret。商户 adminer 维护本商户的名称和 Logo 等品牌基础属性，并在每个文旅场地维护独立显示样式、主图及租金、押金。设备绑定场地并继承场地所属商户，订单绑定设备；服务端在下单时确定商户、费用和收款配置，支付、查单和退款沿用订单原始快照。共享小程序的消费者统一登录且没有商户管理归属，员工权限由独立成员关系决定。当前 schema 15，入口与支付凭据分开，旧设备金额已归档，商户品牌独立保存；迁移与接入说明见 [多商户运行说明](../../docs/multi-merchant.md)。
+所有当前商户通过同一个小程序及 `d.4mr.cn` 总入口接入，新建商户默认共享入口 1，不单独填写 AppID、域名或 AppSecret。商户 adminer 维护本商户的名称和 Logo 等品牌基础属性，并在每个文旅场地维护独立显示样式、主图及租金、押金。设备绑定场地并继承场地所属商户，订单绑定设备；服务端在下单时确定商户、费用和收款配置，支付、查单和退款沿用订单原始快照。共享小程序的消费者统一登录且没有商户管理归属，员工权限由独立成员关系决定。当前 schema 16，入口与支付凭据分开，旧设备金额已归档，商户品牌独立保存，用户头像存入独立表；迁移与接入说明见 [多商户运行说明](../../docs/multi-merchant.md)。
 
 ## 部署
 
@@ -75,6 +75,8 @@ GHCR 首次发布默认是私有包；管理员仍需检查组织包权限。Por
 | `GET /api/v2/rental/capabilities` | 最低客户端协议和场地、员工、报价能力 |
 | `POST /api/v2/rental/auth/login` | 微信 `code` 换取本服务身份令牌 |
 | `POST /api/v2/rental/auth/refresh` | 刷新身份令牌 |
+| `PATCH /api/v2/rental/profile` | 本人提交昵称及可选头像 |
+| `GET /api/v2/rental/profile/avatars/:token` | 读取随机地址标识的当前头像图片 |
 | `/api/v2/rental/devices` | 设备识别、登记、场地绑定及开放配置 |
 | `/api/v2/rentals` | 租赁记录、支付、结束及退款查询 |
 | `/api/v2/rental/admin` | 管理员设备列表与 adminer/root 分级身份管理 |
@@ -85,6 +87,10 @@ GHCR 首次发布默认是私有包；管理员仍需检查组织包权限。Por
 | `GET /admin/` | 同源网页管理后台，见 [使用说明](../../docs/admin.md) |
 | `POST /api/v2/rental/payment-notify` | 微信支付通知 |
 | `POST /api/v2/rental/refund-notify` | 微信退款通知 |
+
+用户资料由用户主动填写：小程序使用微信 `chooseAvatar` 和 `input type="nickname"` 提供头像选择、微信昵称快速填写和自定义昵称，再提交 `PATCH /api/v2/rental/profile`。请求仅接受 `nickname`（去除首尾空格后 1–32 个 Unicode 字符，拒绝控制字符）和可选 `avatarDataUrl`（PNG/JPEG/WebP，最多 256 KB）。省略头像时保留原图，拒绝任意头像 URL、账号编号、身份或商户字段。接口只修改当前认证账号，并在事务锁内复核微信身份与认证版本；昵称、头像字节和图片地址一同保存。返回 `{ user }`，后续登录、令牌刷新和授权用户目录均包含保存后的昵称与头像。
+
+头像使用 64 位随机令牌地址，替换后旧地址失效；读取返回图片类型、`nosniff` 和 `no-store`，不暴露用户身份字段。schema 16 的新增迁移不会改写已有昵称、头像 URL、权限或订单；须先运行 `npm run migrate` 再启动新版本。昵称搜索兼容中文、emoji 与 ASCII 手机号列。
 
 金额均使用整数分；支付与退款状态以经过服务端校验的微信结果为准。配置不完整时不会提供支付就绪状态。业务写入、设备占用与结算由数据库事务、唯一约束及幂等标识保护。
 
