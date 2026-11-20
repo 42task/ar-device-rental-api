@@ -21,7 +21,7 @@ class RentalDb {
       INSERT INTO ar_user(id,role) VALUES(1,'user'),(2,'manager'),(3,'user'),(4,'root'),(5,'adminer');
       CREATE TABLE ar_venue(id INTEGER PRIMARY KEY,merchant_id INTEGER NOT NULL,name TEXT,address TEXT DEFAULT '',description TEXT DEFAULT '',status TEXT NOT NULL DEFAULT 'active',use_fee_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1);
       INSERT INTO ar_venue(id,merchant_id,name,use_fee_cents,deposit_cents) VALUES(1,1,'场地一',2000,20000),(2,2,'场地二',3000,9000),(3,1,'场地三',3000,10000);
-      CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,merchant_id INTEGER NOT NULL DEFAULT 1,venue_id INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,remark_name TEXT NOT NULL DEFAULT '',merchant_id INTEGER NOT NULL DEFAULT 1,venue_id INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
       INSERT INTO ar_device(id,uuid,device_type,name) VALUES(7,'camera-7','rokid','AR眼镜'),(8,'camera-8','ios','设备8');`);
     const mysql = readFileSync(resolve('database/002-rentals.sql'), 'utf8');
     const schema = mysql.replace(/^\s*--.*$/gm, '')
@@ -119,7 +119,8 @@ describe('independent AR rental lifecycle', () => {
   it.each(['manager', 'adminer', 'root'] as const)('inherits device operations for %s without trusting a forged client role', async role => {
     const f = fixture(); const actor = f[role];
     expect((await f.service.context(actor, 'role-device-' + role)).actions.canCreate).toBe(true);
-    const created = await f.service.createDevice(actor, { venueId: 1, uuid: 'role-device-' + role });
+    const created = await f.service.createDevice(actor, { venueId: 1, uuid: 'role-device-' + role, remarkName: '  前台备用机  ' });
+    expect(created.device.remarkName).toBe('前台备用机');
     await f.service.configure(actor, created.device.id, { enabled: true, version: 0 });
     expect(await f.service.context(f.user, created.device.uuid)).toMatchObject({ state: 'AVAILABLE', pricing: { totalCents: 22000 }, actions: { canRent: true, canConfigure: false } });
     expect((await f.service.devices(actor, { venueId: 1, search: created.device.uuid })).total).toBe(1);
@@ -127,6 +128,24 @@ describe('independent AR rental lifecycle', () => {
     await expect(f.service.createDevice(forged, { venueId: 1, uuid: 'forged-role-' + role })).rejects.toMatchObject({ status: 403 });
     await expect(f.service.configure(forged, created.device.id, { enabled: false, version: 1 })).rejects.toMatchObject({ status: 403 });
     expect((await f.service.context(actor, created.device.uuid)).pricing).toMatchObject({ enabled: true, totalCents: 22000, version: 1 });
+  });
+  it('keeps remarks private, makes them searchable, and restricts updates to current adminers and root', async () => {
+    const f = fixture();
+    const result = await f.service.createDevice(f.manager, { venueId: 1, uuid: 'remark-device', name: '公开名称', remarkName: '一楼 %_ 备用机' });
+    const deviceId = result.device.id;
+    expect(await f.service.createDevice(f.manager, { venueId: 1, uuid: 'remark-device', remarkName: '不能覆盖' })).toMatchObject({ created: false, device: { remarkName: '一楼 %_ 备用机' } });
+    expect(await f.service.devices(f.manager, { venueId: 1, search: '一楼 %_' })).toMatchObject({ total: 1, items: [{ device: { id: deviceId, remarkName: '一楼 %_ 备用机' } }] });
+    expect((await f.service.context(f.user, 'remark-device')).device).not.toHaveProperty('remarkName');
+    expect((await f.service.context(f.manager, 'remark-device')).actions.canEditDeviceRemark).toBe(false);
+    await expect(f.service.updateDeviceRemark(f.manager, deviceId, { remarkName: '无权修改' })).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.updateDeviceRemark(f.user, deviceId, { remarkName: '无权修改' })).rejects.toMatchObject({ status: 403 });
+    await expect(f.service.updateDeviceRemark(f.adminer, deviceId, { remarkName: '无效\n输入' })).rejects.toMatchObject({ status: 422 });
+    expect(await f.service.updateDeviceRemark(f.adminer, deviceId, { remarkName: '  二楼备用机  ' })).toMatchObject({ device: { name: '公开名称', remarkName: '二楼备用机' } });
+    expect((await f.service.context(f.adminer, 'remark-device')).actions.canEditDeviceRemark).toBe(true);
+    await f.db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [f.adminer.user.id]);
+    await expect(f.service.updateDeviceRemark(f.adminer, deviceId, { remarkName: '权限已撤销' })).rejects.toMatchObject({ status: 403 });
+    expect(await f.service.updateDeviceRemark(f.root, deviceId, { remarkName: '' })).toMatchObject({ device: { name: '公开名称', remarkName: '' } });
+    expect(await f.db.one('SELECT * FROM ar_rental_config WHERE device_id=?', [deviceId])).toBeNull();
   });
   it('retains device capabilities when a system administrator is demoted to device manager', async () => {
     const f = fixture(); await f.configure(); const paid = await f.pay();
@@ -492,6 +511,8 @@ describe('independent AR rental lifecycle', () => {
     registerRentals(router, f.services, { ...f.options, authenticate });
     const route = router.routes.find(route => route.method === 'GET' && route.path === '/v2/rental/devices/context')!;
     await expect(route.handler({ query: { uuid: 'camera-7' }, res: { setHeader() {} } } as any)).rejects.toThrow('unauthorized');
+    const remark = router.routes.find(route => route.method === 'PATCH' && route.path === '/v2/rental/devices/:id/remark')!;
+    await expect(remark.handler({ params: { id: '7' }, body: { remarkName: '测试备注' }, res: { setHeader() {} } } as any)).rejects.toThrow('unauthorized');
     f.payment.notification.mockRejectedValueOnce(new Error('invalid signature'));
     await expect(f.service.paymentNotification({ req: { rawBody: '{}', headers: {} } } as any)).rejects.toThrow('invalid signature');
     expect(f.payment.payment).not.toHaveBeenCalled();
@@ -739,6 +760,14 @@ describe('admin device QR generation', () => {
 });
 
 describe('shared mini-program merchant rentals', () => {
+  it('updates remarks only in the authorized merchant scope', async () => {
+    const f = merchantFixture(true);
+    const adminer = { ...f.manager, user: { ...f.manager.user, id: f.first.adminer.user.id, role: 'adminer' } };
+    await expect(f.a(() => f.service.updateDeviceRemark(adminer, 9, { remarkName: '越权备注' }))).rejects.toMatchObject({ status: 404 });
+    await expect(f.b(() => f.service.updateDeviceRemark(adminer, 9, { remarkName: '越权备注' }))).rejects.toMatchObject({ status: 403 });
+    expect((await f.a(() => f.service.updateDeviceRemark(adminer, 7, { remarkName: '第一商户备注' }))).device.remarkName).toBe('第一商户备注');
+    expect((await f.b(() => f.service.updateDeviceRemark({ ...f.root, merchantId: 2 }, 9, { remarkName: '第二商户备注' }))).device.remarkName).toBe('第二商户备注');
+  });
   it('keeps different mini-program identities isolated when merchant resolution is enabled', async () => {
     const f = merchantFixture(); await f.configure();
     const service = new RentalService(f.first.services, { ...f.options, resolveMerchant: f.resolveMerchant });

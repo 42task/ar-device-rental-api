@@ -31,14 +31,22 @@ function deviceName(value: unknown, uuid: string): string {
   return value.trim();
 }
 
+export function deviceRemarkName(value: unknown): string {
+  if (typeof value !== 'string' || [...value.trim()].length > 255 || /[\x00-\x1f\x7f]/.test(value)) {
+    throw new ApiError(422, '设备备注名称最多 255 个字符，且不含控制字符');
+  }
+  return value.trim();
+}
+
 /** Devices belong to this application and are registered only after explicit confirmation. */
 export class DeviceService {
   constructor(private readonly services: Services) {}
 
-  static display(row: Row): Row {
+  static display(row: Row, management = false): Row {
     const merchantId = Number(row.merchant_id);
     const venueId = Number(row.venue_id);
     return { id: Number(row.id), uuid: String(row.uuid), name: String(row.name || row.uuid), type: resolveDeviceType(String(row.device_type || DEFAULT_DEVICE_TYPE)),
+      ...(management ? { remarkName: String(row.remark_name ?? '') } : {}),
       ...(Number.isSafeInteger(merchantId) && merchantId > 0 ? { merchantId } : {}), ...(row.merchant_name ? { merchantName: String(row.merchant_name) } : {}),
       ...(Number.isSafeInteger(venueId) && venueId > 0 ? { venueId } : {}), ...(row.venue_name ? { venueName: String(row.venue_name) } : {}) };
   }
@@ -55,6 +63,7 @@ export class DeviceService {
     const uuid = deviceUuid(input.uuid);
     const device_type = deviceType(input.type ?? input.device_type);
     const name = deviceName(input.name, uuid);
+    const remark_name = input.remarkName === undefined ? undefined : deviceRemarkName(input.remarkName);
     const venueId = Number(input.venueId);
     if (!Number.isSafeInteger(venueId) || venueId < 1) throw new ApiError(422, '请选择设备所属场地');
     let result: { row: Row; created: boolean };
@@ -76,7 +85,7 @@ export class DeviceService {
           if (Number(existing.venue_id) !== venueId) throw new ApiError(409, '设备已绑定其他场地，请通过设备设置调整');
           return { row: { ...existing, venue_name: venue.name }, created: false };
         }
-        return { row: { ...await db.insert('ar_device', { uuid, name, device_type, merchant_id: ownerId, venue_id: venueId }), venue_name: venue.name }, created: true };
+        return { row: { ...await db.insert('ar_device', { uuid, name, remark_name, device_type, merchant_id: ownerId, venue_id: venueId }), venue_name: venue.name }, created: true };
       });
     } catch (error: any) {
       // The binary UUID unique index resolves concurrent confirmations.
@@ -89,6 +98,6 @@ export class DeviceService {
       result = { row: { ...existing, venue_name: venue?.name }, created: false };
     }
     // No rental configuration is written here, so new devices remain disabled.
-    return { device: DeviceService.display(result.row), created: result.created };
+    return { device: DeviceService.display(result.row, true), created: result.created };
   }
 }

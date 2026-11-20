@@ -6,7 +6,7 @@ import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
 import { archiveDevicePricing } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
@@ -180,13 +180,17 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
         { version: 14, filename: '014-merchant-branding.sql', run: async (_db: Database) => {} },
         { version: 15, filename: '015-venue-appearance.sql', run: async (_db: Database) => {} },
         { version: 16, filename: '016-user-profile.sql', run: async (_db: Database) => {} },
+        { version: 17, filename: '017-device-remark-name.sql', run: async (_db: Database) => {},
+          alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='remark_name'") },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');
         const recorded = await connection.one('SELECT checksum FROM ar_schema_migration WHERE version=?', [step.version]);
         if (recorded && recorded.checksum !== checksum) throw new Error(`Applied migration ${step.version} was modified; use a new migration instead.`);
         if (version < step.version) {
-          for (const statement of source.replace(/^\s*--.*$/gm, '').split(';').map(value => value.trim()).filter(Boolean)) await connection.execute(statement);
+          if (!await step.alreadyApplied?.(connection)) {
+            for (const statement of source.replace(/^\s*--.*$/gm, '').split(';').map(value => value.trim()).filter(Boolean)) await connection.execute(statement);
+          }
           await step.run(connection);
           await connection.transaction(async tx => {
             await tx.execute('INSERT INTO ar_schema_migration (version,checksum,applied_ms) VALUES (?,?,?)', [step.version, checksum, Date.now()]);

@@ -20,8 +20,8 @@ class DeviceDb {
       INSERT INTO ar_merchant_membership VALUES(2,1,'manager','active',1),(3,2,'adminer','active',1);
       CREATE TABLE ar_venue(id INTEGER PRIMARY KEY,merchant_id INTEGER,name TEXT,address TEXT,description TEXT,status TEXT,use_fee_cents INTEGER,deposit_cents INTEGER,version INTEGER,contact_phone TEXT);
       INSERT INTO ar_venue VALUES(101,1,'默认场地','','','active',2000,8000,1,'private-contact'),(202,2,'测试场地','','','active',300,1000,1,'private-contact');
-      CREATE TABLE ar_device(id INTEGER PRIMARY KEY,uuid TEXT,name TEXT,device_type TEXT,merchant_id INTEGER,venue_id INTEGER);
-      INSERT INTO ar_device VALUES(11,'global-1','设备Alpha %_','Rokid Studio2',1,101),(12,'global-2','设备Beta %_','Rokid Studio2',2,202),(13,'global-3','第三台设备','Rokid Studio3',1,101);
+      CREATE TABLE ar_device(id INTEGER PRIMARY KEY,uuid TEXT,name TEXT,device_type TEXT,merchant_id INTEGER,venue_id INTEGER,remark_name TEXT DEFAULT '');
+      INSERT INTO ar_device(id,uuid,name,device_type,merchant_id,venue_id) VALUES(11,'global-1','设备Alpha %_','Rokid Studio2',1,101),(12,'global-2','设备Beta %_','Rokid Studio2',2,202),(13,'global-3','第三台设备','Rokid Studio3',1,101);
       CREATE TABLE ar_rental_config(device_id INTEGER PRIMARY KEY,merchant_id INTEGER,enabled INTEGER,version INTEGER);
       INSERT INTO ar_rental_config VALUES(11,1,1,1),(12,2,1,1),(13,1,0,1);
       CREATE TABLE ar_rental_order(id INTEGER PRIMARY KEY,device_id INTEGER,merchant_id INTEGER);
@@ -87,7 +87,7 @@ describe('explicit root device listing across merchants', () => {
     const f = fixture();
     f.db.sqlite.exec(`INSERT INTO ar_venue SELECT 102,merchant_id,'暂停景点',address,description,'paused',use_fee_cents,deposit_cents,version,contact_phone FROM ar_venue WHERE id=101;
       UPDATE ar_device SET venue_id=102,name='设备Alpha %_ another venue' WHERE id=13;
-      INSERT INTO ar_device VALUES(14,'venue-101-14','设备Alpha %_ 14','Rokid Studio2',1,101),(15,'venue-101-15','设备Alpha %_ 15','Rokid Studio2',1,101);`);
+      INSERT INTO ar_device(id,uuid,name,device_type,merchant_id,venue_id) VALUES(14,'venue-101-14','设备Alpha %_ 14','Rokid Studio2',1,101),(15,'venue-101-15','设备Alpha %_ 15','Rokid Studio2',1,101);`);
     const first = await f.scoped(1, () => f.service.devices(f.manager, { venueId: '101', search: '%_', pageSize: 2 }));
     expect(first).toMatchObject({ total: 3, page: 1, items: [{ device: { id: 15, venueId: 101 } }, { device: { id: 14, venueId: 101 } }] });
     expect(await f.scoped(1, () => f.service.devices(f.manager, { venueId: 101, search: '%_', pageSize: 2, page: 2 })))
@@ -113,7 +113,7 @@ describe('explicit root device listing across merchants', () => {
 
   it('keeps adminer access across its whole merchant and checks optional venue scope for all administrators', async () => {
     const f = fixture();
-    f.db.sqlite.exec("INSERT INTO ar_venue SELECT 203,merchant_id,'另一景点',address,description,status,use_fee_cents,deposit_cents,version,contact_phone FROM ar_venue WHERE id=202; INSERT INTO ar_device VALUES(14,'adminer-203','另一景点设备','Rokid Studio2',2,203)");
+    f.db.sqlite.exec("INSERT INTO ar_venue SELECT 203,merchant_id,'另一景点',address,description,status,use_fee_cents,deposit_cents,version,contact_phone FROM ar_venue WHERE id=202; INSERT INTO ar_device(id,uuid,name,device_type,merchant_id,venue_id) VALUES(14,'adminer-203','另一景点设备','Rokid Studio2',2,203)");
     expect(await f.scoped(2, () => f.service.devices(f.adminer, {}))).toMatchObject({ total: 2 });
     expect(await f.scoped(2, () => f.service.devices(f.adminer, { venueId: 203 })))
       .toMatchObject({ total: 1, items: [{ device: { id: 14, venueId: 203 } }] });
