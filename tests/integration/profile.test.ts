@@ -45,7 +45,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('MySQL user profiles and av
     const actor = await f.login('migration');
     await f.db.execute('UPDATE ar_user SET nickname=? WHERE id=?', ['已有昵称', actor.user.id]);
     await f.db.execute('DROP TABLE ar_user_avatar');
-    await f.db.execute('DELETE FROM ar_schema_migration WHERE version=16');
+    await f.db.execute('DELETE FROM ar_schema_migration WHERE version>=16');
     await f.db.execute('UPDATE ar_schema_meta SET version=15');
     await migrate(f.db); const journal = await f.db.query('SELECT * FROM ar_schema_migration ORDER BY version'); await migrate(f.db);
     expect((await f.db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(SCHEMA_VERSION);

@@ -15,10 +15,10 @@ export async function readDevicePage(db: Database, query: DevicePageQuery): Prom
   const scoped = merchantId !== undefined;
   if (allMerchants && (scoped || venueId !== undefined)) throw new ApiError(503, '设备查询范围冲突');
   const ownership = scoped || allMerchants;
-  const predicates = [...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : []), ...(search ? ["(d.uuid LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=')"] : [])];
+  const predicates = [...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : []), ...(search ? ["(d.uuid LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=' OR d.remark_name LIKE ? ESCAPE '=')"] : [])];
   const pattern = '%' + search.replace(/[=%_]/g, '=$&') + '%';
   const where = predicates.length ? ' WHERE ' + predicates.join(' AND ') : '';
-  const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern] : [])];
+  const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern, pattern] : [])];
   const [count, rows] = await Promise.all([
     db.one('SELECT COUNT(*) AS total FROM ar_device d' + where, values),
     db.query(`SELECT d.*,${allMerchants ? 'm.id AS merchant_record_id,m.name AS merchant_name,' : ''}v.id AS venue_record_id,v.merchant_id AS venue_merchant_id,v.name AS venue_name,

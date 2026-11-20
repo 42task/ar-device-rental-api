@@ -668,9 +668,28 @@ console.log('Local PEM imports, credential-read races and merchant-save context 
   const f = fixture('manager'); f.spec.setUser({ id: 10, role: 'manager', merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' }); await f.spec.createDeviceDialog();
   const form = f.document.querySelector('dialog').querySelector('form');
   const inputs = form.querySelectorAll('input'); inputs[0].value = 'Synthetic device'; inputs[1].value = 'synthetic-device';
+  inputs[2].value = '  一楼备用机  ';
   f.replies.push({ created: true }); await form.emit('submit');
   const created = f.calls.find(call => call.method === 'POST'); assert.equal(created.headers['X-Merchant-Id'], '2');
-  assert.deepEqual(JSON.parse(created.body), { name: 'Synthetic device', uuid: 'synthetic-device', type: 'Rokid Studio2', venueId: 11 });
+  assert.deepEqual(JSON.parse(created.body), { name: 'Synthetic device', uuid: 'synthetic-device', type: 'Rokid Studio2', venueId: 11, remarkName: '一楼备用机' });
+}
+
+for (const role of ['manager', 'adminer', 'root']) {
+  const f = fixture(role); f.spec.setUser({ id: 10, role, merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' });
+  const row = f.spec.deviceRow({ device: { id: 7, uuid: 'remark-test', name: '公开名称', remarkName: '一楼备用机' } });
+  assert.match(row.textContent, /一楼备用机/);
+  const edit = row.querySelectorAll('button').find(button => button.textContent === '修改备注');
+  assert.equal(!!edit, role !== 'manager');
+  if (!edit) continue;
+  await edit.emit('click');
+  const form = f.document.querySelector('dialog').querySelector('form');
+  assert.equal(form.querySelector('input').value, '一楼备用机');
+  form.querySelector('input').value = '';
+  f.replies.push({ device: { id: 7, remarkName: '' } }); await form.emit('submit');
+  const saved = f.calls.find(call => call.method === 'PATCH');
+  assert.match(saved.path, /\/rental\/devices\/7\/remark$/);
+  assert.equal(saved.headers['X-Merchant-Id'], '2');
+  assert.deepEqual(JSON.parse(saved.body), { remarkName: '' });
 }
 
 // A transfer cannot accidentally be submitted after the operation context changes.

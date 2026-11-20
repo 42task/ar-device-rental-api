@@ -19,6 +19,7 @@ export function registerRentals(router: ApiRouter, services: Services, options: 
   route('GET', '/v2/rental/admin/devices/:id/qrcode', async ctx => service.deviceQrcode(await identity(ctx), ctx.params.id));
   route('POST', '/v2/rental/devices', async ctx => service.createDevice(await identity(ctx), ctx.body));
   route('PATCH', '/v2/rental/devices/:id/config', async ctx => service.configure(await identity(ctx), ctx.params.id, ctx.body));
+  route('PATCH', '/v2/rental/devices/:id/remark', async ctx => service.updateDeviceRemark(await identity(ctx), ctx.params.id, ctx.body));
   route('GET', '/v2/rentals', async ctx => service.list(await identity(ctx), ctx.query));
   route('POST', '/v2/rentals', async ctx => {
     const result = await service.create(await identity(ctx), ctx.body);
