@@ -3,13 +3,13 @@ import type { Context, Row, Services } from '../core/contracts';
 import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
 import { hasDeviceManagement, requireManager, requireRoot } from '../core/roles';
-import { DeviceService, deviceUuid } from '../devices/service';
+import { DeviceService, deviceRemarkName, deviceUuid } from '../devices/service';
 import { rentalOrderNumber, rentalRefundNumber } from './numbers';
 import type { RentalOptions, RentalPrincipal } from './types';
 import { currentMerchant, entryMerchant, withMerchant } from '../merchants/context';
 import type { WeChatClient } from '../payments/wechat';
 import { publicVenue } from '../venues';
-import { legacyAccountAdapter, loadAccountPermissions } from '../auth/identity';
+import { legacyAccountAdapter, loadAccountPermissions, requireMerchantManagementScope } from '../auth/identity';
 import { refundStatusAfterObservation } from './refund-state';
 import { quoteForDevice, rentalCents as cents, venueForDevice } from './quotes';
 import { readDevicePage } from './device-queries';
@@ -27,6 +27,10 @@ const requestKey = (value: unknown): string => {
   return value;
 };
 const manager = (principal: RentalPrincipal) => hasDeviceManagement(principal.user);
+const canEditDeviceRemark = (user: Row | null): boolean => user?.role === 'adminer' || user?.role === 'root';
+function requireDeviceRemarkEditor(user: Row): void {
+  if (!canEditDeviceRemark(user)) throw new ApiError(403, '仅商户管理员或 root 可以修改设备备注名称');
+}
 const pagination = (query: Row): { page: number; pageSize: number } => {
   const requested = Number(query.page), size = Number(query.pageSize || query['per-page'] || 20);
   const page = Number.isSafeInteger(requested) && requested > 0 ? Math.min(requested, 10000000) : 1;
@@ -160,9 +164,9 @@ export class RentalService {
       mine: principal ? this.mine(row, principal) : false,
     };
   }
-  private displayDevice(device: Row): Row {
+  private displayDevice(device: Row, management = false): Row {
     const merchant = currentMerchant();
-    return { ...DeviceService.display(device), ...(device.merchant_id === undefined ? {} : { merchantId: Number(device.merchant_id), merchantName: device.merchant_name ?? (Number(device.merchant_id) === merchant?.id ? merchant.name : undefined) }) };
+    return { ...DeviceService.display(device, management), ...(device.merchant_id === undefined ? {} : { merchantId: Number(device.merchant_id), merchantName: device.merchant_name ?? (Number(device.merchant_id) === merchant?.id ? merchant.name : undefined) }) };
   }
   async context(principal: RentalPrincipal, uuid: unknown): Promise<Row> {
     return this.withDeviceMerchant(principal, 'uuid', uuid, false, () => this.contextInMerchant(principal, uuid));
@@ -172,7 +176,8 @@ export class RentalService {
     const merchant = currentMerchant();
     const device = await this.services.db.one('SELECT * FROM ar_device WHERE uuid = ?', [deviceUuid(uuid)]);
     if (device && merchant && Number(device.merchant_id) !== merchant.id) throw new ApiError(409, '设备属于其他商户，请使用对应小程序', 'MERCHANT_MISMATCH');
-    const canManage = await this.currentManager(principal);
+    const currentManager = await this.currentManagerUser(principal);
+    const canManage = !!currentManager;
     const owner = merchant ? { merchant: { id: merchant.id, name: merchant.name } } : {};
     if (!device) return { ...owner, device: null, state: 'UNREGISTERED', relation: 'none', pricing: null, rental: null, paymentReady: this.paymentReady(), actions: { canRent: false, canContinuePayment: false, canCancelPayment: false, ...this.refundActions(null, false), canConfigure: false, canCreate: canManage }, serverTime: iso(this.now()) };
     const config = await this.services.db.one('SELECT * FROM ar_rental_config WHERE device_id = ?' + (merchant ? ' AND merchant_id = ?' : ''), [device.id, ...(merchant ? [merchant.id] : [])]);
@@ -185,11 +190,12 @@ export class RentalService {
     const relation = current ? this.mine(current, principal) ? 'mine' : 'other' : 'none';
     const state = slot ? slot.state : price.enabled ? 'AVAILABLE' : 'DISABLED';
     const visible = current && (relation === 'mine' || canManage) ? this.view(current, principal) : null;
-    return { ...owner, device: this.displayDevice({ ...device, venue_name: venue.name }), venue: publicVenue(venue), state, relation, pricing: price, rental: visible, paymentReady: this.paymentReady(), actions: {
+    return { ...owner, device: this.displayDevice({ ...device, venue_name: venue.name }, canManage), venue: publicVenue(venue), state, relation, pricing: price, rental: visible, paymentReady: this.paymentReady(), actions: {
       canRent: !slot && price.enabled && price.totalCents > 0 && this.paymentReady(),
       canContinuePayment: current?.status === 'PENDING_PAYMENT' && relation === 'mine' && Number(current.expires_ms) > this.now(),
       canCancelPayment: current?.status === 'PENDING_PAYMENT' && relation === 'mine',
       ...this.refundActions(current, canManage), canConfigure: canManage, canCreate: false,
+      canEditDeviceRemark: canManage && canEditDeviceRemark(principal.user) && canEditDeviceRemark(currentManager),
     }, serverTime: iso(this.now()) };
   }
   async get(principal: RentalPrincipal, orderId: unknown): Promise<Row> {
@@ -509,6 +515,21 @@ export class RentalService {
   async configure(principal: RentalPrincipal, deviceId: unknown, input: Row): Promise<Row> {
     return this.withDeviceMerchant(principal, 'id', deviceId, true, () => this.configureInMerchant(principal, deviceId, input));
   }
+  async updateDeviceRemark(principal: RentalPrincipal, deviceId: unknown, input: Row): Promise<Row> {
+    this.assertPrincipal(principal);
+    requireDeviceRemarkEditor(principal.user);
+    requireMerchantManagementScope(principal.user);
+    const merchant = currentMerchant();
+    const remarkName = deviceRemarkName(input.remarkName);
+    return this.services.db.transaction(async db => {
+      const device = await db.one('SELECT * FROM ar_device WHERE id=?' + (merchant ? ' AND merchant_id=?' : '') + ' FOR UPDATE',
+        [id(deviceId), ...(merchant ? [merchant.id] : [])]);
+      if (!device) throw new ApiError(404, '设备不存在');
+      requireDeviceRemarkEditor(await this.requireCurrentManager(principal, db, true));
+      await db.execute('UPDATE ar_device SET remark_name=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', [remarkName, device.id]);
+      return { device: this.displayDevice({ ...device, remark_name: remarkName }, true) };
+    });
+  }
   private async configureInMerchant(principal: RentalPrincipal, deviceId: unknown, input: Row): Promise<Row> {
     this.assertPrincipal(principal); requireManager(principal.user);
     const merchant = currentMerchant();
@@ -577,7 +598,7 @@ export class RentalService {
     const search = typeof query.search === 'string' ? query.search.trim().slice(0, 100) : '';
     const result = await readDevicePage(this.services.db, { merchantId: allMerchants ? undefined : merchant?.id, venueId,
       allMerchants: allMerchants && !!merchant, search, page, pageSize });
-    return { items: result.items.map(item => ({ device: this.displayDevice(item.device), venue: publicVenue(item.venue), pricing: item.pricing, state: item.state })),
+    return { items: result.items.map(item => ({ device: this.displayDevice(item.device, true), venue: publicVenue(item.venue), pricing: item.pricing, state: item.state })),
       page, pageSize, total: result.total, scope: allMerchants ? 'all' : 'merchant', ...(allMerchants ? {} : { merchantId: merchant?.id ?? null }) };
   }
   async deviceQrcode(principal: RentalPrincipal, deviceId: unknown): Promise<Row> {
