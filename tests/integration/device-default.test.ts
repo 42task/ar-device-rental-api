@@ -32,7 +32,7 @@ async function sqlDefault(db: Database): Promise<unknown> {
   return (await db.one("SELECT COLUMN_DEFAULT AS value FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='ar_device' AND COLUMN_NAME='device_type'"))?.value;
 }
 
-describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device type defaults', () => {
+describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registration and migrations', () => {
   it.each([3, 4])('upgrades schema %i without changing existing device types and remains idempotent', async previousVersion => {
     await withTestDatabase(async db => {
       // Recreate the released schema's device table and version marker before upgrading.
@@ -51,6 +51,33 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device type def
       await migrate(db);
       expect(await sqlDefault(db)).toBe('Rokid Studio2');
       expect(await db.query('SELECT uuid,device_type FROM ar_device ORDER BY uuid')).toEqual([{ uuid: 'legacy-ios', device_type: 'ios' }, { uuid: 'legacy-rokid', device_type: 'rokid' }, { uuid: 'legacy-studio', device_type: 'rokid studio2' }, { uuid: 'sql-default', device_type: 'Rokid Studio2' }]);
+    });
+  });
+
+  it.each([false, true])('upgrades schema 16 and preserves device data (column already added: %s)', async columnAlreadyAdded => {
+    await withTestDatabase(async db => {
+      await migrate(db);
+      await db.execute('ALTER TABLE ar_device DROP COLUMN remark_name');
+      await db.execute('DELETE FROM ar_schema_migration WHERE version=17');
+      await db.execute('UPDATE ar_schema_meta SET version=16 WHERE name=?', ['ar-device-rental-api']);
+
+      const venue = await seedVenue(db);
+      const previous = { uuid: 'legacy-without-remark', name: '原设备名称', venue_id: venue.id };
+      await db.insert('ar_device', previous);
+      if (columnAlreadyAdded) {
+        await db.execute(await readFile(resolve('database/017-device-remark-name.sql'), 'utf8'));
+      }
+
+      await migrate(db);
+      expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: 17 });
+      expect(await db.one('SELECT uuid,name,venue_id,remark_name FROM ar_device')).toEqual({ ...previous, remark_name: '' });
+      const applied = await db.one('SELECT checksum,applied_ms FROM ar_schema_migration WHERE version=17');
+      expect(applied?.checksum).toMatch(/^[a-f0-9]{64}$/);
+
+      await db.execute('UPDATE ar_device SET remark_name=? WHERE uuid=?', ['一楼备用机', previous.uuid]);
+      await migrate(db);
+      expect(await db.one('SELECT uuid,name,venue_id,remark_name FROM ar_device')).toEqual({ ...previous, remark_name: '一楼备用机' });
+      expect(await db.one('SELECT checksum,applied_ms FROM ar_schema_migration WHERE version=17')).toEqual(applied);
     });
   });
 
@@ -80,11 +107,19 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device type def
       const duplicate = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: 'http-explicit-ios', type: 'rs2', venueId: venue.id });
       expect(duplicate.status).toBe(200);
       expect(duplicate.body).toMatchObject({ created: false, device: { uuid: 'http-explicit-ios', type: 'ios' } });
-      const concurrent = await Promise.all(Array.from({ length: 2 }, () => request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: 'http-concurrent-studio', type: 'rs2', venueId: venue.id })));
+      const remarks = ['一楼备用机', '二楼备用机'];
+      const concurrent = await Promise.all(remarks.map(remarkName => request(app).post('/api/v2/rental/devices').set('Authorization', bearer)
+        .send({ uuid: 'http-concurrent-studio', type: 'rs2', venueId: venue.id, remarkName })));
       expect(concurrent.map(result => result.status)).toEqual([200, 200]);
       expect(concurrent.map(result => result.body.created).sort()).toEqual([false, true]);
       expect(concurrent[0].body.device).toEqual(concurrent[1].body.device);
       expect(concurrent[0].body.device.type).toBe('Rokid Studio2');
+      const savedRemark = remarks[concurrent.findIndex(result => result.body.created)];
+      const device = concurrent[0].body.device;
+      expect(device.remarkName).toBe(savedRemark);
+      const change = await request(app).patch(`/api/v2/rental/devices/${device.id}/remark`).set('Authorization', bearer).send({ remarkName: '未经授权的备注' });
+      expect(change.status).toBe(403);
+      expect(await db.one('SELECT remark_name FROM ar_device WHERE id=?', [device.id])).toEqual({ remark_name: savedRemark });
       await migrate(db);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_device'))!.total)).toBe(cases.length + 1);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_config'))!.total)).toBe(0);

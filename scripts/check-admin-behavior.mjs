@@ -663,9 +663,9 @@ console.log('Local PEM imports, credential-read races and merchant-save context 
   assert.equal(f.calls.filter(call => call.method).length, 0); assert.match(form.textContent, /绑定商户已变化/);
 }
 
-// A confirmed device registration uses the authenticated merchant scope without a client receiving-account field.
-{
-  const f = fixture('manager'); f.spec.setUser({ id: 10, role: 'manager', merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' }); await f.spec.createDeviceDialog();
+// Each staff role can set an optional remark during registration in the authenticated merchant scope.
+for (const role of ['manager', 'adminer', 'root']) {
+  const f = fixture(role); f.spec.setUser({ id: 10, role, merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' }); await f.spec.createDeviceDialog();
   const form = f.document.querySelector('dialog').querySelector('form');
   const inputs = form.querySelectorAll('input'); inputs[0].value = 'Synthetic device'; inputs[1].value = 'synthetic-device';
   inputs[2].value = '  一楼备用机  ';
@@ -674,23 +674,71 @@ console.log('Local PEM imports, credential-read races and merchant-save context 
   assert.deepEqual(JSON.parse(created.body), { name: 'Synthetic device', uuid: 'synthetic-device', type: 'Rokid Studio2', venueId: 11, remarkName: '一楼备用机' });
 }
 
+// Registration prepared in one scope cannot dispatch after the merchant changes during the protocol check.
+{
+  const f = fixture('root'), { second } = roleMerchantContext(f);
+  await f.spec.createDeviceDialog();
+  const { form } = controls(f);
+  merchantField(form, '设备名称').value = 'Synthetic device';
+  merchantField(form, '设备 UUID').value = 'synthetic-device';
+  merchantField(form, '备注名称（选填）').value = '一楼备用机';
+  const check = deferred(), started = deferred();
+  f.context.fetch = async (path, options = {}) => {
+    if (path.endsWith('/rental/capabilities')) { started.resolve(); return check.promise; }
+    f.calls.push({ path, ...options }); return { ok: true, json: async () => ({ created: true }) };
+  };
+  const submission = form.emit('submit'); await started.promise;
+  f.spec.selectManagementMerchant(second);
+  check.resolve({ ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) });
+  await submission;
+  assert.equal(f.calls.some(call => call.method), false);
+  assert.equal(f.document.querySelector('.toast'), null);
+}
+
 for (const role of ['manager', 'adminer', 'root']) {
   const f = fixture(role); f.spec.setUser({ id: 10, role, merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' });
+  f.spec.setPage('devices');
   const row = f.spec.deviceRow({ device: { id: 7, uuid: 'remark-test', name: '公开名称', remarkName: '一楼备用机' } });
-  assert.match(row.textContent, /一楼备用机/);
+  assert.match(row.textContent, /remark-test/);
+  assert.match(row.textContent, /公开名称/);
+  assert.match(row.textContent, /备注：一楼备用机/);
   const edit = row.querySelectorAll('button').find(button => button.textContent === '修改备注');
   assert.equal(!!edit, role !== 'manager');
   if (!edit) continue;
   await edit.emit('click');
   const form = f.document.querySelector('dialog').querySelector('form');
   assert.equal(form.querySelector('input').value, '一楼备用机');
-  form.querySelector('input').value = '';
-  f.replies.push({ device: { id: 7, remarkName: '' } }); await form.emit('submit');
+  const remarkName = role === 'adminer' ? '二楼备用机' : '';
+  form.querySelector('input').value = remarkName;
+  f.replies.push({ device: { id: 7, remarkName } }); await form.emit('submit');
   const saved = f.calls.find(call => call.method === 'PATCH');
   assert.match(saved.path, /\/rental\/devices\/7\/remark$/);
   assert.equal(saved.headers['X-Merchant-Id'], '2');
-  assert.deepEqual(JSON.parse(saved.body), { remarkName: '' });
+  assert.deepEqual(JSON.parse(saved.body), { remarkName });
+  assert.equal(f.context.pageLoads, 1);
 }
+
+// A completed remark edit only refreshes the device list if the draft's scope is still current.
+{
+  const f = fixture('root'), { first, second } = roleMerchantContext(f);
+  f.spec.setPage('devices');
+  const row = f.spec.deviceRow({ device: { id: 7, uuid: 'remark-test', remarkName: '一楼备用机' } });
+  await row.querySelectorAll('button').find(button => button.textContent === '修改备注').emit('click');
+  const { form } = controls(f), response = deferred(), started = deferred();
+  merchantField(form, '备注名称').value = '二楼备用机';
+  f.context.fetch = async (path, options = {}) => {
+    if (path.endsWith('/rental/capabilities')) return { ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) };
+    f.calls.push({ path, ...options }); started.resolve(); return response.promise;
+  };
+  const submission = form.emit('submit'); await started.promise;
+  f.spec.selectManagementMerchant(second);
+  response.resolve({ ok: true, json: async () => ({ device: { id: 7, remarkName: '二楼备用机' } }) });
+  await submission;
+  assert.equal(f.calls.find(call => call.method === 'PATCH').headers['X-Merchant-Id'], String(first.id));
+  assert.equal(f.context.pageLoads, 0);
+  assert.equal(f.document.querySelector('.toast'), null);
+}
+console.log('Device remark registration, role-restricted editing, list display and delayed-response isolation verified.');
 
 // A transfer cannot accidentally be submitted after the operation context changes.
 {

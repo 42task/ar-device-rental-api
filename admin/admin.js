@@ -527,7 +527,12 @@ function pagination(page, result) {
 }
 function deviceRow(item) {
   const row = el('tr'); const pricing = item.pricing || {}; const device = item.device || {};
-  const identity = textCell(device.uuid, device.remarkName || (device.name && device.name !== device.uuid ? device.name : '')); identity.classList.add('device-identity');
+  const identity = textCell(device.uuid, device.name && device.name !== device.uuid ? device.name : ''); identity.classList.add('device-identity');
+  if (device.remarkName) {
+    const remark = el('div', 'cell-sub', '备注：' + device.remarkName);
+    remark.title = remark.textContent;
+    identity.append(remark);
+  }
   const status = append(el('td'), badge(item.state, deviceLabels)); if (!pricing.enabled) status.append(el('div', 'cell-sub', '租赁未开放'));
   const actions = el('td', 'row-actions'); actions.append(button('配置', () => configureDialog(item), 'table-action'));
   if (canEditDeviceRemark(state.user.role)) actions.append(button('修改备注', () => deviceRemarkDialog(device), 'table-action'));
@@ -748,11 +753,14 @@ function noVenueGuidance(ui) {
   if (canManageVenues(state.user?.role)) ui.form.append(button('前往场地管理', () => { ui.node.close(); navigate('venues'); }, 'secondary'));
 }
 async function createDeviceDialog() {
+  if (!canUseAdmin(state.user?.role)) return;
   const ui = formDialog('登记新设备', '确认登记');
-  const selectedMerchantId = managementMerchantId();
+  const selectedMerchantId = managementMerchantId(), scope = deviceContextScope();
+  const current = () => ui.node.open && !!selectedMerchantId && scope === deviceContextScope();
+  const assertDraftScope = () => { if (!current()) throw new Error('账号或绑定商户已变化，请关闭后重新登记'); };
   ui.form.append(el('div', 'loading', '正在读取本商户场地…'));
   let venues;
-  try { venues = await activeVenues(); if (!ui.node.open) return; if (!selectedMerchantId || managementMerchantId() !== selectedMerchantId) throw new Error('当前商户已变化，请关闭后重新登记'); }
+  try { venues = await activeVenues(); if (!ui.node.open) return; assertDraftScope(); }
   catch (error) { if (ui.node.open) ui.form.replaceChildren(message(error.message)); return; }
   if (!venues.length) { noVenueGuidance(ui); return; }
   ui.form.replaceChildren();
@@ -769,20 +777,25 @@ async function createDeviceDialog() {
   ui.form.append(el('p', 'notice', '租金与押金使用所选场地的设置。新设备默认未开放租赁，核对场地后再开放。')); ui.ready();
   ui.form.addEventListener('submit', async event => {
     event.preventDefault(); if (ui.submit.disabled) return; ui.error.textContent = '';
-    if (!selectedMerchantId || managementMerchantId() !== selectedMerchantId) { ui.error.textContent = '绑定商户已变化，请关闭后重新登记'; return; }
     const payload = { name: name.value.trim(), uuid: uuid.value.trim(), type: type.value.trim(), venueId: Number(venue.value) };
-    if (remark.value.trim()) payload.remarkName = remark.value.trim();
+    const remarkName = remark.value.trim();
+    if (remarkName) payload.remarkName = remarkName;
     if (!payload.name || !payload.uuid || !payload.type || !venues.some(item => item.id === payload.venueId)) { ui.error.textContent = '请完整填写设备信息并选择本商户场地'; return; }
     ui.busy(true);
-    try { const result = await write('/rental/devices', payload); ui.node.close(); toast(result.created === false ? '该设备已登记，请在列表中查看' : '设备已登记并绑定场地，请核对后开放租赁'); state.filters.devices = { page: 1, search: '' }; if (state.page === 'devices') loadPage(); else navigate('devices'); }
-    catch (error) { ui.error.textContent = error.message; }
-    finally { ui.busy(false); }
+    try {
+      assertDraftScope();
+      const result = await api('/rental/devices', { method: 'POST', body: JSON.stringify(payload), beforeDispatch: assertDraftScope });
+      if (!current()) return;
+      ui.node.close(); toast(result.created === false ? '该设备已登记，请在列表中查看' : '设备已登记并绑定场地，请核对后开放租赁'); state.filters.devices = { page: 1, search: '' }; if (state.page === 'devices') loadPage(); else navigate('devices');
+    } catch (error) { if (ui.node.open) ui.error.textContent = error.message; }
+    finally { if (ui.node.open) ui.busy(false); }
   });
 }
 function deviceRemarkDialog(device) {
   if (!canEditDeviceRemark(state.user?.role)) return;
   const scope = deviceContextScope();
   const ui = formDialog('修改设备备注 · ' + device.uuid);
+  const current = () => ui.node.open && scope === deviceContextScope();
   const remark = field(ui.form, '备注名称', { value: device.remarkName || '', maxLength: 255, help: '仅管理端可见，留空可清除备注。' });
   ui.ready();
   ui.form.addEventListener('submit', async event => {
@@ -791,11 +804,12 @@ function deviceRemarkDialog(device) {
     try {
       await api('/rental/devices/' + encodeURIComponent(device.id) + '/remark', {
         method: 'PATCH', body: JSON.stringify({ remarkName: remark.value.trim() }),
-        beforeDispatch: () => { if (!ui.node.open || scope !== deviceContextScope()) throw new Error('当前账号或商户已变化，请重新打开设备'); },
+        beforeDispatch: () => { if (!current()) throw new Error('当前账号或商户已变化，请重新打开设备'); },
       });
+      if (!current()) return;
       ui.node.close(); toast('设备备注已保存'); if (state.page === 'devices') loadPage();
-    } catch (error) { ui.error.textContent = error.message; }
-    finally { ui.busy(false); }
+    } catch (error) { if (ui.node.open) ui.error.textContent = error.message; }
+    finally { if (ui.node.open) ui.busy(false); }
   });
 }
 async function configureDialog(item) {
