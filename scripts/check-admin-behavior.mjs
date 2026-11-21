@@ -460,6 +460,7 @@ for (const invalidation of ['account', 'role', 'authorization', 'merchant', 'log
   await f.spec.loadPage(); assert.equal(currentVenueSelect(f), undefined); assert.equal(f.calls.some(call => call.path.endsWith('/venues')), false);
   const query = new URL(f.calls.find(call => call.path.includes('/devices?')).path, f.context.location.origin).searchParams;
   assert.equal(query.has('venueId'), false); assert.equal(f.app.querySelector('tbody').querySelectorAll('tr').length, 2); assert.ok(f.app.querySelector('.device-summary'));
+  assert.equal(f.app.querySelector('thead').querySelector('th').textContent, '设备');
 }
 console.log('Manager venue selection, fixed merchant scope, filtered devices and delayed-response isolation verified.');
 
@@ -699,9 +700,11 @@ for (const role of ['manager', 'adminer', 'root']) {
   const f = fixture(role); f.spec.setUser({ id: 10, role, merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' });
   f.spec.setPage('devices');
   const row = f.spec.deviceRow({ device: { id: 7, uuid: 'remark-test', name: '公开名称', remarkName: '一楼备用机' } });
-  assert.match(row.textContent, /remark-test/);
-  assert.match(row.textContent, /公开名称/);
-  assert.match(row.textContent, /备注：一楼备用机/);
+  const identity = row.querySelector('.device-identity');
+  assert.equal(identity.querySelector('.cell-main').textContent, '一楼备用机');
+  assert.equal(identity.querySelector('.cell-sub').textContent, 'remark-test');
+  assert.ok(identity.querySelector('.cell-sub').classList.contains('device-uuid'));
+  assert.equal(identity.children.length, 2);
   const edit = row.querySelectorAll('button').find(button => button.textContent === '修改备注');
   assert.equal(!!edit, role !== 'manager');
   if (!edit) continue;
@@ -716,6 +719,18 @@ for (const role of ['manager', 'adminer', 'root']) {
   assert.equal(saved.headers['X-Merchant-Id'], '2');
   assert.deepEqual(JSON.parse(saved.body), { remarkName });
   assert.equal(f.context.pageLoads, 1);
+}
+
+// Devices without a remark use their ordinary name, or just the UUID when no distinct name exists.
+{
+  const f = fixture('root');
+  const named = f.spec.deviceRow({ device: { uuid: 'fallback-id', name: '公开名称', remarkName: '' } }).querySelector('.device-identity');
+  assert.equal(named.querySelector('.cell-main').textContent, '公开名称');
+  assert.equal(named.querySelector('.cell-sub').textContent, 'fallback-id');
+  const unnamed = f.spec.deviceRow({ device: { uuid: 'fallback-id', name: 'fallback-id' } }).querySelector('.device-identity');
+  assert.equal(unnamed.querySelector('.cell-main').textContent, 'fallback-id');
+  assert.ok(unnamed.querySelector('.cell-main').classList.contains('device-uuid'));
+  assert.equal(unnamed.querySelector('.cell-sub'), null);
 }
 
 // A completed remark edit only refreshes the device list if the draft's scope is still current.

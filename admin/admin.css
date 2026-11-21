@@ -226,7 +226,8 @@ tbody tr:hover { background: #f5f8fe; }
 .user-avatar.account-avatar { width: 32px; height: 32px; flex-basis: 32px; }
 .order-refund .cell-sub { max-width: none; }
 .device-identity { min-width: 140px; max-width: 300px; }
-.device-identity .cell-main { font-family: var(--mono); user-select: text; white-space: normal; overflow-wrap: anywhere; line-height: 1.7; }
+.device-identity .cell-main, .device-identity .device-uuid { white-space: normal; overflow-wrap: anywhere; line-height: 1.7; }
+.device-uuid { font-family: var(--mono); user-select: text; }
 .device-model { font-size: 14px; }
 .pagination { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 16px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .pagination-actions { display: flex; align-items: center; gap: 9px; }

@@ -501,7 +501,7 @@ function renderList(content, page, result, snapshot) {
     const wrap = el('div', 'table-wrap ' + page + '-table'); wrap.tabIndex = 0; wrap.setAttribute('role', 'region'); wrap.setAttribute('aria-label', pages[page][0] + '表格'); wrap.setAttribute('aria-describedby', hint.id);
     const table = el('table'); table.setAttribute('aria-label', pages[page][0]);
     const thead = el('thead'), tr = el('tr');
-    for (const label of page === 'devices' ? ['设备 UUID', '设备型号', '所属场地', '租赁状态', '场地租金', '场地押金', '操作'] : page === 'orders' ? ['订单 / 设备 / 场地', '租赁状态', '订单金额', '退款状态', '创建时间', '操作'] : ['用户', '手机号', '当前身份', '操作']) { const th = el('th', '', label); th.scope = 'col'; tr.append(th); }
+    for (const label of page === 'devices' ? ['设备', '设备型号', '所属场地', '租赁状态', '场地租金', '场地押金', '操作'] : page === 'orders' ? ['订单 / 设备 / 场地', '租赁状态', '订单金额', '退款状态', '创建时间', '操作'] : ['用户', '手机号', '当前身份', '操作']) { const th = el('th', '', label); th.scope = 'col'; tr.append(th); }
     thead.append(tr); const body = el('tbody');
     for (const item of result.items) body.append(page === 'devices' ? deviceRow(item) : page === 'orders' ? orderRow(item) : userRow(item));
     append(table, thead, body); append(wrap, table); append(card, hint, wrap);
@@ -527,12 +527,11 @@ function pagination(page, result) {
 }
 function deviceRow(item) {
   const row = el('tr'); const pricing = item.pricing || {}; const device = item.device || {};
-  const identity = textCell(device.uuid, device.name && device.name !== device.uuid ? device.name : ''); identity.classList.add('device-identity');
-  if (device.remarkName) {
-    const remark = el('div', 'cell-sub', '备注：' + device.remarkName);
-    remark.title = remark.textContent;
-    identity.append(remark);
-  }
+  const identity = el('td', 'device-identity');
+  const name = device.remarkName || device.name;
+  const hasDistinctName = Boolean(name && name !== device.uuid);
+  if (hasDistinctName) identity.append(el('div', 'cell-main', name));
+  identity.append(el('div', (hasDistinctName ? 'cell-sub' : 'cell-main') + ' device-uuid', device.uuid));
   const status = append(el('td'), badge(item.state, deviceLabels)); if (!pricing.enabled) status.append(el('div', 'cell-sub', '租赁未开放'));
   const actions = el('td', 'row-actions'); actions.append(button('配置', () => configureDialog(item), 'table-action'));
   if (canEditDeviceRemark(state.user.role)) actions.append(button('修改备注', () => deviceRemarkDialog(device), 'table-action'));
