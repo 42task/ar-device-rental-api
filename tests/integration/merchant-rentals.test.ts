@@ -18,11 +18,12 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
     try {
       await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4`);
       db = new Database(mysql.createPool({ ...settings, database, connectionLimit: 12 }));
-      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql']) {
+      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql']) {
         const sql = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(value => value.trim()).filter(Boolean);
         for (const statement of sql) await db.execute(statement);
       }
       await db.execute('ALTER TABLE ar_user ADD COLUMN merchant_id int NULL DEFAULT 1, ADD COLUMN auth_version int NOT NULL DEFAULT 0');
+      await db.execute('ALTER TABLE ar_user_phone ADD COLUMN identity_id int NULL');
       await db.execute("CREATE TABLE ar_merchant_membership (user_id int PRIMARY KEY,merchant_id int NOT NULL,role varchar(16) NOT NULL,status varchar(16) NOT NULL DEFAULT 'active',authorization_version int NOT NULL DEFAULT 1)");
       for (const table of ['ar_device', 'ar_rental_config', 'ar_rental_order', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job']) await db.execute(`ALTER TABLE ${table} ADD COLUMN merchant_id int NOT NULL DEFAULT 1`);
       await db.execute('ALTER TABLE ar_rental_order ADD COLUMN payment_config_id int NULL DEFAULT 1');
@@ -36,6 +37,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
       const appA = 'wx03dbf50c15cac06f', appB = shared ? appA : 'wx1111111111111111';
       for (const [id, role, merchantId, appid] of [[1, 'user', 1, appA], [2, 'user', 1, appA], [3, 'manager', 1, appA], [11, 'user', 2, appB], [13, 'manager', 2, appB], [20, 'root', null, appA]] as const) {
         await db.insert('ar_user', { id, role, appid, merchant_id: merchantId, openid: 'synthetic-payer-' + id });
+        if (role === 'user') await db.insert('ar_user_phone', { user_id: id, appid, phone_e164: '+86138001380' + String(id).padStart(2, '0'), country_code: '86', verified_ms: Date.now(), code_hash: String(id).padStart(64, '0'), identity_id: id });
         if (role === 'manager') await db.insert('ar_merchant_membership', { user_id: id, merchant_id: merchantId, role, status: 'active', authorization_version: 1 });
       }
       const deviceA = await db.insert('ar_device', { uuid: 'first-merchant-device', merchant_id: 1, venue_id: 1 });
@@ -72,7 +74,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
       const first = provider(appA, 'synthetic-merchant-a'), second = provider(appB, 'synthetic-merchant-b');
       const merchantA: MerchantRuntime = { id: 1, code: 'a', name: 'A', status: 'active', origin: 'https://a.example', appId: appA, client: first.client as any, configId: 1 };
       const merchantB: MerchantRuntime = { id: 2, code: 'b', name: 'B', status: 'active', origin: 'https://b.example', appId: appB, client: second.client as any, configId: 2 };
-      const principal = (id: number, role: string, merchant: MerchantRuntime): RentalPrincipal => ({ user: { id, role, merchant_id: role === 'root' ? null : merchant.id, auth_version: 0 }, appid: role === 'root' ? appA : merchant.appId, openid: 'synthetic-payer-' + id, merchantId: merchant.id, authVersion: 0 });
+      const principal = (id: number, role: string, merchant: MerchantRuntime): RentalPrincipal => ({ user: { id, role, merchant_id: role === 'root' ? null : merchant.id, auth_version: 0 }, appid: role === 'root' ? appA : merchant.appId, openid: 'synthetic-payer-' + id, merchantId: merchant.id, authVersion: 0, identityId: id });
       const managerA = principal(3, 'manager', merchantA), managerB = principal(13, 'manager', merchantB), payerB = principal(11, 'user', merchantB);
       let now = Date.now();
       const options = { appId: appA, payment: first.client as any, authenticate: async () => managerA, now: () => now,

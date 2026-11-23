@@ -24,7 +24,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       const appId = 'wx03dbf50c15cac06f', origin = 'https://admin.integration.test';
       for (const [id, role] of [[1, 'manager'], [2, 'user'], [3, 'root'], [4, 'adminer'], [5, 'adminer']] as const) await db.insert('ar_user', { id, role, appid: appId, openid: 'synthetic-admin-' + id });
       for (const [id, role] of [[1, 'manager'], [4, 'adminer'], [5, 'adminer']] as const) await db.insert('ar_merchant_membership', { user_id: id, merchant_id: 1, role, status: 'active', authorization_version: 1, updated_ms: Date.now() });
-      for (const [id, phone] of [[1, '+8613800138000'], [3, '+8613900139000'], [4, '+8613600136000'], [5, '+8613500135000']] as const) await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [id, appId, phone, '86', Date.now(), String(id).repeat(64)]);
+      const prospectPhone = '+8613400134000';
+      for (const [id, phone] of [[1, '+8613800138000'], [2, prospectPhone], [3, '+8613900139000'], [4, '+8613600136000'], [5, '+8613500135000']] as const) await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [id, appId, phone, '86', Date.now(), String(id).repeat(64)]);
       let providerCalls = 0;
       const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
       const client = { config: { appId }, codeSession: async (code: string) => ({ openid: 'synthetic-admin-' + code }), unlimitedCode: async () => { providerCalls++; return image; } };
@@ -44,8 +45,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
         const route = (method: string, path: string) => (ctx: any) => scoped(() => Promise.resolve(router.routes.find(row => row.method === method && row.path === '/v2/rental/admin/auth' + path)!.handler(ctx)));
         const call = (method: string, path: string, input: Parameters<typeof context>[0] = {}) => route(method, path)(context({ ...input, method })) as Promise<Row>;
         const changeRole = (input: Parameters<typeof context>[0]) => scoped(() => router.routes.find(row => row.method === 'PUT' && row.path === '/v2/rental/admin/users/:id/role')!.handler(context({ ...input, method: 'PUT' })) as Promise<Row>);
+        const lookupPhone = (input: Parameters<typeof context>[0]) => scoped(() => router.routes.find(row => row.method === 'POST' && row.path === '/v2/rental/admin/users/lookup-phone')!.handler(context({ ...input, method: 'POST' })) as Promise<Row>);
         const users = (input: Parameters<typeof context>[0]) => scoped(() => router.routes.find(row => row.method === 'GET' && row.path === '/v2/rental/admin/users')!.handler(context({ ...input, method: 'GET' })) as Promise<Row>);
-        return { auth, admin, route, call, changeRole, users };
+        return { auth, admin, route, call, changeRole, lookupPhone, users };
       });
       const tokens = [await nodes[0].auth.login('1'), await nodes[1].auth.login('3')].map(value => value.token.accessToken);
       let userToken = (await nodes[0].auth.login('2')).token.accessToken;
@@ -82,7 +84,10 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       const consumeAdminCtx = context({ id: adminChallenge.id, cookie: adminBrowserCookie });
       expect(await nodes[1].route('POST', '/challenges/:id/consume')(consumeAdminCtx)).toMatchObject({ user: { id: 4, role: 'adminer' } });
       const adminSessionCookie = consumeAdminCtx.res.append.mock.calls[0][1].split(';')[0];
-      await nodes[0].changeRole({ token: tokens[1], id: '2', body: { role: 'manager' } });
+      expect(await nodes[0].lookupPhone({ cookie: adminSessionCookie, body: { phone: prospectPhone } })).toMatchObject({
+        items: [{ id: 2, role: 'user', allowedRoles: ['manager', 'adminer'] }],
+      });
+      await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'manager', phone: prospectPhone } });
       await expect(nodes[1].auth.authenticateBearer(context({ token: userToken }))).rejects.toMatchObject({ status: 401 });
       userToken = (await nodes[0].auth.login('2')).token.accessToken;
       const userList = await nodes[0].users({ cookie: adminSessionCookie });
@@ -94,9 +99,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       for (const [id, role] of [['4', 'user'], ['5', 'manager'], ['3', 'user'], ['2', 'adminer']]) await expect(nodes[1].changeRole({ cookie: adminSessionCookie, id, body: { role } })).rejects.toMatchObject({ status: 403 });
       await expect(nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'root' } })).rejects.toMatchObject({ status: 422 });
       await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'user' } });
-      // Only root can grant adminer or demote an existing adminer. Previously issued
-      // browser cookies and JWTs immediately observe the lower current role.
-      await nodes[0].changeRole({ token: tokens[1], id: '2', body: { role: 'adminer' } });
+      // An adminer can grant their role to an ordinary user after verifying the phone.
+      // Root can then demote an existing adminer, invalidating their old credentials.
+      await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'adminer', phone: prospectPhone } });
       await expect(nodes[0].auth.authenticateBearer(context({ token: userToken }))).rejects.toMatchObject({ status: 401 });
       expect((await nodes[0].auth.login('2')).user.role).toBe('adminer');
       await nodes[0].changeRole({ token: tokens[1], id: '4', body: { role: 'manager' } });

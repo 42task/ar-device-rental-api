@@ -90,7 +90,7 @@ describe('merchant account identities and explicit assignment', () => {
     await f.db.execute("UPDATE ar_merchant_membership SET status='revoked',authorization_version=2 WHERE user_id=2");
     expect((await f.authenticate(f.first, f.target.token.accessToken)).user).toMatchObject({ role: 'user', merchant_id: null });
   });
-  it('separates platform consumers from merchant employee lists and restricts first staff grants to root', async () => {
+  it('keeps the platform directory root-only and requires a verified phone for an adminer grant', async () => {
     const f = await fixture(), consumer = await f.login(f.first, 'platform-consumer');
     const employeeList = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, f.root.token.accessToken))) as Row;
     expect(employeeList).toMatchObject({ scope: 'employees', items: [{ id: 2, role: 'manager' }] });
@@ -100,7 +100,7 @@ describe('merchant account identities and explicit assignment', () => {
     expect(platform.items.map((row: Row) => row.id)).toEqual([consumer.user.id]);
     const admin = await f.login(f.first, 'local-admin'); await f.member(admin.user.id, 1, 'adminer');
     const adminToken = (await f.login(f.first, 'local-admin')).token.accessToken;
-    await expect(runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, adminToken, { role: 'manager' }, { id: String(consumer.user.id) })))).rejects.toMatchObject({ status: 403 });
+    await expect(runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, adminToken, { role: 'manager' }, { id: String(consumer.user.id) })))).rejects.toMatchObject({ status: 404 });
     const denied = f.ctx(f.first, adminToken); denied.query.scope = 'platform';
     await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/users')(denied))).rejects.toMatchObject({ status: 403 });
     expect(await runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, f.root.token.accessToken, { role: 'manager' }, { id: String(consumer.user.id) })))).toMatchObject({ role: 'manager', merchantId: 1 });
@@ -237,7 +237,7 @@ describe('merchant account identities and explicit assignment', () => {
     const listed = await own(() => f.route('GET', 'admin/users')(f.ctx(f.first, staff.token.accessToken))) as Row;
     expect(listed.items.map((user: Row) => user.id)).toEqual([member.user.id]);
     expect(await own(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'manager' }, { id: String(member.user.id) })))).toMatchObject({ id: member.user.id, role: 'manager' });
-    await expect(own(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'user' }, { id: '2' })))).rejects.toMatchObject({ status: 409 });
+    await expect(own(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'user' }, { id: '2' })))).rejects.toMatchObject({ status: 404 });
     expect((await f.db.one('SELECT role,merchant_id FROM ar_user WHERE id=2'))!).toMatchObject({ role: 'manager', merchant_id: 1 });
   });
   it('keeps independent AppID identities and never links equal OpenIDs or UnionIDs across merchants', async () => {
