@@ -97,6 +97,7 @@ describe('independent rental authentication', () => {
   it('permits roots to grant manager with audit, excludes actor and rejects root promotion', async () => {
     const f = fixture(), root = await f.auth.login('code'); await f.bootstrap();
     f.client.codeSession.mockResolvedValue({ openid: 'second-user' }); const second = await f.auth.login('code-2');
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [second.user.id, appId, '+8613800138000', '86', Date.now(), 'b'.repeat(64)]);
     const change = f.route('PUT', '/v2/rental/admin/users/:id/role');
     await expect(change(f.context(root.token.accessToken, { role: 'root' }, { id: String(second.user.id) }))).rejects.toMatchObject({ status: 422 });
     const grant: any = await change(f.context(root.token.accessToken, { role: 'manager' }, { id: String(second.user.id) }));
@@ -108,26 +109,28 @@ describe('independent rental authentication', () => {
     await expect(f.route('GET', '/v2/rental/admin/users')(f.context(second.token.accessToken))).rejects.toMatchObject({ status: 403 });
     expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(3);
   });
-  it('shows complete verified phones only in the authorized directory and distinguishes unbound legacy numbers', async () => {
+  it('lists and counts only current-app verified phones in the authorized directory', async () => {
     const f = fixture(), root = await f.auth.login('root'); await f.bootstrap();
     f.client.codeSession.mockResolvedValueOnce({ openid: 'verified-user' }); const verified = await f.auth.login('verified');
     f.client.codeSession.mockResolvedValueOnce({ openid: 'unbound-user' }); const unbound = await f.auth.login('unbound');
+    f.client.codeSession.mockResolvedValueOnce({ openid: 'unverified-user' }); const unverified = await f.auth.login('unverified');
     const number = '+8613800138000';
     await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [verified.user.id, appId, number, '86', Date.now(), 'b'.repeat(64)]);
-    await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['13900139000', unbound.user.id]);
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [unverified.user.id, appId, '+8613400134000', '86', 0, 'c'.repeat(64)]);
+    await f.db.execute('UPDATE ar_user SET tel=? WHERE id IN (?,?)', ['13900139000', unbound.user.id, verified.user.id]);
     const list = f.route('GET', '/v2/rental/admin/users');
     const result = await list(f.context(root.token.accessToken)) as Row;
-    expect(result.items.find((user: Row) => user.id === verified.user.id)).toMatchObject({ tel: '+86 138****8000', phoneNumber: number, phoneVerified: true });
-    expect(result.items.find((user: Row) => user.id === unbound.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
+    expect(result).toMatchObject({ total: 1, items: [{ id: verified.user.id, tel: '+86 138****8000', phoneNumber: number, phoneVerified: true }] });
     expect(result.items.every((user: Row) => !('openid' in user) && !('code_hash' in user))).toBe(true);
+    expect(await list(f.context(root.token.accessToken, {}, {}, { page: '2' }))).toMatchObject({ page: 2, total: 1, items: [] });
+    expect(await list(f.context(root.token.accessToken, {}, {}, { search: '13900139000' }))).toMatchObject({ total: 0, items: [] });
     f.client.codeSession.mockResolvedValueOnce({ openid: 'verified-user' });
     expect((await f.auth.login('verified-again')).user).not.toHaveProperty('phoneNumber');
     expect((await f.auth.refresh(verified.token.refreshToken)).user).not.toHaveProperty('phoneNumber');
     await expect(list(f.context(verified.token.accessToken))).rejects.toMatchObject({ status: 403 });
     await expect(list(f.context(''))).rejects.toMatchObject({ status: 401 });
     await f.db.execute('UPDATE ar_user_phone SET appid=? WHERE user_id=?', ['wxaaaaaaaaaaaaaaaa', verified.user.id]);
-    const mismatched = await list(f.context(root.token.accessToken)) as Row;
-    expect(mismatched.items.find((user: Row) => user.id === verified.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
+    expect(await list(f.context(root.token.accessToken))).toMatchObject({ total: 0, items: [] });
   });
   it('lets root assign adminer and lets adminer manage only other lower-level users with fresh roles and audit', async () => {
     const f = fixture(), root = await f.auth.login('root'); await f.bootstrap();
@@ -137,6 +140,7 @@ describe('independent rental authentication', () => {
     const change = f.route('PUT', '/v2/rental/admin/users/:id/role');
     const phone = '+8613800138000';
     await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [target.user.id, appId, phone, '86', Date.now(), 'c'.repeat(64)]);
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [peer.user.id, appId, '+8613600136000', '86', Date.now(), 'd'.repeat(64)]);
     const set = (token: string, id: number, nextRole: string, verifiedPhone?: string) => change(f.context(token, { role: nextRole, reason: 'Synthetic role hierarchy test', phone: verifiedPhone }, { id: String(id) })) as Promise<Row>;
     await set(root.token.accessToken, admin.user.id, 'adminer');
     await set(root.token.accessToken, peer.user.id, 'adminer');
