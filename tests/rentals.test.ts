@@ -412,9 +412,10 @@ describe('independent AR rental lifecycle', () => {
   it.each(['manager', 'adminer'] as const)('keeps an approved timed-out refund occupied and retries the same refund only for a current %s', async role => {
     const f = fixture(); await f.configure(); const paid = await f.pay(); const actor = f[role];
     f.payment.payment.mockRejectedValueOnce(new Error('refund request timed out'));
-    const ended = await f.service.end(actor, paid.row.id, { refundMode: 'deposit', reason: '现场确认归还', idempotencyKey: 'timeout-end-request' });
+    const ended = await f.service.end(actor, paid.row.id, { refundMode: 'deposit', idempotencyKey: 'timeout-end-request' });
     expect(ended.rental).toMatchObject({ status: 'ENDED', refundStatus: 'PENDING', refundAmountCents: 20000 });
     const pending = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [paid.row.id]))!;
+    expect(pending.end_reason).toBeNull();
     expect((await f.service.context(f.user, 'camera-7')).state).toBe('SETTLING');
     const before = f.payment.payment.mock.calls.length;
     await expect(f.service.syncRefund(f.user, paid.row.id)).rejects.toMatchObject({ status: 403 });
@@ -424,7 +425,13 @@ describe('independent AR rental lifecycle', () => {
     expect(await f.service.get(actor, paid.row.id)).toMatchObject({ actions: { canEndRental: false, canSyncRefund: true, canRetryRefund: true } });
     expect((await f.service.retryRefund(actor, paid.row.id)).rental.refundStatus).toBe('PROCESSING');
     expect([...f.refunds.keys()]).toEqual([pending.out_refund_no]);
-    await f.service.end(f.root, paid.row.id, { refundMode: 'deposit', reason: '重复确认', idempotencyKey: 'timeout-end-duplicate' });
+    const refundAttempts = f.payment.payment.mock.calls.filter(([method, path]) => method === 'POST' && path === '/v3/refund/domestic/refunds');
+    expect(refundAttempts).toHaveLength(2);
+    for (const [, , body] of refundAttempts) {
+      expect(body!.out_refund_no).toBe(pending.out_refund_no);
+      expect(body).not.toHaveProperty('reason');
+    }
+    await f.service.end(f.root, paid.row.id, { refundMode: 'deposit', idempotencyKey: 'timeout-end-duplicate' });
     expect(f.refunds.size).toBe(1);
     await f.db.execute("UPDATE ar_user SET role='user' WHERE id=?", [actor.user.id]);
     await expect(f.service.end(actor, paid.row.id, { refundMode: 'deposit', reason: '已撤销权限后重试', idempotencyKey: 'revoked-end-duplicate' })).rejects.toMatchObject({ status: 403 });
@@ -439,10 +446,11 @@ describe('independent AR rental lifecycle', () => {
   it.each(['deposit', 'full'])('ends once with %s refund, stops timing and releases only after provider success', async mode => {
     const f = fixture(); await f.configure(); const paid = await f.pay(); f.advance(60000);
     await expect(f.service.end(f.user, paid.row.id, { refundMode: mode, reason: '归还', idempotencyKey: 'end-request-1' })).rejects.toMatchObject({ status: 403 });
-    const ended = await f.service.end(f.manager, paid.row.id, { refundMode: mode, reason: '现场确认归还', idempotencyKey: 'end-request-1', refundAmountCents: 1 });
+    const ended = await f.service.end(f.manager, paid.row.id, { refundMode: mode, reason: ' 现场确认归还 ', idempotencyKey: 'end-request-1', refundAmountCents: 1 });
     const amount = mode === 'deposit' ? 20000 : 22000;
     expect(ended.rental).toMatchObject({ status: 'ENDED', refundStatus: 'PROCESSING', refundAmountCents: amount });
     expect((await f.service.context(f.other, 'camera-7')).state).toBe('SETTLING');
+    expect(f.payment.payment).toHaveBeenCalledWith('POST', '/v3/refund/domestic/refunds', expect.objectContaining({ reason: '现场确认归还' }));
     const refund = [...f.refunds.values()][0];
     expect(refund.amount).toEqual({ refund: amount, total: 22000, currency: 'CNY' });
     expect(refund.out_refund_no).toMatch(/^ARF_[a-f0-9]{24}$/);
@@ -457,7 +465,7 @@ describe('independent AR rental lifecycle', () => {
   });
   it('ends zero-deposit rentals without sending a zero-amount provider refund', async () => {
     const f = fixture(); await f.configure(0, 500); const paid = await f.pay();
-    const ended = await f.service.end(f.manager, paid.row.id, { refundMode: 'deposit', reason: '已归还', idempotencyKey: 'end-request-1' });
+    const ended = await f.service.end(f.manager, paid.row.id, { refundMode: 'deposit', reason: '   ', idempotencyKey: 'end-request-1' });
     expect(ended.rental).toMatchObject({ refundAmountCents: 0, refundStatus: 'SUCCESS' });
     expect(f.refunds.size).toBe(0);
     expect((await f.service.context(f.user, 'camera-7')).state).toBe('AVAILABLE');

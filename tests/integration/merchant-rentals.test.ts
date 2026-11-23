@@ -112,10 +112,10 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
       const replacement = provider(appB, 'synthetic-replacement-merchant');
       if (shared) { merchantB.client = replacement.client as any; merchantB.configId = 3; }
       first.timeoutNextRefund();
-      const settlement = { refundMode: 'deposit', reason: '合成并发归还', idempotencyKey: 'merchant-a-settlement' };
+      const settlement = { refundMode: 'deposit', idempotencyKey: 'merchant-a-settlement' };
       const endings = await Promise.allSettled([
         runWithMerchant(merchantA, () => service.end(managerA, orderA.id, settlement)),
-        runWithMerchant(merchantA, () => service.end(principal(20, 'root', merchantA), orderA.id, { ...settlement, refundMode: 'full', idempotencyKey: 'merchant-a-other-choice' })),
+        runWithMerchant(merchantA, () => service.end(principal(20, 'root', merchantA), orderA.id, { refundMode: 'full', reason: '合成并发归还', idempotencyKey: 'merchant-a-other-choice' })),
       ]);
       expect(endings.filter(result => result.status === 'fulfilled')).toHaveLength(1);
       for (const result of endings) if (result.status === 'rejected') expect(result.reason).toMatchObject({ status: 409 });
@@ -153,7 +153,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant rental
         }
         const root = principal(20, 'root', merchantA);
         const endKey = 'same-root-end-key-across-merchants';
-        const closing = await Promise.allSettled(active.map(row => runWithMerchant(merchantA, () => service.end(root, row.id, { refundMode: 'deposit', reason: '合成跨商户并发归还', idempotencyKey: endKey }))));
+        const closing = await Promise.allSettled(active.map(row => runWithMerchant(merchantA, () => service.end(root, row.id, { refundMode: 'deposit', idempotencyKey: endKey }))));
         expect(closing.filter(result => result.status === 'fulfilled')).toHaveLength(1);
         for (const result of closing) if (result.status === 'rejected') expect(result.reason).toMatchObject({ status: 409 });
         expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_order WHERE ended_by=? AND end_key=?', [root.user.id, endKey]))!.total)).toBe(1);
