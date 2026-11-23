@@ -612,7 +612,7 @@ export class RentalService {
       LEFT JOIN ar_venue v ON v.id=d.venue_id AND v.merchant_id=d.merchant_id
       WHERE d.id=?` + (merchant ? ' AND d.merchant_id=?' : ''), [id(deviceId), ...(merchant ? [merchant.id] : [])]);
     if (!device) throw new ApiError(404, '设备不存在');
-    return { device: this.displayDevice(device), ...deviceQr(device.uuid, device.device_type, merchant?.origin) };
+    return { device: this.displayDevice(device, true), ...deviceQr(device.uuid, device.device_type, merchant?.origin) };
   }
   async paymentNotification(ctx: Context): Promise<Row> {
     const { notice, client, configId } = await this.notification(ctx);
