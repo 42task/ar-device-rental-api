@@ -16,6 +16,7 @@ async function requireClientProtocol() {
 }
 const app = document.querySelector('#app');
 const state = { user: null, merchant: null, managementMerchant: null, merchants: [], merchantId: null, merchantGeneration: 0, merchantRefreshGeneration: 0, deviceVenue: { scope: '', items: [], selectedId: null }, page: 'overview', sequence: 0, timer: null, challenge: null, loginGeneration: 0, filters: { devices: { page: 1, search: '' }, orders: { page: 1, search: '', status: '' }, users: { page: 1, search: '', scope: 'employees' } } };
+let userLookupPhone = '';
 const deviceLabels = { AVAILABLE: ['可租赁', 'green'], RESERVED: ['待支付占用', 'amber'], RENTED: ['租赁中', 'blue'], SETTLING: ['结算中', 'amber'], DISABLED: ['已停租', ''] };
 const orderLabels = { PENDING_PAYMENT: ['待支付', 'amber'], ACTIVE: ['租赁中', 'blue'], ENDED: ['已结束', 'green'], CANCELLED: ['已取消', ''], COMPENSATING: ['补偿退款中', 'amber'] };
 const refundLabels = { PENDING: '待退款', PROCESSING: '退款处理中', SUCCESS: '退款成功', ABNORMAL: '退款异常', CLOSED: '退款关闭' };
@@ -25,7 +26,7 @@ const pages = { overview: ['运营总览', 'OVERVIEW', '设备与租赁状态，
 const roles = {
   user: { label: '普通用户', rank: 0, description: '可以租赁设备、查询自己的订单与退款进度，不能管理设备或办理退款。' },
   manager: { label: '设备管理员', rank: 1, description: '可在所属商户选择景点并查看该景点设备；在小程序管理设备、确认归还及退款。' },
-  adminer: { label: '商户管理员', rank: 2, description: '管理所属商户的设备和业务，可在普通用户与设备管理员之间变更身份；不能修改商户管理员或 ROOT。' },
+  adminer: { label: '商户管理员', rank: 2, description: '管理所属商户的设备和业务，可授权普通用户成为设备管理员或商户管理员，也可撤销本商户设备管理员的权限。' },
   root: { label: 'ROOT · 超级管理员', rank: 3, description: '最高管理权限，可将其他非 ROOT 账号设为普通用户、设备管理员或商户管理员。ROOT 身份仅由指定手机号验证确认，此页面不能授予或修改。' },
 };
 const roleLabel = role => (Object.hasOwn(roles, role) ? roles[role] : roles.user).label;
@@ -36,6 +37,7 @@ const canManageBranding = role => ['adminer', 'root'].includes(role);
 const canEditDeviceRemark = role => ['adminer', 'root'].includes(role);
 const brandingThemes = { aero: ['晴空蓝', '清爽明亮，轻盈科技感'], forest: ['森林绿', '自然安静，适合户外场景'], sunset: ['落日橙', '温暖活力，适合文旅体验'], ink: ['曜石黑', '深色界面，简洁沉稳'] };
 function canOpenPage(page) { return Boolean(pages[page]) && (page !== 'users' || canManageUsers(state.user?.role)) && (page !== 'branding' || canManageBranding(state.user?.role)); }
+function isPhoneLookup(page) { return page === 'users' && state.user?.role === 'adminer' && state.filters.users.scope === 'phone'; }
 function managementMerchantId() {
   const value = state.user?.role === 'root' ? state.merchantId : ['manager', 'adminer'].includes(state.user?.role) ? state.managementMerchant?.id ?? state.user.merchantId : null;
   return Number.isSafeInteger(value) && value > 0 ? value : null;
@@ -61,6 +63,8 @@ function renderManagerVenuePrompt(content) {
 function merchantParentTitle() { return state.user?.role === 'root' ? '商户管理' : '我的商户'; }
 function applyManagementSession(session) {
   state.user = session.user;
+  userLookupPhone = '';
+  if (state.filters.users.scope === 'phone' || session.user.role !== 'root') state.filters.users.scope = 'employees';
   // Root has no staff membership; the session merchant is the entry's default scope.
   const merchant = session.user.role === 'root' ? session.merchant : Object.hasOwn(session, 'managementMerchant') ? session.managementMerchant : session.merchant;
   state.managementMerchant = session.user.role === 'root' ? null : merchant || null;
@@ -81,7 +85,10 @@ function openMerchantVenues(merchant = managementMerchant()) {
 }
 function assignableRoles(actor, target) {
   if (!actor || !target || String(actor.id) === String(target.id) || target.role === 'root' || !Object.hasOwn(roles, target.role)) return [];
-  const allowed = actor.role === 'root' ? ['user', 'manager', 'adminer'] : actor.role === 'adminer' && ['user', 'manager'].includes(target.role) ? ['user', 'manager'] : [];
+  let allowed = [];
+  if (actor.role === 'root') allowed = ['user', 'manager', 'adminer'];
+  if (actor.role === 'adminer' && target.role === 'manager') allowed = ['user', 'manager'];
+  if (actor.role === 'adminer' && target.role === 'user' && Array.isArray(target.allowedRoles)) allowed = ['manager', 'adminer'];
   return Array.isArray(target.allowedRoles) ? allowed.filter(role => target.allowedRoles.includes(role)) : allowed;
 }
 const money = cents => Number.isSafeInteger(Number(cents)) ? (Number(cents) / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
@@ -109,9 +116,9 @@ function userAvatar(user, className = '') {
   }
   return node;
 }
-function userCell(user) {
+function userCell(user, includePhone = true) {
   const cell = el('td'), identity = el('div', 'user-identity'), copy = el('div', 'user-copy');
-  const name = el('div', 'cell-main', userName(user)); name.title = name.textContent;
+  const name = el('div', 'cell-main', userName(user, includePhone)); name.title = name.textContent;
   append(copy, name, el('div', 'cell-sub', 'ID ' + user.id)); append(identity, userAvatar(user), copy); cell.append(identity); return cell;
 }
 function message(text, className = 'error') { const node = el('div', className, text); node.setAttribute('role', 'alert'); return node; }
@@ -168,6 +175,7 @@ async function boot() {
   }
 }
 function showLogin(reason = '') {
+  userLookupPhone = '';
   document.title = '微信扫码登录 · AR设备租赁';
   state.user = null; state.merchant = null; state.managementMerchant = null; state.merchantId = null; state.merchants = []; state.merchantGeneration++; state.sequence++; stopPolling();
   const generation = ++state.loginGeneration;
@@ -360,8 +368,11 @@ async function loadPage() {
   if (!state.user) return;
   if (!canOpenPage(state.page)) state.page = 'overview';
   const page = state.page;
+  if (page !== 'users') userLookupPhone = '';
   const sequence = ++state.sequence;
   const selectedMerchantId = managementMerchantId();
+  const phoneLookup = isPhoneLookup(page), phone = phoneLookup ? userLookupPhone : '';
+  const currentPhoneLookup = () => sequence === state.sequence && isPhoneLookup(state.page) && phone === userLookupPhone && selectedMerchantId === managementMerchantId();
   const deviceScope = page === 'devices' ? deviceContextScope() : '';
   const currentDevices = () => sequence === state.sequence && deviceScope && deviceScope === deviceContextScope();
   const managerScope = page === 'devices' ? managerDeviceScope() : '';
@@ -410,14 +421,23 @@ async function loadPage() {
       if (!currentManagerDevices() || managerDeviceVenue()?.id !== venue.id) return;
       if (!Array.isArray(result.items) || result.items.some(item => (item.device?.venueId ?? item.venue?.id) !== venue.id)) throw new Error('设备景点范围已变化，请重新加载');
       renderList(content, page, result, null);
+    } else if (phoneLookup) {
+      const result = phone ? await api('/rental/admin/users/lookup-phone', {
+        method: 'POST', body: JSON.stringify({ phone }), beforeDispatch: () => { if (!currentPhoneLookup()) throw new Error('搜索范围已变化，请重新查询'); },
+      }) : { items: [], total: 0 };
+      if (!currentPhoneLookup()) return;
+      if (!Array.isArray(result.items) || result.items.length > 1 || result.items.some(user => user.role !== 'user' || user.merchantId != null || !Number.isSafeInteger(user.id) || user.id < 1)) throw new Error('查询响应无效，请重新查询');
+      renderList(content, page, { ...result, total: result.items.length }, null);
     } else {
       const filters = state.filters[page]; const query = new URLSearchParams({ ...filters, 'per-page': '20' });
       const [result, snapshot] = await Promise.all([api('/rental/admin/' + page + '?' + query), page === 'devices' ? api('/rental/admin/overview').catch(() => null) : Promise.resolve(null)]);
       if (sequence === state.sequence && state.user && (page !== 'devices' || currentDevices())) renderList(content, page, result, snapshot);
     }
   } catch (error) {
-    if (sequence !== state.sequence || !state.user || page === 'devices' && !currentDevices()) return;
-    const empty = el('div', 'empty card'); append(empty, el('h3', '', '数据暂时无法加载'), el('p', '', error.message), button('重新加载', () => loadPage(), 'secondary')); content.replaceChildren(empty);
+    if (sequence !== state.sequence || !state.user || page === 'devices' && !currentDevices() || phoneLookup && !currentPhoneLookup()) return;
+    const empty = el('div', 'empty'); append(empty, el('h3', '', phoneLookup ? '查询未完成' : '数据暂时无法加载'), el('p', '', error.message), button('重新加载', () => loadPage(), 'secondary'));
+    const card = el('div', 'card'); if (phoneLookup) card.append(renderToolbar(page, { total: 0 }));
+    content.replaceChildren(append(card, empty));
   }
 }
 function renderOverview(content, data) {
@@ -447,12 +467,18 @@ function renderOverview(content, data) {
 }
 function renderToolbar(page, result) {
   const bar = el('div', 'toolbar'); const form = el('form', 'search-form'); form.setAttribute('role', 'search');
-  const search = el('input'); search.type = 'search'; search.maxLength = 100; search.value = state.filters[page].search;
-  search.placeholder = page === 'devices' ? '搜索设备' : page === 'orders' ? '搜索订单编号、设备名称或 UUID' : '搜索手机号或昵称';
+  const phoneLookup = isPhoneLookup(page);
+  const search = el('input'); search.type = phoneLookup ? 'tel' : 'search'; search.maxLength = 100; search.value = phoneLookup ? userLookupPhone : state.filters[page].search;
+  search.placeholder = phoneLookup ? '输入完整手机号' : page === 'devices' ? '搜索设备' : page === 'orders' ? '搜索订单编号、设备名称或 UUID' : '搜索手机号或昵称';
   search.setAttribute('aria-label', page === 'devices' ? '搜索设备名称、备注或 UUID' : search.placeholder);
   const searchField = el('div', 'search-field'); append(searchField, icon('search'), search);
-  const submit = button('搜索', null, 'secondary'); submit.type = 'submit'; append(form, searchField, submit);
-  form.addEventListener('submit', event => { event.preventDefault(); state.filters[page].search = search.value.trim(); state.filters[page].page = 1; loadPage(); });
+  const submit = button(phoneLookup ? '查找用户' : '搜索', null, 'secondary'); submit.type = 'submit'; append(form, searchField, submit);
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    if (phoneLookup) userLookupPhone = search.value.trim(); else state.filters[page].search = search.value.trim();
+    state.filters[page].page = 1;
+    return loadPage();
+  });
   bar.append(form);
   if (page === 'devices' && state.user.role === 'manager') {
     const scope = managerDeviceScope(), venue = el('select'); venue.setAttribute('aria-label', '选择当前景点');
@@ -476,10 +502,18 @@ function renderToolbar(page, result) {
     select.value = state.filters.orders.status;
     select.addEventListener('change', () => { state.filters.orders.status = select.value; state.filters.orders.page = 1; loadPage(); }); bar.append(select);
   }
-  if (page === 'users' && state.user.role === 'root') {
+  if (page === 'users' && canManageUsers(state.user.role)) {
     const scope = el('select'); scope.setAttribute('aria-label', '用户管理范围');
-    for (const [value, label] of [['employees', '本商户员工'], ['platform', '未分配商户的消费者']]) { const option = el('option', '', label); option.value = value; scope.append(option); }
-    scope.value = state.filters.users.scope || 'employees'; scope.addEventListener('change', () => { state.filters.users.scope = scope.value; state.filters.users.page = 1; loadPage(); }); bar.append(scope);
+    const alternative = state.user.role === 'root' ? ['platform', '未分配商户的消费者'] : ['phone', '按手机号查找普通用户'];
+    for (const [value, label] of [['employees', '本商户员工'], alternative]) { const option = el('option', '', label); option.value = value; scope.append(option); }
+    scope.value = state.filters.users.scope;
+    scope.addEventListener('change', () => {
+      if (!['employees', alternative[0]].includes(scope.value)) return;
+      userLookupPhone = '';
+      state.filters.users.scope = scope.value; state.filters.users.page = 1;
+      return loadPage();
+    });
+    bar.append(scope);
   }
   if (page === 'devices') { const create = button('登记设备', createDeviceDialog, '', 'plus'); create.disabled = state.user.role === 'manager' && !managerDeviceVenue(); bar.append(create); }
   else bar.append(el('span', 'muted', '共 ' + Number(result.total || 0) + ' 条记录'));
@@ -494,6 +528,7 @@ function deviceSummary(snapshot) {
 }
 function renderList(content, page, result, snapshot) {
   if (!Array.isArray(result.items)) throw new Error('列表响应格式无效');
+  const phoneLookup = isPhoneLookup(page);
   const card = el('div', 'card'); card.append(renderToolbar(page, result));
   if (result.items.length) {
     const hint = append(el('div', 'table-scroll-hint'), document.createTextNode('左右滑动查看完整信息'), icon('chevron-right'));
@@ -501,21 +536,28 @@ function renderList(content, page, result, snapshot) {
     const wrap = el('div', 'table-wrap ' + page + '-table'); wrap.tabIndex = 0; wrap.setAttribute('role', 'region'); wrap.setAttribute('aria-label', pages[page][0] + '表格'); wrap.setAttribute('aria-describedby', hint.id);
     const table = el('table'); table.setAttribute('aria-label', pages[page][0]);
     const thead = el('thead'), tr = el('tr');
-    for (const label of page === 'devices' ? ['设备', '设备型号', '所属场地', '租赁状态', '场地租金', '场地押金', '操作'] : page === 'orders' ? ['订单 / 设备 / 场地', '租赁状态', '订单金额', '退款状态', '创建时间', '操作'] : ['用户', '手机号', '当前身份', '操作']) { const th = el('th', '', label); th.scope = 'col'; tr.append(th); }
+    for (const label of page === 'devices' ? ['设备', '设备型号', '所属场地', '租赁状态', '场地租金', '场地押金', '操作'] : page === 'orders' ? ['订单 / 设备 / 场地', '租赁状态', '订单金额', '退款状态', '创建时间', '操作'] : phoneLookup ? ['用户', '当前身份', '操作'] : ['用户', '手机号', '当前身份', '操作']) { const th = el('th', '', label); th.scope = 'col'; tr.append(th); }
     thead.append(tr); const body = el('tbody');
-    for (const item of result.items) body.append(page === 'devices' ? deviceRow(item) : page === 'orders' ? orderRow(item) : userRow(item));
+    for (const item of result.items) body.append(page === 'devices' ? deviceRow(item) : page === 'orders' ? orderRow(item) : userRow(item, phoneLookup ? userLookupPhone : ''));
     append(table, thead, body); append(wrap, table); append(card, hint, wrap);
+  } else if (phoneLookup) {
+    const empty = el('div', 'empty');
+    append(empty, icon('user', 'muted', 'empty-symbol'), el('h3', '', userLookupPhone ? '没有找到可授权的普通用户' : '按手机号查找普通用户'), el('p', '', '请使用用户在本小程序已授权的完整手机号。'));
+    card.append(empty);
   } else {
     const empty = el('div', 'empty');
     append(empty, icon(page === 'devices' ? 'cube' : page === 'orders' ? 'clipboard' : 'user', 'muted', 'empty-symbol'), el('h3', '', state.filters[page].search || state.filters[page].status ? '没有找到匹配的记录' : page === 'devices' ? '尚未登记设备' : page === 'orders' ? '暂无租赁订单' : '暂无可管理的用户'), el('p', '', page === 'devices' ? '先创建场地并设置租金、押金，再登记设备并绑定场地。' : '新的记录会在这里显示。'));
     if (page === 'devices' && !state.filters.devices.search) empty.append(button('登记第一台设备', createDeviceDialog, 'secondary'));
     card.append(empty);
   }
-  card.append(pagination(page, result));
+  if (!phoneLookup) card.append(pagination(page, result));
   const deviceScope = state.user.role === 'manager' ? el('p', 'notice', '当前景点：' + (managerDeviceVenue()?.name || '未选择') + ' · 本次查询 ' + Number(result.total || 0) + ' 台设备') : deviceSummary(snapshot);
   content.replaceChildren(...(page === 'devices' ? [deviceScope, card] : [card]));
   if (page === 'orders') content.append(el('p', 'footer-note', '此处仅查看订单。办理归还、退款和异常处理请使用小程序；支付与退款状态以服务端校验为准。'));
-  if (page === 'users') content.append(el('p', 'footer-note', (state.user.role === 'root' ? '你可以将其他非 ROOT 账号设为普通用户、设备管理员或商户管理员。' : '你只能在普通用户与设备管理员之间变更身份；同级商户管理员与 ROOT 受保护。') + '当前账号不能修改自己的身份。普通用户无设备管理及退款权限，降级后的后续请求按最新身份校验。'));
+  if (page === 'users') {
+    const note = state.user.role === 'root' ? '你可以将其他非 ROOT 账号设为普通用户、设备管理员或商户管理员。当前账号不能修改自己的身份。' : phoneLookup ? '查到的普通用户可授权为本商户的设备管理员或商户管理员。' : '你可以撤销本商户设备管理员的权限。当前账号及其他商户管理员的身份受保护。';
+    content.append(el('p', 'footer-note', note));
+  }
 }
 function pagination(page, result) {
   const row = el('div', 'pagination'); const number = Number(result.page || 1), size = Number(result.pageSize || 20), total = Number(result.total || 0), pagesCount = Math.max(1, Math.ceil(total / size));
@@ -558,18 +600,22 @@ function refundSummary(order) {
 function verifiedUserPhone(user) {
   return user.phoneVerified === true && typeof user.phoneNumber === 'string' && /^\+[1-9][0-9]{6,14}$/.test(user.phoneNumber) ? user.phoneNumber : '';
 }
-function userName(user) { return user.nickname || verifiedUserPhone(user) || '用户 #' + user.id; }
-function userIdentity(user) {
+function userName(user, includePhone = true) { return user.nickname || (includePhone && verifiedUserPhone(user)) || '用户 #' + user.id; }
+function userIdentity(user, includePhone = true) {
+  const identity = '目标账号：' + userName(user, includePhone) + '（ID ' + user.id + '）。';
+  if (!includePhone) return identity;
   const phone = verifiedUserPhone(user);
-  return '目标账号：' + userName(user) + '（ID ' + user.id + '）。' + (phone ? '手机号：' + phone + '（微信已验证）。' : '未授权手机号，请由用户本人在小程序授权。');
+  return identity + (phone ? '手机号：' + phone + '（微信已验证）。' : '未授权手机号，请由用户本人在小程序授权。');
 }
-function userRow(user) {
+function userRow(user, lookupPhone = '') {
   const row = el('tr');
   const phone = verifiedUserPhone(user);
-  append(row, userCell(user), textCell(phone || '未授权手机号', phone ? '微信已验证' : '需本人在小程序授权'), append(el('td'), badge(user.role, { root: [roleLabel('root'), 'green'], adminer: [roleLabel('adminer'), 'blue'], manager: [roleLabel('manager'), 'blue'], user: [roleLabel('user'), ''] })));
+  const phoneCell = lookupPhone ? null : textCell(phone || '未授权手机号', phone ? '微信已验证' : '需本人在小程序授权');
+  append(row, userCell(user, !lookupPhone), phoneCell, append(el('td'), badge(user.role, { root: [roleLabel('root'), 'green'], adminer: [roleLabel('adminer'), 'blue'], manager: [roleLabel('manager'), 'blue'], user: [roleLabel('user'), ''] })));
   const actions = el('td');
   const protectedLabel = user.role === 'root' ? 'ROOT 身份受保护' : String(user.id) === String(state.user.id) ? '当前账号' : user.role === 'adminer' ? '同级身份受保护' : '不可修改';
-  actions.append(assignableRoles(state.user, user).length ? button('管理身份', () => roleDialog(user), 'text-button') : el('span', 'muted', protectedLabel));
+  const hasLookup = state.user.role !== 'adminer' || user.role !== 'user' || Boolean(lookupPhone);
+  actions.append(hasLookup && assignableRoles(state.user, user).length ? button('管理身份', () => roleDialog(user, lookupPhone), 'text-button') : el('span', 'muted', protectedLabel));
   row.append(actions); return row;
 }
 function dialog(title) {
@@ -1207,16 +1253,21 @@ async function transferDialog(kind, target) {
   });
   if (merchant.value) await loadTargetVenues();
 }
-function roleDialog(user) {
+function roleDialog(user, lookupPhone = '') {
   const allowed = assignableRoles(state.user, user);
-  if (!allowed.length) { toast('当前身份不能修改该账号'); return; }
+  const promotingUser = state.user?.role === 'adminer' && user.role === 'user';
+  const validLookup = () => isPhoneLookup(state.page) && lookupPhone && lookupPhone === userLookupPhone;
+  if (!allowed.length || promotingUser && !validLookup()) { toast('当前身份不能修改该账号'); return; }
   const root = state.user.role === 'root', actorId = state.user.id, actorRole = state.user.role, loginGeneration = state.loginGeneration, merchantGeneration = state.merchantGeneration;
+  const assignedMerchant = managementMerchant();
   const ui = formDialog('管理用户身份', '确认变更');
-  const currentDraft = () => ui.node.open && state.user?.id === actorId && state.user?.role === actorRole && state.loginGeneration === loginGeneration && state.merchantGeneration === merchantGeneration;
-  ui.form.append(el('p', 'role-copy', userIdentity(user) + '当前身份：' + roleLabel(user.role) + '。' + (root ? '选择所属商户与身份后直接生效，无需员工确认。历史订单与资金记录保留原商户归属。' : '你只能在普通用户与设备管理员之间变更身份，所属商户保持不变。')));
+  const currentDraft = () => ui.node.open && state.user?.id === actorId && state.user?.role === actorRole && state.loginGeneration === loginGeneration && state.merchantGeneration === merchantGeneration && (!promotingUser || validLookup() && assignedMerchant?.id === managementMerchantId());
+  const roleCopy = root ? '选择所属商户与身份后直接生效，无需员工确认。历史订单与资金记录保留原商户归属。' : promotingUser ? '请选择要授予的本商户身份。' : '设为普通用户后将撤销本商户的设备管理权限。';
+  ui.form.append(el('p', 'role-copy', userIdentity(user, !promotingUser) + '当前身份：' + roleLabel(user.role) + '。' + roleCopy));
   const target = field(ui.form, '目标身份', { tag: 'select', required: true });
+  if (promotingUser) { const option = el('option', '', '请选择目标身份'); option.value = ''; target.append(option); }
   for (const role of allowed) { const option = el('option', '', roleLabel(role)); option.value = role; target.append(option); }
-  target.value = user.role;
+  target.value = promotingUser ? '' : user.role;
   let merchant;
   const merchantChoices = (state.merchants.length ? state.merchants : state.merchant ? [state.merchant] : []).filter(value => value.status === 'active');
   if (root) {
@@ -1225,7 +1276,7 @@ function roleDialog(user) {
     for (const value of merchantChoices) { const option = el('option', '', merchantLabel(value)); option.value = String(value.id); merchant.append(option); }
     const preferred = merchantChoices.find(value => value.id === user.merchantId) || merchantChoices.find(value => value.id === state.merchantId);
     merchant.value = preferred ? String(preferred.id) : '';
-  }
+  } else if (promotingUser && assignedMerchant) ui.form.append(el('p', 'role-copy', '所属商户：' + merchantLabel(assignedMerchant)));
   const permission = el('p', 'role-copy'); ui.form.append(permission);
   const effect = el('p', 'notice role-change-notice'); ui.form.append(effect);
   const reason = field(ui.form, '变更原因', { tag: 'textarea', maxLength: 255, rows: 3, required: true, placeholder: '填写授权、调整归属或撤销原因，将记录到操作审计' });
@@ -1239,7 +1290,7 @@ function roleDialog(user) {
     permission.textContent = next ? next.description : '请选择当前权限允许的身份。';
     if (merchant) merchant.disabled = target.value === 'user';
     const selected = root && merchantChoices.find(value => value.id === Number(merchant.value));
-    effect.textContent = !hasChange ? '选择新的身份或所属商户后，核对权限范围并填写变更原因。' : '将从「' + roleLabel(user.role) + '」调整为「' + roleLabel(target.value) + '」。' + (root ? target.value === 'user' ? '确认后撤销员工归属。' : '所属商户：' + (selected ? selected.name : '待选择') + '。' : '') + (demotion ? '确认后，该账号的后续请求将立即按降低后的权限校验。' : '确认后直接生效，请只向可信任人员授权。');
+    effect.textContent = !hasChange ? (root ? '选择新的身份或所属商户后，核对权限范围并填写变更原因。' : '选择目标身份后，核对权限范围并填写变更原因。') : '将从「' + roleLabel(user.role) + '」调整为「' + roleLabel(target.value) + '」。' + (root ? target.value === 'user' ? '确认后撤销员工归属。' : '所属商户：' + (selected ? selected.name : '待选择') + '。' : '') + (demotion ? '确认后，该账号的后续请求将立即按降低后的权限校验。' : '确认后直接生效，请只向可信任人员授权。');
     ui.submit.querySelector('span').textContent = hasChange ? demotion ? '确认降低权限' : root ? '确认商户与身份' : '确认提升权限' : '确认变更';
     ui.submit.classList.toggle('danger-button', demotion);
     ui.submit.disabled = !currentDraft() || !hasChange || !validMerchant() || !checked.checked;
@@ -1253,10 +1304,14 @@ function roleDialog(user) {
     if (!assignableRoles(state.user, user).includes(nextRole) || !changed() || !validMerchant() || !checked.checked) { ui.error.textContent = '请重新核对所属商户、目标身份与权限范围'; return; }
     if (!reason.value.trim()) { ui.error.textContent = '请填写权限变更原因'; return; }
     const path = '/rental/admin/users/' + encodeURIComponent(user.id) + (root ? '/merchant' : '/role');
-    const payload = { role: nextRole, reason: reason.value.trim(), ...(root ? { merchantId: nextRole === 'user' ? Number(user.merchantId || state.merchantId) : Number(merchant.value) } : {}) }; ui.busy(true);
+    const payload = { role: nextRole, reason: reason.value.trim() };
+    if (root) payload.merchantId = nextRole === 'user' ? Number(user.merchantId || state.merchantId) : Number(merchant.value);
+    if (promotingUser) payload.phone = lookupPhone;
+    ui.busy(true);
     try {
       await api(path, { method: root ? 'POST' : 'PUT', body: JSON.stringify(payload), beforeDispatch: () => { if (!currentDraft()) throw new Error('登录或商户范围已变化，请重新打开身份管理。'); } });
       if (!currentDraft()) return;
+      if (promotingUser) userLookupPhone = '';
       ui.node.close(); toast(root ? nextRole === 'user' ? '已撤销员工身份' : '所属商户与身份已更新' : '已调整为' + roleLabel(nextRole)); loadPage();
     } catch (error) { if (currentDraft()) ui.error.textContent = error.message; }
     finally { ui.busy(false); update(); }

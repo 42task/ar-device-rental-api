@@ -39,7 +39,7 @@ npm start
 
 目标账号须先在当前小程序完成微信原生手机号授权。服务端只核对当前 AppID 的已验证绑定；匹配配置且系统尚无 root 时，在之后的登录、令牌刷新或身份校验中自动初始化首个 root，并记录 `env-root-bootstrap` 审计。旧 `tel` 字段、手填号码或仅完成微信登录都不能取得该权限。
 
-`ROOT_PHONE` 留空时关闭自动初始化。已有 root 时不会新增、替换或撤销 root，修改或清空该变量也不会迁移既有权限；身份按 `root > adminer > manager > user` 继承，adminer 可管理其他 user、manager，仅 root 可管理 adminer；数据库保证全库最多一个 root。非空号码配置无效时，登录与身份校验返回安全的 503 配置错误，不回显号码。
+`ROOT_PHONE` 留空时关闭自动初始化。已有 root 时保留其身份，修改或清空该变量也不会迁移既有权限。身份按 `root > adminer > manager > user` 继承。adminer 可按微信已验证手机号精确查找普通用户，将其授予本商户的 manager 或 adminer，并可撤销本商户已有 manager 的员工权限。现有 adminer 由 root 管理。数据库保证全库最多一个 root。非空号码配置无效时，登录与身份校验返回 503 配置错误。
 
 也可保留受控控制台的人工初始化方式，先用已验证手机号核对账号：
 
@@ -80,6 +80,8 @@ GHCR 首次发布默认是私有包；管理员仍需检查组织包权限。Por
 | `/api/v2/rental/devices` | 设备识别、登记、场地绑定及开放配置 |
 | `/api/v2/rentals` | 租赁记录、支付、结束及退款查询 |
 | `/api/v2/rental/admin` | 管理员设备列表与 adminer/root 分级身份管理 |
+| `POST /api/v2/rental/admin/users/lookup-phone` | 按 `phone` 精确查询当前商户 AppID 下可授予员工身份的普通用户，返回 `items`，最多一条 |
+| `PUT /api/v2/rental/admin/users/:id/role` | adminer 授予普通用户 `manager` 或 `adminer` 时须同时提交 `role` 和目标用户已验证的 `phone` |
 | `/api/v2/rental/admin/venues` | 当前商户的场地与收费；创建场地必须绑定有效商户 |
 | `/api/v2/rental/admin/auth` | 网页扫码挑战、小程序确认及独立浏览器会话 |
 | `GET /api/v2/rental/admin/overview` | 管理总览 |
