@@ -1,7 +1,7 @@
-import { randomBytes } from 'node:crypto';
+import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import mysql from 'mysql2/promise';
 import request from '../http-client';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createApplication } from '../../src/application';
 import { Database } from '../../src/core/database';
 import { migrate } from '../../src/core/migrations';
@@ -22,12 +22,20 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       await migrate(db);
       await migrate(db);
       const appId = 'wx03dbf50c15cac06f';
-      const client = new WeChatClient({ appId, appSecret: 'synthetic-test-only', payEnabled: false, allowEnvironmentFallback: false, fetch: async input => {
-        const url = new URL(String(input));
-        expect(url.origin).toBe('https://api.weixin.qq.com');
-        const code = url.searchParams.get('js_code');
-        return new Response(JSON.stringify({ openid: 'test-openid-' + code }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      } });
+      // The simulated refund resolves its original account through the registry.
+      const keys = generateKeyPairSync('rsa', {
+        modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' },
+      });
+      const client = new WeChatClient({
+        appId, appSecret: 'synthetic-test-only', mchId: 'synthetic-merchant', serialNo: 'synthetic-serial',
+        privateKey: keys.privateKey, platformKeys: { synthetic: keys.publicKey }, payEnabled: false, allowEnvironmentFallback: false,
+        fetch: async input => {
+          const url = new URL(String(input));
+          expect(url.origin).toBe('https://api.weixin.qq.com');
+          const code = url.searchParams.get('js_code');
+          return new Response(JSON.stringify({ openid: 'test-openid-' + code }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        },
+      });
       const auth = new RentalAuth(db, client, { jwtSecret: 'integration-test-signing-key-at-least-32-bytes' });
       const { app } = createApplication({ db, client, auth });
       const login = async (code: string) => {
@@ -93,6 +101,25 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       expect((await request(app).get('/api/v2/rental/admin/orders').query({ search: '%' }).set('Authorization', managerToken)).body.total).toBe(0);
       expect((await request(app).get('/api/v2/rental/admin/orders').query({ status: 'INVALID' }).set('Authorization', managerToken)).status).toBe(422);
       expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', managerToken)).body.orders.total).toBe(1);
+      await db.execute("UPDATE ar_rental_order SET status='ACTIVE',payment_status='SUCCESS',started_ms=? WHERE id=?", [Date.now(), seeded.id]);
+      await db.insert('ar_rental_slot', { device_id: deviceId, rental_id: seeded.id, state: 'RENTED' });
+      const refund = vi.spyOn(client, 'payment').mockImplementation(async (_method, _path, body) => ({
+        out_trade_no: body!.out_trade_no, out_refund_no: body!.out_refund_no, amount: body!.amount, status: 'PROCESSING',
+      }));
+      const endRental = () => request(app).post(`/api/v2/rentals/${seeded.id}/end`).set('Authorization', managerToken);
+      for (const reason of [undefined, '   ']) {
+        const rejected = await endRental().send({ refundMode: 'full', reason, idempotencyKey: 'synthetic-full-refund' });
+        expect(rejected.status).toBe(422);
+      }
+      expect((await db.one('SELECT status FROM ar_rental_order WHERE id=?', [seeded.id]))!.status).toBe('ACTIVE');
+      expect(refund).not.toHaveBeenCalled();
+      const ended = await endRental().send({ refundMode: 'deposit', idempotencyKey: 'synthetic-deposit-refund' });
+      expect(ended.status).toBe(200);
+      expect(ended.body.rental).toMatchObject({ refundMode: 'deposit', refundAmountCents: 5000, refundStatus: 'PROCESSING' });
+      expect((await db.one('SELECT end_reason FROM ar_rental_order WHERE id=?', [seeded.id]))!.end_reason).toBeNull();
+      expect((await db.one('SELECT state FROM ar_rental_slot WHERE rental_id=?', [seeded.id]))!.state).toBe('SETTLING');
+      expect(refund).toHaveBeenCalledTimes(1);
+      expect(refund.mock.calls[0][2]).not.toHaveProperty('reason');
       expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.accessToken })).status).toBe(401);
       expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.refreshToken })).status).toBe(200);
       expect((await request(app).get('/api/v2/rentals').set('Authorization', 'Bearer ' + ordinary.token.refreshToken)).status).toBe(401);
