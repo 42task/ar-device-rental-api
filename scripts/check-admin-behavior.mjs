@@ -137,7 +137,8 @@ for (const role of ['manager', 'adminer', 'root']) {
 {
   const f = fixture('adminer');
   for (const user of [{ id: 10, role: 'adminer' }, { id: 11, role: 'adminer' }, { id: 12, role: 'root' }, { id: 13, role: 'user', allowedRoles: [] }]) assert.equal(f.spec.userRow(user).querySelectorAll('button').length, 0);
-  for (const role of ['user', 'manager']) assert.equal(f.spec.userRow({ id: 11, role }).querySelectorAll('button').length, 1);
+  assert.equal(f.spec.userRow({ id: 11, role: 'manager' }).querySelectorAll('button').length, 1);
+  assert.equal(f.spec.userRow({ id: 11, role: 'user', allowedRoles: ['manager', 'adminer'] }).querySelectorAll('button').length, 0);
   const root = fixture('root');
   assert.equal(root.spec.userRow({ id: 11, role: 'adminer' }).querySelectorAll('button').length, 1);
   for (const user of [{ id: 10, role: 'root' }, { id: 11, role: 'root' }]) assert.equal(root.spec.userRow(user).querySelectorAll('button').length, 0);
@@ -147,7 +148,8 @@ for (const role of ['manager', 'adminer', 'root']) {
 // The server's allowedRoles can narrow the local policy, never widen it.
 {
   const f = fixture('adminer');
-  assert.deepEqual(Array.from(f.spec.assignableRoles({ id: 10, role: 'adminer' }, { id: 11, role: 'user', allowedRoles: ['manager', 'adminer', 'root'] })), ['manager']);
+  assert.deepEqual(Array.from(f.spec.assignableRoles({ id: 10, role: 'adminer' }, { id: 11, role: 'user', allowedRoles: ['manager', 'adminer', 'user', 'root'] })), ['manager', 'adminer']);
+  assert.deepEqual(Array.from(f.spec.assignableRoles({ id: 10, role: 'adminer' }, { id: 11, role: 'manager', allowedRoles: ['user', 'manager', 'adminer'] })), ['user', 'manager']);
   assert.deepEqual(Array.from(f.spec.assignableRoles({ id: 10, role: 'root' }, { id: 11, role: 'adminer', allowedRoles: ['user', 'manager'] })), ['user', 'manager']);
 }
 
@@ -209,17 +211,62 @@ for (const verified of [true, false]) {
   assert.deepEqual(JSON.parse(written.body), { merchantId: 2, reason: 'Synthetic assignment', role: 'manager' });
 }
 
-// Actual form submission grants only the selected, explicitly acknowledged role.
-{
-  const f = fixture('adminer'); f.spec.roleDialog({ id: 11, role: 'user', allowedRoles: ['user', 'manager'] }); const c = controls(f);
+// Actual phone lookup and form submission grant only the selected, acknowledged role.
+async function phoneLookupFixture() {
+  const f = fixture('adminer'); roleMerchantContext(f);
+  f.spec.setUser({ id: 10, role: 'adminer', merchantId: 1 });
+  f.context.location.hash = '#users'; f.spec.shell(); f.spec.useRealPages();
+  f.replies.push({ items: [], total: 0 }); await f.spec.loadPage();
+  const scope = f.app.querySelector('.toolbar').querySelector('select');
+  assert.equal(scope.value, 'employees');
+  assert.deepEqual(scope.querySelectorAll('option').map(option => option.value), ['employees', 'phone']);
+  scope.value = 'phone'; await scope.emit('change');
+  assert.equal(f.calls.length, 1);
+  assert.match(f.app.textContent, /请使用用户在本小程序已授权的完整手机号/);
+  return f;
+}
+const syntheticLookupPhone = '13800138000';
+async function lookUpByPhone(f, items) {
+  const form = f.app.querySelector('.search-form');
+  const phone = form.querySelector('input'); assert.equal(phone.type, 'tel');
+  phone.value = syntheticLookupPhone; f.replies.push({ items }); await form.emit('submit');
+  const lookup = f.calls.at(-1);
+  assert.equal(lookup.path, '/api/v2/rental/admin/users/lookup-phone');
+  assert.equal(lookup.method, 'POST');
+  assert.equal(lookup.headers['X-Merchant-Id'], '1');
+  assert.deepEqual(JSON.parse(lookup.body), { phone: syntheticLookupPhone });
+}
+const lookedUpUser = { id: 11, role: 'user', nickname: 'Synthetic renter', merchantId: null, allowedRoles: ['manager', 'adminer'] };
+for (const role of ['manager', 'adminer']) {
+  const f = await phoneLookupFixture();
+  await lookUpByPhone(f, [lookedUpUser]);
+  const row = f.app.querySelector('tbody').querySelector('tr');
+  assert.match(row.textContent, /Synthetic renter.*ID 11.*普通用户/);
+  assert.equal(f.app.querySelector('tbody').querySelectorAll('tr').length, 1);
+  assert.doesNotMatch(row.textContent, /未授权手机号/);
+  await row.querySelector('button').emit('click');
+  const c = controls(f);
   assert.equal(merchantField(c.form, '所属商户'), null);
-  assert.deepEqual(c.select.querySelectorAll('option').map(option => option.value), ['user', 'manager']);
+  assert.match(c.form.textContent, /所属商户：First/);
+  assert.deepEqual(c.select.querySelectorAll('option').map(option => option.value), ['', 'manager', 'adminer']);
   assert.equal(c.submit.disabled, true);
-  await selectRole(c, 'manager'); assert.match(c.submit.textContent, /提升权限/);
+  await selectRole(c, role); assert.match(c.submit.textContent, /提升权限/);
   await c.form.emit('submit');
-  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].path, '/api/v2/rental/admin/users/11/role'); assert.equal(f.calls[0].method, 'PUT');
-  assert.deepEqual(JSON.parse(f.calls[0].body), { role: 'manager', reason: 'Synthetic role-change test' });
-  assert.equal(f.calls[0].credentials, 'same-origin');
+  const written = f.calls.at(-1);
+  assert.equal(written.path, '/api/v2/rental/admin/users/11/role');
+  assert.equal(written.method, 'PUT');
+  assert.equal(written.credentials, 'same-origin');
+  assert.deepEqual(JSON.parse(written.body), { role, reason: 'Synthetic role-change test', phone: syntheticLookupPhone });
+  assert.equal(f.app.querySelector('.search-form').querySelector('input').value, '');
+  assert.equal(f.app.querySelector('tbody'), null);
+}
+{
+  const f = await phoneLookupFixture(); await lookUpByPhone(f, []);
+  assert.match(f.app.textContent, /没有找到可授权的普通用户/);
+  assert.equal(f.app.querySelector('tbody'), null);
+  await lookUpByPhone(f, [lookedUpUser, { ...lookedUpUser, id: 12 }]);
+  assert.match(f.app.textContent, /查询未完成/);
+  assert.equal(f.app.querySelector('tbody'), null);
 }
 {
   const f = fixture('root'); roleMerchantContext(f); f.spec.roleDialog({ id: 11, role: 'manager', merchantId: 1, allowedRoles: ['user', 'manager', 'adminer'] }); const c = controls(f);
@@ -273,10 +320,10 @@ for (const invalidation of ['merchant', 'actor', 'login', 'close']) {
   await selectRole(c, 'user'); await c.form.emit('submit'); assert.equal(JSON.parse(f.calls[0].body).role, 'user');
 }
 
-// Even manually injecting a higher target role into the select never sends it.
+// Injecting a higher role for an existing employee cannot submit it.
 {
-  const f = fixture('adminer'); f.spec.roleDialog({ id: 11, role: 'user' }); const c = controls(f);
-  await selectRole(c, 'manager'); c.select.value = 'adminer'; await c.form.emit('submit'); assert.equal(f.calls.length, 0); assert.match(c.form.textContent, /重新核对/);
+  const f = fixture('adminer'); f.spec.roleDialog({ id: 11, role: 'manager' }); const c = controls(f);
+  await selectRole(c, 'user'); c.select.value = 'adminer'; await c.form.emit('submit'); assert.equal(f.calls.length, 0); assert.match(c.form.textContent, /重新核对/);
   c.select.value = 'root'; await c.form.emit('submit'); assert.equal(f.calls.length, 0);
 }
 
@@ -460,6 +507,7 @@ for (const invalidation of ['account', 'role', 'authorization', 'merchant', 'log
   await f.spec.loadPage(); assert.equal(currentVenueSelect(f), undefined); assert.equal(f.calls.some(call => call.path.endsWith('/venues')), false);
   const query = new URL(f.calls.find(call => call.path.includes('/devices?')).path, f.context.location.origin).searchParams;
   assert.equal(query.has('venueId'), false); assert.equal(f.app.querySelector('tbody').querySelectorAll('tr').length, 2); assert.ok(f.app.querySelector('.device-summary'));
+  assert.equal(f.app.querySelector('thead').querySelector('th').textContent, '设备');
 }
 console.log('Manager venue selection, fixed merchant scope, filtered devices and delayed-response isolation verified.');
 
@@ -699,9 +747,11 @@ for (const role of ['manager', 'adminer', 'root']) {
   const f = fixture(role); f.spec.setUser({ id: 10, role, merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' });
   f.spec.setPage('devices');
   const row = f.spec.deviceRow({ device: { id: 7, uuid: 'remark-test', name: '公开名称', remarkName: '一楼备用机' } });
-  assert.match(row.textContent, /remark-test/);
-  assert.match(row.textContent, /公开名称/);
-  assert.match(row.textContent, /备注：一楼备用机/);
+  const identity = row.querySelector('.device-identity');
+  assert.equal(identity.querySelector('.cell-main').textContent, '一楼备用机');
+  assert.equal(identity.querySelector('.cell-sub').textContent, 'remark-test');
+  assert.ok(identity.querySelector('.cell-sub').classList.contains('device-uuid'));
+  assert.equal(identity.children.length, 2);
   const edit = row.querySelectorAll('button').find(button => button.textContent === '修改备注');
   assert.equal(!!edit, role !== 'manager');
   if (!edit) continue;
@@ -716,6 +766,18 @@ for (const role of ['manager', 'adminer', 'root']) {
   assert.equal(saved.headers['X-Merchant-Id'], '2');
   assert.deepEqual(JSON.parse(saved.body), { remarkName });
   assert.equal(f.context.pageLoads, 1);
+}
+
+// Devices without a remark use their ordinary name, or just the UUID when no distinct name exists.
+{
+  const f = fixture('root');
+  const named = f.spec.deviceRow({ device: { uuid: 'fallback-id', name: '公开名称', remarkName: '' } }).querySelector('.device-identity');
+  assert.equal(named.querySelector('.cell-main').textContent, '公开名称');
+  assert.equal(named.querySelector('.cell-sub').textContent, 'fallback-id');
+  const unnamed = f.spec.deviceRow({ device: { uuid: 'fallback-id', name: 'fallback-id' } }).querySelector('.device-identity');
+  assert.equal(unnamed.querySelector('.cell-main').textContent, 'fallback-id');
+  assert.ok(unnamed.querySelector('.cell-main').classList.contains('device-uuid'));
+  assert.equal(unnamed.querySelector('.cell-sub'), null);
 }
 
 // A completed remark edit only refreshes the device list if the draft's scope is still current.
@@ -1023,11 +1085,13 @@ console.log('Transfer venue scope, unavailable targets and delayed target respon
   assert.equal(written.headers['X-Client-Protocol'], '2'); assert.ok(written.headers['X-Client-Version']);
 }
 
-// Only root can switch between current-merchant staff and unassigned platform consumers.
+// The unrestricted platform directory remains root-only.
 {
   const f = fixture('root'); const bar = f.spec.renderToolbar('users', { total: 0 });
   const scope = bar.querySelector('select'); assert.equal(scope.value, 'employees'); scope.value = 'platform'; await scope.emit('change'); assert.equal(f.spec.getUserScope(), 'platform');
-  const adminer = fixture('adminer'); assert.equal(adminer.spec.renderToolbar('users', { total: 0 }).querySelector('select'), null);
+  const adminer = fixture('adminer');
+  const adminerScope = adminer.spec.renderToolbar('users', { total: 0 }).querySelector('select');
+  adminerScope.value = 'platform'; await adminerScope.emit('change'); assert.equal(adminer.spec.getUserScope(), 'employees');
 }
 console.log('Protocol gating, complete payment-credential recovery and employee/platform scopes verified.');
 

@@ -17,8 +17,9 @@ class RentalDb {
   constructor() {
     opened.push(this);
     this.sqlite.exec(`PRAGMA foreign_keys=ON;
-      CREATE TABLE ar_user(id INTEGER PRIMARY KEY,role TEXT,appid TEXT DEFAULT 'wx-rental-test');
+      CREATE TABLE ar_user(id INTEGER PRIMARY KEY,role TEXT,appid TEXT DEFAULT 'wx-rental-test',tel TEXT);
       INSERT INTO ar_user(id,role) VALUES(1,'user'),(2,'manager'),(3,'user'),(4,'root'),(5,'adminer');
+      CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY REFERENCES ar_user(id),appid TEXT NOT NULL,identity_id INTEGER,verified_ms INTEGER NOT NULL);
       CREATE TABLE ar_venue(id INTEGER PRIMARY KEY,merchant_id INTEGER NOT NULL,name TEXT,address TEXT DEFAULT '',description TEXT DEFAULT '',status TEXT NOT NULL DEFAULT 'active',use_fee_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1);
       INSERT INTO ar_venue(id,merchant_id,name,use_fee_cents,deposit_cents) VALUES(1,1,'场地一',2000,20000),(2,2,'场地二',3000,9000),(3,1,'场地三',3000,10000);
       CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,remark_name TEXT NOT NULL DEFAULT '',merchant_id INTEGER NOT NULL DEFAULT 1,venue_id INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -60,6 +61,7 @@ afterEach(() => { for (const db of opened.splice(0)) db.sqlite.close(); vi.resto
 function fixture(appid = 'wx-rental-test', mchId = 'merchant-rental') {
   const db = new RentalDb();
   let now = 1794542400000;
+  db.sqlite.prepare('INSERT INTO ar_user_phone(user_id,appid,identity_id,verified_ms) SELECT id,?,id,? FROM ar_user').run(appid, now);
   const user: RentalPrincipal = { user: { id: 1, role: 'user' }, appid, openid: 'payer-1' };
   const other: RentalPrincipal = { user: { id: 3, role: 'user' }, appid, openid: 'payer-3' };
   const manager: RentalPrincipal = { user: { id: 2, role: 'manager' }, appid, openid: 'payer-2' };
@@ -116,6 +118,46 @@ function fixture(appid = 'wx-rental-test', mchId = 'merchant-rental') {
 }
 
 describe('independent AR rental lifecycle', () => {
+  it('requires a verified phone for the rental app before reserving a device', async () => {
+    const f = fixture(); await f.configure();
+    await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['+8613800138000', f.user.user.id]);
+    await f.db.execute('UPDATE ar_user_phone SET appid=? WHERE user_id=?', ['wx-other-app', f.user.user.id]);
+    const unverified = { ...f.user, user: { ...f.user.user, phoneVerified: true } };
+    await expect(f.create(unverified)).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
+    expect(await f.db.one('SELECT * FROM ar_rental_order')).toBeNull();
+    expect(await f.db.one('SELECT * FROM ar_rental_slot')).toBeNull();
+    expect(f.payment.order).not.toHaveBeenCalled();
+    await f.db.execute('UPDATE ar_user_phone SET appid=? WHERE user_id=?', [f.user.appid, f.user.user.id]);
+    expect((await f.create()).rental.status).toBe('PENDING_PAYMENT');
+  });
+
+  it('checks verification before and after provider prepay for a pending rental', async () => {
+    const f = fixture(); await f.configure();
+    const { rental } = await f.create();
+    await f.db.execute('UPDATE ar_user_phone SET verified_ms=0 WHERE user_id=?', [f.user.user.id]);
+    await expect(f.service.payment(f.user, rental.id)).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
+    expect(await f.db.one('SELECT prepay_attempted FROM ar_rental_order WHERE id=?', [rental.id])).toEqual({ prepay_attempted: 0 });
+    expect(f.payment.order).not.toHaveBeenCalled();
+    await f.db.execute('UPDATE ar_user_phone SET verified_ms=? WHERE user_id=?', [1794542400000, f.user.user.id]);
+    const providerOrder = f.payment.order.getMockImplementation()!;
+    f.payment.order.mockImplementationOnce(async (input) => {
+      const params = await providerOrder(input);
+      // Binding on a second app archives the first binding during the network request.
+      await f.db.execute('UPDATE ar_user_phone SET appid=? WHERE user_id=?', ['wx-other-app', f.user.user.id]);
+      return params;
+    });
+    await expect(f.service.payment(f.user, rental.id)).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
+    expect(await f.db.one('SELECT pay_params,prepay_pending_until_ms FROM ar_rental_order WHERE id=?', [rental.id])).toMatchObject({ pay_params: expect.any(String), prepay_pending_until_ms: null });
+    // A later payment request must also recheck verification for those cached parameters.
+    await expect(f.service.payment(f.user, rental.id)).rejects.toMatchObject({ status: 403, code: 'PHONE_VERIFICATION_REQUIRED' });
+    await f.db.execute('UPDATE ar_user_phone SET appid=? WHERE user_id=?', [f.user.appid, f.user.user.id]);
+    expect(await f.service.payment(f.user, rental.id)).toHaveProperty('payParams');
+    expect(f.payment.order).toHaveBeenCalledTimes(1);
+    await f.db.execute('DELETE FROM ar_user_phone WHERE user_id=?', [f.user.user.id]);
+    expect((await f.service.get(f.user, rental.id)).rental.status).toBe('PENDING_PAYMENT');
+    expect((await f.service.cancel(f.user, rental.id)).rental.status).toBe('CANCELLED');
+  });
+
   it.each(['manager', 'adminer', 'root'] as const)('inherits device operations for %s without trusting a forged client role', async role => {
     const f = fixture(); const actor = f[role];
     expect((await f.service.context(actor, 'role-device-' + role)).actions.canCreate).toBe(true);
@@ -680,7 +722,8 @@ function merchantFixture(shared = false) {
     db.sqlite.exec("CREATE TABLE ar_merchant(id INTEGER PRIMARY KEY,name TEXT); INSERT INTO ar_merchant VALUES(1,'第一商户'),(2,'第二商户');");
     db.sqlite.prepare('UPDATE ar_user SET appid=? WHERE id IN (11,12)').run(first.user.appid);
   }
-  const scoped = (identity: RentalPrincipal, merchantId: number): RentalPrincipal => ({ ...identity, merchantId, authVersion: 1, user: { ...identity.user, merchant_id: identity.user.role === 'root' ? null : merchantId, auth_version: 1 } });
+  db.sqlite.prepare('INSERT INTO ar_user_phone(user_id,appid,identity_id,verified_ms) VALUES(?,?,?,?)').run(11, second.user.appid, 11, 1794542400000);
+  const scoped = (identity: RentalPrincipal, merchantId: number): RentalPrincipal => ({ ...identity, merchantId, authVersion: 1, identityId: identity.user.id, user: { ...identity.user, merchant_id: identity.user.role === 'root' ? null : merchantId, auth_version: 1 } });
   const user = scoped(first.user, 1), manager = scoped(first.manager, 1), root = scoped(first.root, 1);
   const userB = scoped({ user: { id: 11, role: 'user' }, appid: second.user.appid, openid: 'payer-11' }, 2);
   const managerB = scoped({ user: { id: 12, role: 'manager' }, appid: second.user.appid, openid: 'payer-12' }, 2);

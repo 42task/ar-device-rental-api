@@ -12,11 +12,15 @@ export function hasDeviceManagement(user: Row): boolean {
 export function canManageUsers(user: Row): boolean {
   return ['adminer', 'root'].includes(userRole(user));
 }
-/** A role hierarchy grants business capabilities, never the actor's own role. */
+/** Existing administrators are protected from changes by their peers. */
 export function assignableRoles(actor: Row, target: Row): AssignableRole[] {
-  if (Number(actor.id) === Number(target.id) || userRole(target) === 'root') return [];
+  const targetRole = userRole(target);
+  if (Number(actor.id) === Number(target.id) || targetRole === 'root') return [];
   if (userRole(actor) === 'root') return ['user', 'manager', 'adminer'];
-  if (userRole(actor) === 'adminer' && ['user', 'manager'].includes(userRole(target))) return ['user', 'manager'];
+  if (userRole(actor) === 'adminer') {
+    if (targetRole === 'user') return ['manager', 'adminer'];
+    if (targetRole === 'manager') return ['user', 'manager'];
+  }
   return [];
 }
 export function requireManager(user: Row): void {

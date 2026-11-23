@@ -135,17 +135,20 @@ describe('independent rental authentication', () => {
     f.client.codeSession.mockResolvedValueOnce({ openid: 'target-user' }); const target = await f.auth.login('target');
     f.client.codeSession.mockResolvedValueOnce({ openid: 'peer-admin' }); const peer = await f.auth.login('peer');
     const change = f.route('PUT', '/v2/rental/admin/users/:id/role');
-    const set = (token: string, id: number, nextRole: string) => change(f.context(token, { role: nextRole, reason: 'Synthetic role hierarchy test' }, { id: String(id) })) as Promise<Row>;
+    const phone = '+8613800138000';
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?)', [target.user.id, appId, phone, '86', Date.now(), 'c'.repeat(64)]);
+    const set = (token: string, id: number, nextRole: string, verifiedPhone?: string) => change(f.context(token, { role: nextRole, reason: 'Synthetic role hierarchy test', phone: verifiedPhone }, { id: String(id) })) as Promise<Row>;
     await set(root.token.accessToken, admin.user.id, 'adminer');
     await set(root.token.accessToken, peer.user.id, 'adminer');
     expect((await f.auth.authenticate(f.context(admin.token.accessToken))).user.role).toBe('adminer');
     expect((await f.auth.refresh(admin.token.refreshToken)).user.role).toBe('adminer');
     const list = await f.route('GET', '/v2/rental/admin/users')(f.context(admin.token.accessToken)) as Row;
-    expect(list.items.find((user: Row) => user.id === target.user.id).allowedRoles).toEqual(['user', 'manager']);
+    expect(list.items.find((user: Row) => user.id === target.user.id).allowedRoles).toEqual(['manager', 'adminer']);
     expect(list.items.find((user: Row) => user.id === root.user.id).allowedRoles).toEqual([]);
     expect(list.items.find((user: Row) => user.id === peer.user.id).allowedRoles).toEqual([]);
     expect(list.items.some((user: Row) => user.id === admin.user.id)).toBe(false);
-    expect(await set(admin.token.accessToken, target.user.id, 'manager')).toMatchObject({ role: 'manager', allowedRoles: ['user', 'manager'] });
+    await expect(set(admin.token.accessToken, target.user.id, 'manager')).rejects.toMatchObject({ status: 404 });
+    expect(await set(admin.token.accessToken, target.user.id, 'manager', phone)).toMatchObject({ role: 'manager', allowedRoles: ['user', 'manager'] });
     const audits = (await f.db.query('SELECT * FROM ar_role_audit')).length;
     await set(admin.token.accessToken, target.user.id, 'manager');
     expect(await f.db.query('SELECT * FROM ar_role_audit')).toHaveLength(audits);
@@ -196,7 +199,11 @@ describe('independent rental authentication', () => {
   it('rejects missing signing configuration without preventing route registration', async () => {
     const f = fixture(); vi.stubEnv('JWT_SECRET', ''); vi.stubEnv('JWT_SECRET_PATH', '');
     const auth = new RentalAuth(f.db as any, f.client as any), router = new ApiRouter(); auth.registerAuth(router);
-    expect(router.routes).toHaveLength(6);
+    expect(router.routes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ method: 'POST', path: '/v2/rental/auth/login' }),
+      expect.objectContaining({ method: 'POST', path: '/v2/rental/admin/users/lookup-phone' }),
+      expect.objectContaining({ method: 'PUT', path: '/v2/rental/admin/users/:id/role' }),
+    ]));
     await expect(auth.login('code')).rejects.toMatchObject({ status: 503 });
     expect(f.client.codeSession).not.toHaveBeenCalled();
   });

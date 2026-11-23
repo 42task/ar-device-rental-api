@@ -20,7 +20,7 @@ async function fixture() {
     CREATE TABLE ar_admin_guard(id INTEGER PRIMARY KEY); INSERT INTO ar_admin_guard VALUES(1);
     CREATE TABLE ar_role_audit(id INTEGER PRIMARY KEY,actor_user_id INTEGER,target_user_id INTEGER,previous_role TEXT,next_role TEXT,source TEXT,reason TEXT);
     CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY,appid TEXT,phone_e164 TEXT,country_code TEXT,verified_ms INTEGER,code_hash TEXT UNIQUE,UNIQUE(appid,phone_e164));
-    INSERT INTO ar_user_phone VALUES(1,'${appId}','+8613800138000','86',1800000000000,'${'a'.repeat(64)}'),(3,'${appId}','+8613900139000','86',1800000000000,'${'b'.repeat(64)}'),(4,'${appId}','+8613700137000','86',1800000000000,'${'c'.repeat(64)}'),(5,'${appId}','+8613600136000','86',1800000000000,'${'d'.repeat(64)}'),(6,'${appId}','+8613500135000','86',1800000000000,'${'e'.repeat(64)}');
+    INSERT INTO ar_user_phone VALUES(1,'${appId}','+8613800138000','86',1800000000000,'${'a'.repeat(64)}'),(2,'${appId}','+8613400134000','86',1800000000000,'${'f'.repeat(64)}'),(3,'${appId}','+8613900139000','86',1800000000000,'${'b'.repeat(64)}'),(4,'${appId}','+8613700137000','86',1800000000000,'${'c'.repeat(64)}'),(5,'${appId}','+8613600136000','86',1800000000000,'${'d'.repeat(64)}'),(6,'${appId}','+8613500135000','86',1800000000000,'${'e'.repeat(64)}');
     CREATE TABLE ar_admin_login_challenge(id TEXT PRIMARY KEY,browser_hash TEXT,origin TEXT,confirmation_code TEXT,status TEXT,scanned_user_id INTEGER,created_ms INTEGER,expires_ms INTEGER,consumed_ms INTEGER,qrcode_image BLOB);
     CREATE TABLE ar_admin_session(id TEXT PRIMARY KEY,user_id INTEGER,appid TEXT,created_ms INTEGER,expires_ms INTEGER,revoked_ms INTEGER);`);
   const sql = (value: string) => value.replace(/ FOR UPDATE/g, '').replace(/CURRENT_TIMESTAMP\(3\)/g, 'CURRENT_TIMESTAMP').replace(/^(DELETE FROM .*?) LIMIT 100$/, '$1');
@@ -167,18 +167,19 @@ describe('durable admin scan login', () => {
       { actor_user_id: 4, target_user_id: 2, previous_role: 'manager', next_role: 'user', source: 'api', reason: '撤销临时授权' },
     ]);
   });
-  it('allows a verified adminer browser session to manage lower roles but never itself, peers, root or adminer grants', async () => {
+  it('allows a verified adminer browser session to enroll ordinary users and protect existing administrators', async () => {
     const f = await fixture(), challenge = await f.create();
     await f.approve(challenge, 'adminer'); const session = await f.consume(challenge);
     expect(session.result.user).toMatchObject({ id: 5, role: 'adminer' });
     expect((await f.auth.authenticate(f.ctx({ cookie: session.cookie, method: 'GET' }))).user.role).toBe('adminer');
-    expect(await f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'manager' } })).toMatchObject({ role: 'manager', allowedRoles: ['user', 'manager'] });
-    expect(await f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'user' } })).toMatchObject({ role: 'user' });
+    expect(await f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'manager', phone: '13400134000' } })).toMatchObject({ role: 'manager', allowedRoles: ['user', 'manager'] });
     for (const [id, role] of [['5', 'user'], ['6', 'manager'], ['4', 'user'], ['2', 'adminer']]) {
       await expect(f.changeRole({ cookie: session.cookie, id, body: { role } })).rejects.toMatchObject({ status: 403 });
     }
     await expect(f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'root' } })).rejects.toMatchObject({ status: 422 });
     await expect(f.changeRole({ cookie: session.cookie, id: '2', source: null, body: { role: 'manager' } })).rejects.toMatchObject({ status: 403 });
+    expect(await f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'user' } })).toMatchObject({ role: 'user' });
+    expect(await f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'adminer', phone: '+8613400134000' } })).toMatchObject({ role: 'adminer', allowedRoles: [] });
     await f.changeRole({ token: f.tokens.root, id: '5', body: { role: 'manager' } });
     expect((await f.invoke('GET', '/session', { cookie: session.cookie })).user.role).toBe('manager');
     await expect(f.changeRole({ cookie: session.cookie, id: '2', body: { role: 'manager' } })).rejects.toMatchObject({ status: 403 });

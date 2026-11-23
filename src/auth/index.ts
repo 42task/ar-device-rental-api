@@ -23,6 +23,18 @@ export function publicMerchant(): Row | undefined {
   return merchant ? { id: merchant.id, code: merchant.code, name: merchant.name, status: merchant.status, origin: merchant.origin, appId: merchant.appId, configId: merchant.configId } : undefined;
 }
 const validIdentity = (value: unknown): value is string => typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,128}$/u.test(value);
+const unavailableUser = () => new ApiError(404, '未找到可管理的账号，请核对已验证手机号');
+
+async function ordinaryUserByPhone(db: Database, appId: string, phone: string, targetId?: number): Promise<Row | null> {
+  const sql = `SELECT u.id,u.nickname,u.avatar FROM ar_user_phone p
+    INNER JOIN ar_user u ON u.id=p.user_id
+    WHERE p.appid=? AND p.phone_e164=? AND p.verified_ms>0 AND u.role<>'root'
+      AND NOT EXISTS(SELECT 1 FROM ar_merchant_membership m WHERE m.user_id=u.id AND m.status='active')
+      AND EXISTS(SELECT 1 FROM ar_user_wechat_identity i WHERE i.user_id=u.id AND i.appid=p.appid AND i.status='active'
+        AND (p.identity_id IS NULL OR p.identity_id=i.id))`;
+  return targetId === undefined ? db.one(sql, [appId, phone])
+    : db.one(sql + ' AND u.id=? FOR UPDATE', [appId, phone, targetId]);
+}
 
 export class RentalAuth {
   webAuthenticate?: (ctx: Context) => Promise<RentalPrincipal>;
@@ -252,6 +264,25 @@ export class RentalAuth {
     if (ctx.req.headers.authorization === undefined && this.webAuthenticate) return this.webAuthenticate(ctx);
     return this.authenticateBearer(ctx);
   };
+  private async lookupOrdinaryUser(ctx: Context): Promise<Row> {
+    const principal = await this.authenticate(ctx);
+    requireUserAdmin(principal.user);
+    const merchant = currentMerchant();
+    if (!merchant) throw new ApiError(503, '请先选择管理商户');
+    const phone = normalizePhoneInput(ctx.body.phone);
+    return this.db.transaction(async db => {
+      const raw = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [principal.user.id]);
+      if (!raw) throw new ApiError(403, '账号已失效');
+      const actor = await loadAccountPermissions(db, raw);
+      requireUserAdmin(actor); requireMerchantManagementScope(actor);
+      if (Number(actor.auth_version ?? 0) !== principal.authVersion) throw new ApiError(401, '账号授权已变更，请重新登录');
+      if (merchant.status !== 'active') throw new ApiError(422, '当前商户尚未开放服务');
+      const match = await ordinaryUserByPhone(db, merchant.appId, phone);
+      if (!match) return { items: [] };
+      const user = { ...match, role: 'user', merchant_id: null };
+      return { items: [{ ...publicUser(user), allowedRoles: assignableRoles(actor, user).filter(role => role !== 'user') }] };
+    });
+  }
   private async employeeUsers(ctx: Context, principal: RentalPrincipal): Promise<Row> {
     const scope = ctx.query.scope ?? 'employees';
     if (!['employees', 'platform'].includes(scope)) throw new ApiError(422, '用户查询范围无效');
@@ -293,20 +324,31 @@ export class RentalAuth {
       const actor = await loadAccountPermissions(db, actorRaw);
       requireUserAdmin(actor); requireMerchantManagementScope(actor);
       if (Number(actor.auth_version ?? 0) !== principal.authVersion) throw new ApiError(401, '账号授权已变更，请重新登录');
+      const adminer = actor.role === 'adminer';
+      const phone = adminer && nextRole !== 'user' && ctx.body.phone !== undefined ? normalizePhoneInput(ctx.body.phone) : undefined;
       const raw = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [targetId]);
-      if (!raw) throw new ApiError(404, '用户不存在');
+      if (!raw) throw adminer ? unavailableUser() : new ApiError(404, '用户不存在');
       const target = await loadAccountPermissions(db, raw);
-      if (target.merchant_id != null && Number(target.merchant_id) !== merchant.id) throw new ApiError(409, '该员工属于其他商户，请由最高管理员直接调整商户与身份');
-      if (actor.role !== 'root' && target.merchant_id == null) throw new ApiError(403, '只能管理本商户已有员工');
+      if (target.merchant_id != null && Number(target.merchant_id) !== merchant.id) {
+        throw adminer ? unavailableUser() : new ApiError(409, '该员工属于其他商户，请由最高管理员直接调整商户与身份');
+      }
       if (!assignableRoles(actor, target).includes(nextRole)) throw new ApiError(403, '不能修改自身、同级或更高身份，也不能授予超出权限的身份');
-      if (nextRole !== 'user' && target.merchant_id == null && !await db.one("SELECT id FROM ar_user_wechat_identity WHERE user_id=? AND appid=? AND status='active'", [targetId, merchant.appId])) throw new ApiError(409, '该账号尚无目标小程序的已验证微信身份，请选择已在该小程序登录的账号');
+      const adminerGrant = adminer && target.role === 'user';
+      if (adminerGrant) {
+        if (!phone || !await ordinaryUserByPhone(db, merchant.appId, phone, targetId)) throw unavailableUser();
+        const destination = await db.one('SELECT app_id,status FROM ar_merchant WHERE id=? FOR UPDATE', [merchant.id]);
+        if (destination?.status !== 'active' || destination.app_id !== merchant.appId) throw new ApiError(422, '当前商户尚未开放服务');
+      } else if (nextRole !== 'user' && target.merchant_id == null
+        && !await db.one("SELECT id FROM ar_user_wechat_identity WHERE user_id=? AND appid=? AND status='active'", [targetId, merchant.appId])) {
+        throw new ApiError(409, '该账号尚无目标小程序的已验证微信身份，请选择已在该小程序登录的账号');
+      }
       if (target.role === nextRole && nextRole !== 'user') return { ...publicUser(target), allowedRoles: assignableRoles(actor, target) };
       const now = this.now();
       await this.membership(db, targetId, merchant.id, nextRole, now);
       await db.execute('UPDATE ar_user SET role=?,merchant_id=?,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP(3) WHERE id=?', [nextRole, nextRole === 'user' ? null : merchant.id, targetId]);
       await this.invalidateAuthorizations(db, targetId, now);
       await db.insert('ar_role_audit', { actor_user_id: actor.id, target_user_id: targetId, previous_role: target.role, next_role: nextRole, source: 'api', reason: typeof ctx.body.reason === 'string' ? ctx.body.reason.trim().slice(0, 255) || '管理员更新员工角色' : '管理员更新员工角色', merchant_id: merchant.id });
-      const updated = { ...target, role: nextRole, merchant_id: nextRole === 'user' ? null : merchant.id };
+      const updated = { ...target, role: nextRole, merchant_id: nextRole === 'user' ? null : merchant.id, ...(adminerGrant ? { tel: null } : {}) };
       return { ...publicUser(updated), allowedRoles: assignableRoles(actor, updated) };
     });
   }
@@ -348,10 +390,15 @@ export class RentalAuth {
       const target = merchant ? await tx.one('SELECT * FROM ar_user WHERE id=? AND merchant_id=? FOR UPDATE', [targetId, merchant.id]) : await tx.one('SELECT * FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [targetId, this.appId]);
       if (!target) throw new ApiError(404, '用户不存在');
       if (!assignableRoles(actor, target).includes(nextRole)) throw new ApiError(403, '不能修改自身、同级或更高身份，也不能授予超出权限的身份');
+      const adminerGrant = actor.role === 'adminer' && target.role === 'user';
+      if (adminerGrant && (ctx.body.phone === undefined || !await tx.one(
+        'SELECT user_id FROM ar_user_phone WHERE user_id=? AND appid=? AND phone_e164=? AND verified_ms>0',
+        [targetId, this.appId, normalizePhoneInput(ctx.body.phone)],
+      ))) throw unavailableUser();
       if (target.role === nextRole) return { user: target, actor };
       await tx.execute('UPDATE ar_user SET role=?,updated_at=CURRENT_TIMESTAMP(3) WHERE id=?', [nextRole, targetId]);
       await tx.insert('ar_role_audit', { actor_user_id: principal.user.id, target_user_id: targetId, previous_role: target.role, next_role: nextRole, source: 'api', reason: typeof ctx.body.reason === 'string' ? ctx.body.reason.trim().slice(0, 255) || '管理员更新角色' : '管理员更新角色', ...(merchant ? { merchant_id: merchant.id } : {}) });
-      return { user: { ...target, role: nextRole }, actor };
+      return { user: { ...target, role: nextRole, ...(adminerGrant ? { tel: null } : {}) }, actor };
     });
     return { ...publicUser(result.user), allowedRoles: assignableRoles(result.actor, result.user) };
   }
@@ -361,6 +408,7 @@ export class RentalAuth {
     route('POST', '/v2/rental/auth/refresh', async ctx => ({ success: true, data: await this.refresh(ctx.body.refreshToken) }));
     route('POST', '/v2/rental/auth/merchant-binding/confirm', async () => { throw new ApiError(410, '商户分配确认已停用，请由最高管理员直接分配商户与身份'); });
     route('GET', '/v2/rental/admin/users', ctx => this.users(ctx));
+    route('POST', '/v2/rental/admin/users/lookup-phone', ctx => this.lookupOrdinaryUser(ctx));
     route('PUT', '/v2/rental/admin/users/:id/role', ctx => this.setRole(ctx));
     route('POST', '/v2/rental/admin/users/:id/merchant', ctx => this.assignMerchant(ctx));
   }

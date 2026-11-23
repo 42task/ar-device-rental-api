@@ -35,7 +35,7 @@ async function setup(db: Database) {
   const scoped = <T>(operation: () => Promise<T>) => withMerchant({ entry, merchant }, operation);
   const login = (code: string, bindToken?: string) => scoped(() => auth.login(code, bindToken));
   const root = await login('synthetic-root');
-  const call = (method: string, path: string, bearer: string, body: Row = {}, params: Row = {}, query: Row = {}) => scoped(() => router.routes.find(row => row.method === method && row.path === '/v2/rental/' + path)!.handler({ req: { headers: { authorization: 'Bearer ' + bearer } }, res: { setHeader: vi.fn() }, body, params, query } as any)) as Promise<Row>;
+  const call = (method: string, path: string, bearer: string, body: Row = {}, params: Row = {}, query: Row = {}, managementMerchant = merchant) => withMerchant({ entry, merchant: managementMerchant }, () => router.routes.find(row => row.method === method && row.path === '/v2/rental/' + path)!.handler({ req: { headers: { authorization: 'Bearer ' + bearer } }, res: { setHeader: vi.fn() }, body, params, query } as any)) as Promise<Row>;
   return { db, auth, merchant, entry, scoped, login, root, call };
 }
 
@@ -80,6 +80,81 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL authoritative m
     await expect(f.call('GET', 'admin/users', verified.token.accessToken)).rejects.toMatchObject({ status: 403 });
     expect((await f.login('synthetic-phone-consumer')).user).not.toHaveProperty('phoneNumber');
     expect((await f.scoped(() => f.auth.refresh(verified.token.refreshToken))).user).not.toHaveProperty('phoneNumber');
+  }), 30_000);
+
+  it('enrolls ordinary users only with an exact verified phone and confines adminer grants to their merchant', async () => withFixture(async f => {
+    const provisionAdmin = async (code: string, merchantId: number) => {
+      const { user } = await f.login(code);
+      await f.call('POST', 'admin/users/:id/merchant', f.root.token.accessToken,
+        { merchantId, role: 'adminer', reason: 'Synthetic admin setup' }, { id: String(user.id) });
+      return f.login(code);
+    };
+    const admin = await provisionAdmin('synthetic-first-admin', 1);
+    const otherAdmin = await provisionAdmin('synthetic-second-admin', 2);
+    const otherMerchant = { ...f.merchant, id: 2 };
+    const token = admin.token.accessToken;
+    const first = await f.login('synthetic-new-manager');
+    const second = await f.login('synthetic-new-adminer');
+    const legacy = await f.login('synthetic-unverified-legacy-number');
+    const external = await f.login('synthetic-wrong-app-phone');
+    const retired = await f.login('synthetic-inactive-phone-identity');
+    const firstPhone = '+8613800138000', secondPhone = '+447700900123';
+    const bind = async (user: Row, number: string, phoneApp = appId, identityId: number | null = null) => f.db.insert('ar_user_phone', {
+      user_id: user.id, appid: phoneApp, identity_id: identityId, phone_e164: number,
+      country_code: number === secondPhone ? '44' : '86', verified_ms: Date.now(), code_hash: randomBytes(32).toString('hex'),
+    });
+    await bind(first.user, firstPhone);
+    await bind(second.user, secondPhone);
+    await bind(external.user, '+8613900139000', 'wx0123456789abcdef');
+    const linked = (await f.db.one('SELECT id FROM ar_user_wechat_identity WHERE user_id=?', [retired.user.id]))!;
+    await bind(retired.user, '+8613600136000', appId, linked.id);
+    await f.db.execute("UPDATE ar_user_wechat_identity SET status='retired' WHERE id=?", [linked.id]);
+    await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['+8613700137000', legacy.user.id]);
+    await f.db.execute('UPDATE ar_user SET nickname=?,tel=? WHERE id=?', ['Synthetic manager profile', 'legacy-private-number', first.user.id]);
+    const lookup = (phone: string, bearer = token, merchant = f.merchant) =>
+      f.call('POST', 'admin/users/lookup-phone', bearer, { phone }, {}, {}, merchant);
+    const grant = (target: Row, role: string, phone?: string, bearer = token, merchant = f.merchant) =>
+      f.call('PUT', 'admin/users/:id/role', bearer, { role, phone, reason: 'Synthetic verified phone grant' }, { id: String(target.id) }, {}, merchant);
+
+    await expect(lookup('1380013')).rejects.toMatchObject({ status: 422 });
+    await expect(lookup(firstPhone, first.token.accessToken)).rejects.toMatchObject({ status: 403 });
+    await expect(lookup(firstPhone, token, otherMerchant)).rejects.toMatchObject({ status: 403 });
+    for (const phone of ['+8613700137000', '+8613900139000', '+8613600136000', '+8613500135000']) {
+      expect(await lookup(phone)).toEqual({ items: [] });
+    }
+    expect(await lookup('13800138000')).toEqual({ items: [{
+      id: first.user.id, nickname: 'Synthetic manager profile', avatar: null, tel: null,
+      merchantId: null, role: 'user', allowedRoles: ['manager', 'adminer'],
+    }] });
+    await expect(grant(first.user, 'manager')).rejects.toMatchObject({ status: 404 });
+    await expect(grant(first.user, 'manager', secondPhone)).rejects.toMatchObject({ status: 404 });
+    await expect(grant(legacy.user, 'manager', '+8613700137000')).rejects.toMatchObject({ status: 404 });
+    await f.db.execute("UPDATE ar_merchant SET status='paused' WHERE id=1");
+    await expect(grant(first.user, 'manager', firstPhone)).rejects.toMatchObject({ status: 422 });
+    await f.db.execute("UPDATE ar_merchant SET status='active' WHERE id=1");
+
+    expect(await grant(first.user, 'manager', firstPhone)).toMatchObject({ role: 'manager', merchantId: 1, tel: null, allowedRoles: ['user', 'manager'] });
+    expect(await lookup(firstPhone)).toEqual({ items: [] });
+    await expect(grant(first.user, 'adminer', firstPhone)).rejects.toMatchObject({ status: 403 });
+    await expect(grant(first.user, 'manager', firstPhone, otherAdmin.token.accessToken, otherMerchant)).rejects.toMatchObject({ status: 404 });
+    await expect(f.scoped(() => f.auth.refresh(first.token.refreshToken))).rejects.toMatchObject({ status: 401 });
+    expect((await f.login('synthetic-new-manager')).user).toMatchObject({ role: 'manager', merchantId: 1 });
+
+    const competing = await Promise.allSettled([grant(second.user, 'adminer', secondPhone), grant(second.user, 'adminer', secondPhone, otherAdmin.token.accessToken, otherMerchant)]);
+    const winner = competing.findIndex(result => result.status === 'fulfilled');
+    expect(competing.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    expect(competing[1 - winner]).toMatchObject({ status: 'rejected', reason: { status: 404 } });
+    expect(await f.db.one('SELECT role,merchant_id,auth_version FROM ar_user WHERE id=?', [second.user.id])).toEqual({ role: 'adminer', merchant_id: winner + 1, auth_version: 1 });
+    expect(await f.db.one('SELECT role,merchant_id,status,authorization_version FROM ar_merchant_membership WHERE user_id=?', [second.user.id])).toEqual({
+      role: 'adminer', merchant_id: winner + 1, status: 'active', authorization_version: 1,
+    });
+    expect(await f.db.query('SELECT actor_user_id,previous_role,next_role,merchant_id,reason FROM ar_role_audit WHERE target_user_id=?', [second.user.id])).toEqual([{
+      actor_user_id: [admin, otherAdmin][winner].user.id, previous_role: 'user', next_role: 'adminer',
+      merchant_id: winner + 1, reason: 'Synthetic verified phone grant',
+    }]);
+    await expect(grant(second.user, 'manager', secondPhone, [admin, otherAdmin][winner].token.accessToken, [f.merchant, otherMerchant][winner])).rejects.toMatchObject({ status: 403 });
+    expect(await grant(first.user, 'user')).toMatchObject({ role: 'user', merchantId: null });
+    expect((await lookup(firstPhone)).items).toMatchObject([{ id: first.user.id, role: 'user' }]);
   }), 30_000);
 
   it('migrates legacy employees once, preserves revoked memberships and expires unversioned grants', async () => withFixture(async f => {
