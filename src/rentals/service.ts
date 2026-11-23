@@ -406,7 +406,10 @@ export class RentalService {
     this.assertPrincipal(principal); requireManager(principal.user);
     const mode = input.refundMode;
     if (mode !== 'deposit' && mode !== 'full') throw new ApiError(422, '请选择退押金或全额退款');
-    if (typeof input.reason !== 'string' || !input.reason.trim() || [...input.reason.trim()].length > 255) throw new ApiError(422, '请填写不超过255字的归还原因');
+    if (input.reason != null && typeof input.reason !== 'string') throw new ApiError(422, '退款备注格式无效');
+    const reason = input.reason?.trim() || null;
+    if (mode === 'full' && !reason) throw new ApiError(422, '全额退款请填写退款备注');
+    if (reason && [...reason].length > 255) throw new ApiError(422, '退款备注不能超过255字');
     const key = requestKey(input.idempotencyKey);
     const existing = await this.readOrder(orderId, principal);
     const row = await this.lockOrder(existing.id, async (db, current) => {
@@ -422,12 +425,12 @@ export class RentalService {
       if (current.status !== 'ACTIVE' || current.payment_status !== 'SUCCESS') throw new ApiError(409, '该订单不处于可结束的租赁状态');
       const amount = mode === 'deposit' ? Number(current.deposit_cents) : Number(current.total_cents);
       const refundStatus = amount === 0 ? 'SUCCESS' : 'PENDING';
-      await db.execute("UPDATE ar_rental_order SET status='ENDED',ended_ms=?,ended_by=?,end_reason=?,end_key=?,refund_mode=?,refund_amount_cents=?,refund_status=?,out_refund_no=?,settled_ms=?,updated_ms=? WHERE id=?", [this.now(), principal.user.id, input.reason.trim(), key, mode, amount, refundStatus, amount ? rentalRefundNumber() : null, amount ? null : this.now(), this.now(), current.id]);
+      await db.execute("UPDATE ar_rental_order SET status='ENDED',ended_ms=?,ended_by=?,end_reason=?,end_key=?,refund_mode=?,refund_amount_cents=?,refund_status=?,out_refund_no=?,settled_ms=?,updated_ms=? WHERE id=?", [this.now(), principal.user.id, reason, key, mode, amount, refundStatus, amount ? rentalRefundNumber() : null, amount ? null : this.now(), this.now(), current.id]);
       if (amount) {
         await db.execute("UPDATE ar_rental_slot SET state='SETTLING',expires_ms=NULL WHERE device_id=? AND rental_id=?", [current.device_id, current.id]);
         await this.enqueue(db, current.id, 'REFUND_APPLY', this.now());
       } else await db.execute('DELETE FROM ar_rental_slot WHERE device_id=? AND rental_id=?', [current.device_id, current.id]);
-      await this.event(db, current.id, principal.user.id, 'RENTAL_ENDED', { refundMode: mode, refundAmountCents: amount, reason: input.reason.trim() });
+      await this.event(db, current.id, principal.user.id, 'RENTAL_ENDED', { refundMode: mode, refundAmountCents: amount, reason });
       return (await db.one('SELECT * FROM ar_rental_order WHERE id=?', [current.id]))!;
     }).catch((error: unknown) => {
       // The database rolls back before this translation. Concurrent or legacy
@@ -449,9 +452,10 @@ export class RentalService {
     const client = await this.orderPayment(row);
     const notifyUrl = client.config.refundNotifyUrl || this.notificationUrl('refund', row);
     if (!notifyUrl.startsWith('https://')) throw new ApiError(503, '退款回调地址未配置');
+    const reason = row.status === 'COMPENSATING' ? '设备占用失效，租赁未成立' : row.end_reason;
     const result = await client.payment('POST', '/v3/refund/domestic/refunds', {
       out_trade_no: row.out_trade_no, out_refund_no: row.out_refund_no,
-      reason: row.status === 'COMPENSATING' ? '设备占用失效，租赁未成立' : row.end_reason,
+      ...(reason ? { reason } : {}),
       notify_url: notifyUrl, amount: { refund: Number(row.refund_amount_cents), total: Number(row.total_cents), currency: 'CNY' },
     });
     const updated = await this.applyRefundResult(Number(row.id), result);
