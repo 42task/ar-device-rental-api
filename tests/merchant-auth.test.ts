@@ -97,7 +97,7 @@ describe('merchant account identities and explicit assignment', () => {
     expect(employeeList.items.some((row: Row) => row.id === consumer.user.id)).toBe(false);
     const platformCtx = f.ctx(f.first, f.root.token.accessToken); platformCtx.query.scope = 'platform';
     const platform = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(platformCtx)) as Row;
-    expect(platform.items.map((row: Row) => row.id)).toEqual([consumer.user.id]);
+    expect(platform).toMatchObject({ total: 0, items: [] });
     const admin = await f.login(f.first, 'local-admin'); await f.member(admin.user.id, 1, 'adminer');
     const adminToken = (await f.login(f.first, 'local-admin')).token.accessToken;
     await expect(runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, adminToken, { role: 'manager' }, { id: String(consumer.user.id) })))).rejects.toMatchObject({ status: 404 });
@@ -108,30 +108,34 @@ describe('merchant account identities and explicit assignment', () => {
     const identity = await f.login(f.first, 'platform-consumer');
     expect(identity).toMatchObject({ entry: { id: 1, appId: appA }, managementMerchant: { id: 1 }, merchant: { id: 1 }, user: { merchantId: 1 } });
   });
-  it('labels verified directory phones for employees and platform consumers within the selected application', async () => {
+  it('lists only verified directory phones for employees and platform consumers within the selected application', async () => {
     const f = await fixture();
     const listed = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, f.root.token.accessToken))) as Row;
     expect(listed.items).toMatchObject([{ id: 2, phoneNumber: '+8613800138000', phoneVerified: true, tel: '+86 138****8000' }]);
     const bound = await f.login(f.first, 'verified-consumer'), unbound = await f.login(f.first, 'unbound-consumer');
+    const unverified = await f.login(f.first, 'unverified-consumer');
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?,?)', [unverified.user.id, appA, '+8613400134000', '86', 0, 'd'.repeat(64), null]);
     f.a.phoneNumber.mockResolvedValueOnce({ phoneE164: '+447700900123', countryCode: '44' });
     await runWithMerchant(f.first, async () => f.phone.bind(await f.authenticate(f.first, bound.token.accessToken), 'consumer-phone-code'));
     await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['13900139000', unbound.user.id]);
     const context = f.ctx(f.first, f.root.token.accessToken); context.query.scope = 'platform';
-    const consumers = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(context)) as Row;
-    expect(consumers.items.find((user: Row) => user.id === bound.user.id)).toMatchObject({ phoneNumber: '+447700900123', phoneVerified: true });
-    expect(consumers.items.find((user: Row) => user.id === unbound.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
+    const directory = () => runWithMerchant(f.first, () => f.route('GET', 'admin/users')(context)) as Promise<Row>;
+    expect(await directory()).toMatchObject({ total: 1, items: [{ id: bound.user.id, phoneNumber: '+447700900123', phoneVerified: true }] });
+    context.query.page = '2';
+    expect(await directory()).toMatchObject({ page: 2, total: 1, items: [] });
+    context.query.page = '1';
     context.query.search = '7700900123';
-    const matches = await runWithMerchant(f.first, () => f.route('GET', 'admin/users')(context)) as Row;
-    expect(matches.items.map((user: Row) => user.id)).toEqual([bound.user.id]);
+    expect(await directory()).toMatchObject({ total: 1, items: [{ id: bound.user.id }] });
     const fresh = await f.login(f.first, 'verified-consumer');
     expect(fresh.user).not.toHaveProperty('phoneNumber');
     expect((await runWithMerchant(f.first, () => f.auth.refresh(fresh.token.refreshToken))).user).not.toHaveProperty('phoneNumber');
     await expect(runWithMerchant(f.first, () => f.route('GET', 'admin/users')(f.ctx(f.first, fresh.token.accessToken)))).rejects.toMatchObject({ status: 403 });
+    await f.db.execute('UPDATE ar_user_phone SET identity_id=? WHERE user_id=?', [2, bound.user.id]);
+    expect(await directory()).toMatchObject({ total: 0, items: [] });
     await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?,?)', [3, appA, '+8613900139000', '86', 1800000000000, 'c'.repeat(64), 3]);
     const independent = f.ctx(f.first, f.root.token.accessToken); independent.query.scope = 'platform';
     const other = await withMerchant({ entry: f.first, merchant: f.second }, () => f.route('GET', 'admin/users')(independent)) as Row;
-    expect(other.items).toMatchObject([{ id: 3, phoneNumber: null, phoneVerified: false }]);
-    expect(JSON.stringify(other)).not.toContain('+8613900139000');
+    expect(other).toMatchObject({ total: 0, items: [] });
   });
   it('revokes legacy assignments, JWTs, browser sessions and scanned challenges when staff authority is removed', async () => {
     const f = await fixture(), browser = await f.adminLogin(f.target.token.accessToken);
@@ -166,6 +170,7 @@ describe('merchant account identities and explicit assignment', () => {
     // A migrated account retains its original profile AppID while the active
     // identity is authoritative for the selected independent application.
     await f.db.execute('UPDATE ar_user SET appid=?,merchant_id=NULL WHERE id=3', [appA]);
+    await f.db.execute('INSERT INTO ar_user_phone VALUES(?,?,?,?,?,?,?)', [3, appB, '+8613900139000', '86', 1800000000000, 'c'.repeat(64), 3]);
     const selected = <T>(operation: () => Promise<T>) => withMerchant({ entry: f.first, merchant: f.second }, operation);
     const context = f.ctx(f.first, f.root.token.accessToken); context.query.scope = 'platform';
     const list = await selected(() => f.route('GET', 'admin/users')(context)) as Row;
@@ -233,9 +238,13 @@ describe('merchant account identities and explicit assignment', () => {
     await expect(runWithMerchant(f.first, () => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'user' }, { id: '2' })))).rejects.toMatchObject({ status: 403 });
     const member = await f.login(f.shared, 'shared-member');
     await f.member(member.user.id, 3, 'manager');
+    const unbound = await f.login(f.shared, 'shared-member-unbound');
+    await f.member(unbound.user.id, 3, 'manager');
+    f.a.phoneNumber.mockResolvedValueOnce({ phoneE164: '+8613600136000', countryCode: '86' });
+    await runWithMerchant(f.first, async () => f.phone.bind(await f.authenticate(f.first, member.token.accessToken), 'shared-member-phone-code'));
     const own = (operation: () => Promise<unknown>) => withMerchant({ entry: f.first, merchant: f.shared }, operation);
     const listed = await own(() => f.route('GET', 'admin/users')(f.ctx(f.first, staff.token.accessToken))) as Row;
-    expect(listed.items.map((user: Row) => user.id)).toEqual([member.user.id]);
+    expect(listed).toMatchObject({ total: 1, items: [{ id: member.user.id, phoneVerified: true }] });
     expect(await own(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'manager' }, { id: String(member.user.id) })))).toMatchObject({ id: member.user.id, role: 'manager' });
     await expect(own(() => f.route('PUT', 'admin/users/:id/role')(f.ctx(f.first, staff.token.accessToken, { role: 'user' }, { id: '2' })))).rejects.toMatchObject({ status: 404 });
     expect((await f.db.one('SELECT role,merchant_id FROM ar_user WHERE id=2'))!).toMatchObject({ role: 'manager', merchant_id: 1 });

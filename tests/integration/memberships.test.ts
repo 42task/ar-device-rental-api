@@ -45,8 +45,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL authoritative m
     const unbound = await f.login('synthetic-unbound-consumer');
     const otherApp = await f.login('synthetic-other-app-phone');
     const unverified = await f.login('synthetic-unverified-phone');
+    const retired = await f.login('synthetic-retired-phone-identity');
     const employee = await f.login('synthetic-phone-employee');
-    const administrator = await f.login('synthetic-phone-adminer');
+    const administrator = await f.login('synthetic-unbound-adminer');
     const elsewhere = await f.login('synthetic-other-merchant-employee');
     const phone = async (userId: number, number: string, countryCode = '86', phoneApp = appId, verifiedMs = Date.now()) => f.db.insert('ar_user_phone', {
       user_id: userId, appid: phoneApp, phone_e164: number, country_code: countryCode, verified_ms: verifiedMs, code_hash: randomBytes(32).toString('hex'),
@@ -58,23 +59,26 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL authoritative m
     await phone(verified.user.id, '+8613800138000');
     await phone(otherApp.user.id, '+8613900139000', '86', 'wx0123456789abcdef');
     await phone(unverified.user.id, '+8613600136000', '86', appId, 0);
+    await phone(retired.user.id, '+8613400134000');
     await phone(employee.user.id, '+447700900123', '44');
     await phone(elsewhere.user.id, '+8613500135000');
+    const retiredIdentity = (await f.db.one('SELECT id FROM ar_user_wechat_identity WHERE user_id=? AND appid=?', [retired.user.id, appId]))!;
+    await f.db.execute('UPDATE ar_user_phone SET identity_id=? WHERE user_id=?', [retiredIdentity.id, retired.user.id]);
+    await f.db.execute("UPDATE ar_user_wechat_identity SET status='retired' WHERE id=?", [retiredIdentity.id]);
+    await f.db.insert('ar_user_wechat_identity', { user_id: retired.user.id, appid: appId, openid: 'synthetic-current-identity', status: 'active' });
     await f.db.execute('UPDATE ar_user SET tel=? WHERE id=?', ['13700137000', unbound.user.id]);
     await membership(employee.user.id, 1, 'manager');
     await membership(administrator.user.id, 1, 'adminer');
     await membership(elsewhere.user.id, 2, 'manager');
 
     const platform = await f.call('GET', 'admin/users', f.root.token.accessToken, {}, {}, { scope: 'platform' });
-    expect(platform.items.find((user: Row) => user.id === verified.user.id)).toMatchObject({ phoneNumber: '+8613800138000', tel: '+86 138****8000', phoneVerified: true });
-    for (const login of [unbound, otherApp, unverified]) expect(platform.items.find((user: Row) => user.id === login.user.id)).toMatchObject({ phoneNumber: null, phoneVerified: false });
-    expect(platform.items.some((user: Row) => user.id === elsewhere.user.id)).toBe(false);
+    expect(platform).toMatchObject({ total: 1, items: [{ id: verified.user.id, phoneNumber: '+8613800138000', tel: '+86 138****8000', phoneVerified: true }] });
     expect((await f.call('GET', 'admin/users', f.root.token.accessToken, {}, {}, { scope: 'platform', search: '13800138000' })).items.map((user: Row) => user.id)).toEqual([verified.user.id]);
+    expect(await f.call('GET', 'admin/users', f.root.token.accessToken, {}, {}, { scope: 'platform', page: 2 })).toMatchObject({ total: 1, page: 2, items: [] });
 
     const employees = await f.call('GET', 'admin/users', f.root.token.accessToken);
-    expect(employees.items.find((user: Row) => user.id === employee.user.id)).toMatchObject({ phoneNumber: '+447700900123', tel: '+44 770****0123', phoneVerified: true });
-    expect(employees.items.some((user: Row) => user.id === elsewhere.user.id || user.id === verified.user.id)).toBe(false);
-    const adminLogin = await f.login('synthetic-phone-adminer');
+    expect(employees).toMatchObject({ total: 1, items: [{ id: employee.user.id, phoneNumber: '+447700900123', tel: '+44 770****0123', phoneVerified: true }] });
+    const adminLogin = await f.login('synthetic-unbound-adminer');
     expect((await f.call('GET', 'admin/users', adminLogin.token.accessToken)).items.map((user: Row) => user.id)).toEqual([employee.user.id]);
     await expect(f.call('GET', 'admin/users', adminLogin.token.accessToken, {}, {}, { scope: 'platform' })).rejects.toMatchObject({ status: 403 });
     await expect(f.call('GET', 'admin/users', verified.token.accessToken)).rejects.toMatchObject({ status: 403 });
@@ -184,6 +188,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL authoritative m
     await f.db.insert('ar_merchant_membership', { user_id: 2, merchant_id: 1, role: 'adminer', status: 'active', authorization_version: 1, updated_ms: Date.now() });
     const subject = await f.login('synthetic-subject');
     const legacyToken = 'b'.repeat(64), now = Date.now();
+    await f.db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [subject.user.id, appId, '+8613800138000', '86', now, 'a'.repeat(64)]);
     await f.db.insert('ar_user_merchant_binding', { id: createHash('sha256').update(legacyToken).digest('hex'), user_id: 2, source_merchant_id: 1, source_appid: appId, source_auth_version: 0, target_merchant_id: 2, target_role: 'adminer', created_by: 1, reason: 'Synthetic retired invitation', created_ms: now, expires_ms: now + 3600000 });
     const assigned = await f.call('POST', 'admin/users/:id/merchant', f.root.token.accessToken, { merchantId: 2, role: 'adminer', reason: 'Synthetic direct staff assignment' }, { id: '2' });
     expect(assigned).toMatchObject({ user: { id: 2, role: 'adminer', merchantId: 2 }, merchant: { id: 2, appId } });
