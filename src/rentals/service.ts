@@ -10,6 +10,7 @@ import { currentMerchant, entryMerchant, withMerchant } from '../merchants/conte
 import type { WeChatClient } from '../payments/wechat';
 import { publicVenue } from '../venues';
 import { legacyAccountAdapter, loadAccountPermissions, requireMerchantManagementScope } from '../auth/identity';
+import { requireVerifiedPhone } from '../auth/phone';
 import { refundStatusAfterObservation } from './refund-state';
 import { quoteForDevice, rentalCents as cents, venueForDevice } from './quotes';
 import { readDevicePage } from './device-queries';
@@ -252,6 +253,7 @@ export class RentalService {
       if (version !== pricing.version || venueVersion !== pricing.venuePriceVersion) throw new ApiError(409, '设备或场地费用已变更，请刷新后确认');
       cents(pricing.useFeeCents); cents(pricing.depositCents);
       if (pricing.totalCents <= 0 || pricing.totalCents > 2147483647) throw new ApiError(422, '场地租赁费用配置无效');
+      await requireVerifiedPhone(db, principal);
       const now = this.now();
       const info = this.displayDevice(device);
       const order = await db.insert('ar_rental_order', {
@@ -288,6 +290,7 @@ export class RentalService {
       const ready = await this.lockOrder(row.id, async (db, current) => {
         await this.assertCurrentPayer(principal, db);
         if (current.status !== 'PENDING_PAYMENT') throw new ApiError(409, '订单状态已变化');
+        await requireVerifiedPhone(db, principal);
         if (Number(current.prepay_pending_until_ms || 0) > this.now()) throw new ApiError(409, '微信支付正在初始化，请稍后重新查询');
         // Production provider fetch is bounded at 15 seconds. The durable fence
         // survives process death and prevents cancel from racing order creation.
@@ -302,6 +305,7 @@ export class RentalService {
         return current;
       });
     }
+    await requireVerifiedPhone(this.services.db, principal);
     return { rental: this.view(await this.readOrder(row.id), principal), payParams: parameters };
   }
   private async providerOrder(row: Row): Promise<Row> {

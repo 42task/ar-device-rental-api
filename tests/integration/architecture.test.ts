@@ -37,11 +37,13 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('independent application id
       const client = new WeChatClient({ appId, appSecret: 'synthetic-application-secret', payEnabled: false, allowEnvironmentFallback: false,
         fetch: async () => { throw Error('No real WeChat access in architecture tests.'); } });
       client.codeSession = async code => ({ openid: 'synthetic-' + code });
+      client.phoneNumber = async () => ({ phoneE164: '+8613800138000', countryCode: '86' });
       const registry = new MerchantRegistry(db, client, new MerchantSecrets('a'.repeat(64)));
       registry.applications.createLoginClient = (row: Row, appSecret: string) => {
         const login = new WeChatClient({ appId: row.app_id, appSecret, payEnabled: false, allowEnvironmentFallback: false,
           fetch: async () => { throw Error('No real WeChat access in architecture tests.'); } });
         login.codeSession = client.codeSession;
+        login.phoneNumber = client.phoneNumber;
         return login;
       };
       const auth = new RentalAuth(db, client, { jwtSecret: 'synthetic-architecture-signing-key-at-least-32-bytes', rootPhone: '' });
@@ -87,7 +89,15 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('independent application id
       const customerContext = await request(app).get('/api/v2/rental/devices/context').set('Authorization', bearer).query({ uuid: 'synthetic-device' });
       expect(customerContext.status).toBe(200);
       expect(customerContext.body.device).not.toHaveProperty('remarkName');
-      const reservation = await request(app).post('/api/v2/rentals').set('Authorization', bearer).send({ deviceId: device.body.device.id, priceVersion: 1, venuePriceVersion: 1, idempotencyKey: 'synthetic-architecture-reservation' });
+      const reserve = () => request(app).post('/api/v2/rentals').set('Authorization', bearer).send({ deviceId: device.body.device.id, priceVersion: 1, venuePriceVersion: 1, idempotencyKey: 'synthetic-architecture-reservation' });
+      const unverified = await reserve();
+      expect(unverified.status).toBe(403);
+      expect(unverified.body.code).toBe('PHONE_VERIFICATION_REQUIRED');
+      expect(await db.one('SELECT * FROM ar_rental_slot WHERE device_id=?', [device.body.device.id])).toBeNull();
+      const binding = await request(app).post('/api/v2/rental/auth/phone').set('Authorization', bearer).send({ code: 'synthetic-architecture-phone' });
+      expect(binding.status).toBe(200);
+      expect(binding.body.verified).toBe(true);
+      const reservation = await reserve();
       expect(reservation.status).toBe(201);
       const stored = (await db.one('SELECT * FROM ar_rental_order WHERE id=?', [reservation.body.rental.id]))!;
       expect(stored).toMatchObject({ merchant_id: merchantId, payment_config_id: configId, mch_id: '2000000001', total_cents: 10000 });

@@ -17,7 +17,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
     try {
       await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4`); created = true;
       db = new Database(mysql.createPool({ ...settings, database, connectionLimit: 12 }));
-      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql']) {
+      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql']) {
         const schema = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(sql => sql.trim()).filter(Boolean);
         for (const statement of schema) await db.execute(statement);
       }
@@ -30,6 +30,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       await db.execute('ALTER TABLE ar_rental_order ADD COLUMN venue_id int NULL, ADD COLUMN venue_name varchar(128) NULL, ADD COLUMN venue_price_version int NULL');
       for (const [userId, role] of [[1, 'user'], [2, 'user'], [10, 'manager'], [11, 'root'], [12, 'adminer']] as const) {
         await db.insert('ar_user', { id: userId, role, appid: 'wx-rental-test', openid: 'payer-' + userId });
+        if (role === 'user') await db.insert('ar_user_phone', { user_id: userId, appid: 'wx-rental-test', phone_e164: '+861380013800' + userId, country_code: '86', verified_ms: Date.now(), code_hash: String(userId).repeat(64) });
       }
       const device = await db.insert('ar_device', { uuid: 'rental-concurrent-device', name: '并发设备', merchant_id: 1, venue_id: 1 });
       const refunds = new Map<string, Row>();
