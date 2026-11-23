@@ -90,6 +90,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL admin challenge
       await nodes[0].changeRole({ cookie: adminSessionCookie, id: '2', body: { role: 'manager', phone: prospectPhone } });
       await expect(nodes[1].auth.authenticateBearer(context({ token: userToken }))).rejects.toMatchObject({ status: 401 });
       userToken = (await nodes[0].auth.login('2')).token.accessToken;
+      await nodes[0].auth.login('5');
       const userList = await nodes[0].users({ cookie: adminSessionCookie });
       expect(userList.items.find((user: Row) => user.id === 2).allowedRoles).toEqual(['user', 'manager']);
       expect(userList.items.some((user: Row) => user.id === 3)).toBe(false);

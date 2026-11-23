@@ -24,14 +24,15 @@ export function publicMerchant(): Row | undefined {
 }
 const validIdentity = (value: unknown): value is string => typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,128}$/u.test(value);
 const unavailableUser = () => new ApiError(404, '未找到可管理的账号，请核对已验证手机号');
+const activePhoneIdentity = `EXISTS(SELECT 1 FROM ar_user_wechat_identity i WHERE i.user_id=p.user_id AND i.appid=p.appid AND i.status='active'
+  AND (p.identity_id IS NULL OR p.identity_id=i.id))`;
 
 async function ordinaryUserByPhone(db: Database, appId: string, phone: string, targetId?: number): Promise<Row | null> {
   const sql = `SELECT u.id,u.nickname,u.avatar FROM ar_user_phone p
     INNER JOIN ar_user u ON u.id=p.user_id
     WHERE p.appid=? AND p.phone_e164=? AND p.verified_ms>0 AND u.role<>'root'
       AND NOT EXISTS(SELECT 1 FROM ar_merchant_membership m WHERE m.user_id=u.id AND m.status='active')
-      AND EXISTS(SELECT 1 FROM ar_user_wechat_identity i WHERE i.user_id=u.id AND i.appid=p.appid AND i.status='active'
-        AND (p.identity_id IS NULL OR p.identity_id=i.id))`;
+      AND ${activePhoneIdentity}`;
   return targetId === undefined ? db.one(sql, [appId, phone])
     : db.one(sql + ' AND u.id=? FOR UPDATE', [appId, phone, targetId]);
 }
@@ -297,11 +298,12 @@ export class RentalAuth {
       requireUserAdmin(actor); requireMerchantManagementScope(actor);
       if (Number(actor.auth_version ?? 0) !== principal.authVersion) throw new ApiError(401, '账号授权已变更，请重新登录');
       if (scope === 'platform') requireRoot(actor);
-      const phoneApp = merchant.appId;
-      const from = ` FROM ar_user u LEFT JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=? AND p.verified_ms>0
+      const from = ` FROM ar_user u INNER JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=? AND p.verified_ms>0
         ${scope === 'employees' ? "INNER JOIN ar_merchant_membership m ON m.user_id=u.id AND m.status='active'" : ''}
-        WHERE u.role<>'root' AND u.id<>? AND ${scope === 'employees' ? 'm.merchant_id=?' : "NOT EXISTS(SELECT 1 FROM ar_merchant_membership x WHERE x.user_id=u.id AND x.status='active') AND EXISTS(SELECT 1 FROM ar_user_wechat_identity i WHERE i.user_id=u.id AND i.appid=? AND i.status='active')"}`;
-      const parameters: unknown[] = [phoneApp, actor.id, scope === 'employees' ? merchant.id : merchant.appId];
+        WHERE u.role<>'root' AND u.id<>? AND ${activePhoneIdentity}
+        AND ${scope === 'employees' ? 'm.merchant_id=?' : "NOT EXISTS(SELECT 1 FROM ar_merchant_membership x WHERE x.user_id=u.id AND x.status='active')"}`;
+      const parameters: unknown[] = [merchant.appId, actor.id];
+      if (scope === 'employees') parameters.push(merchant.id);
       const pattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
       const filter = search ? ' AND (u.nickname LIKE ? OR CAST(p.phone_e164 AS CHAR) LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
       if (search) parameters.push(pattern, pattern, search);
@@ -359,13 +361,13 @@ export class RentalAuth {
     requireMerchantManagementScope(principal.user);
     const page = Math.max(1, Math.min(1000000, Math.floor(Number(ctx.query.page)) || 1)), pageSize = 20;
     const search = typeof ctx.query.search === 'string' ? ctx.query.search.trim().slice(0, 100) : '';
-    const searchSql = search ? ' AND (u.nickname LIKE ? OR u.tel LIKE ? OR CAST(p.phone_e164 AS CHAR) LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
+    const searchSql = search ? ' AND (u.nickname LIKE ? OR CAST(p.phone_e164 AS CHAR) LIKE ? OR CAST(u.id AS CHAR)=?)' : '';
     const pattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
     const merchant = currentMerchant();
     const prefix = merchant ? [merchant.appId, merchant.id, principal.user.id] : [this.appId, principal.user.id];
-    const values = search ? [...prefix, pattern, pattern, pattern, search] : prefix;
-    const from = merchant ? ' FROM ar_user u LEFT JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=? AND p.verified_ms>0 WHERE u.merchant_id=? AND u.id<>?'
-      : ' FROM ar_user u LEFT JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=u.appid AND p.verified_ms>0 WHERE u.appid=? AND u.id<>?';
+    const values = search ? [...prefix, pattern, pattern, search] : prefix;
+    const from = merchant ? ' FROM ar_user u INNER JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=? AND p.verified_ms>0 WHERE u.merchant_id=? AND u.id<>?'
+      : ' FROM ar_user u INNER JOIN ar_user_phone p ON p.user_id=u.id AND p.appid=u.appid AND p.verified_ms>0 WHERE u.appid=? AND u.id<>?';
     const count = await this.db.one('SELECT COUNT(*) AS total' + from + searchSql, values);
     const items = await this.db.query(`SELECT u.*,p.phone_e164 AS verified_phone,p.country_code AS phone_country_code${from}${searchSql} ORDER BY u.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values);
     return { items: items.map(user => ({ ...directoryUser(user), allowedRoles: assignableRoles(principal.user, user) })), page, pageSize, total: Number(count?.total || 0) };

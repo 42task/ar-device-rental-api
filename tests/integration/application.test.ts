@@ -49,13 +49,21 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       expect(promoted.body).toMatchObject({ id: manager.user.id, role: 'manager' });
       expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', 'Bearer ' + manager.token.accessToken)).status).toBe(401);
       const managerToken = 'Bearer ' + (await login('manager')).token.accessToken;
-      const users = await request(app).get('/api/v2/rental/admin/users').set('Authorization', ownerToken);
+      const directory = (scope: string) => request(app).get('/api/v2/rental/admin/users').query({ scope }).set('Authorization', ownerToken);
+      for (const scope of ['employees', 'platform']) {
+        const unverified = await directory(scope);
+        expect(unverified.status).toBe(200);
+        expect(unverified.body).toMatchObject({ scope, total: 0, items: [] });
+      }
+      for (const [account, phone, code] of [[manager, '+8613800138000', 'a'], [ordinary, '+8613900139000', 'b']] as const) {
+        await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [account.user.id, appId, phone, '86', Date.now(), code.repeat(64)]);
+      }
+      const users = await directory('employees');
       expect(users.status).toBe(200);
-      expect(users.body.items).toHaveLength(1);
-      expect(users.body.items[0]).toMatchObject({ id: manager.user.id, role: 'manager' });
-      const platform = await request(app).get('/api/v2/rental/admin/users').query({ scope: 'platform' }).set('Authorization', ownerToken);
-      expect(platform.status).toBe(200); expect(platform.body.items).toHaveLength(1);
-      expect(platform.body.items[0]).toMatchObject({ id: ordinary.user.id, role: 'user', merchantId: null });
+      expect(users.body).toMatchObject({ total: 1, items: [{ id: manager.user.id, role: 'manager', phoneVerified: true }] });
+      const platform = await directory('platform');
+      expect(platform.status).toBe(200);
+      expect(platform.body).toMatchObject({ total: 1, items: [{ id: ordinary.user.id, role: 'user', merchantId: null, phoneVerified: true }] });
       expect(JSON.stringify(users.body)).not.toContain('test-openid');
       const uuid = 'http-device-test';
       const venue = await seedVenue(db);

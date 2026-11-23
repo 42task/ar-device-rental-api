@@ -68,11 +68,13 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('MySQL user profiles and av
     expect(image.headers['content-security-policy']).toContain('sandbox');
     const refreshed = await f.http('post', '/api/v2/rental/auth/refresh').send({ refreshToken: owner.token.refreshToken });
     expect(refreshed.body.data.user).toMatchObject({ id: owner.user.id, nickname: '微信名字 😀', avatar });
+    await f.db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [owner.user.id, appId, '+8613800138000', '86', Date.now(), 'a'.repeat(64)]);
     const directory = await f.http('get', '/api/v2/rental/admin/users?scope=platform&search=' + encodeURIComponent('微信名字'), root.bearer);
     expect(directory.status, JSON.stringify(directory.body)).toBe(200);
     expect(directory.body.items).toEqual([expect.objectContaining({ id: owner.user.id, nickname: '微信名字 😀', avatar })]);
     const employee = await f.login('employee');
     await f.db.insert('ar_merchant_membership', { user_id: employee.user.id, merchant_id: 1, role: 'manager', status: 'active', authorization_version: 1, updated_ms: Date.now() });
+    await f.db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [employee.user.id, appId, '+8613900139000', '86', Date.now(), 'b'.repeat(64)]);
     expect((await f.http('patch', '/api/v2/rental/profile', employee.bearer).send({ nickname: '微信员工' })).status).toBe(200);
     const employees = await f.http('get', '/api/v2/rental/admin/users?scope=employees&search=' + encodeURIComponent('微信员工'), root.bearer);
     expect(employees.status, JSON.stringify(employees.body)).toBe(200);
