@@ -183,10 +183,12 @@ describe('independent AR rental lifecycle', () => {
     await expect(f.service.updateDeviceRemark(f.user, deviceId, { remarkName: '无权修改' })).rejects.toMatchObject({ status: 403 });
     await expect(f.service.updateDeviceRemark(f.adminer, deviceId, { remarkName: '无效\n输入' })).rejects.toMatchObject({ status: 422 });
     expect(await f.service.updateDeviceRemark(f.adminer, deviceId, { remarkName: '  二楼备用机  ' })).toMatchObject({ device: { name: '公开名称', remarkName: '二楼备用机' } });
+    expect(await f.service.deviceQrcode(f.manager, deviceId)).toMatchObject({ device: { remarkName: '二楼备用机' } });
     expect((await f.service.context(f.adminer, 'remark-device')).actions.canEditDeviceRemark).toBe(true);
     await f.db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [f.adminer.user.id]);
     await expect(f.service.updateDeviceRemark(f.adminer, deviceId, { remarkName: '权限已撤销' })).rejects.toMatchObject({ status: 403 });
     expect(await f.service.updateDeviceRemark(f.root, deviceId, { remarkName: '' })).toMatchObject({ device: { name: '公开名称', remarkName: '' } });
+    expect(await f.service.deviceQrcode(f.manager, deviceId)).toMatchObject({ device: { remarkName: '' } });
     expect(await f.db.one('SELECT * FROM ar_rental_config WHERE device_id=?', [deviceId])).toBeNull();
   });
   it('retains device capabilities when a system administrator is demoted to device manager', async () => {
