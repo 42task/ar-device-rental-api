@@ -26,13 +26,6 @@ export async function assertDeviceIdentifierAvailable(db: Database, kind: Device
   const retired = await retiredDeviceIdentifier(db, kind, key, true);
   if (retired && Number(retired.device_id) !== deviceId) throw new ApiError(409, '该标识曾用于其他设备，不能重新分配');
 
-  if (kind === 'uuid' && isDeviceUuid(value) && !current && retired?.original_identifier !== value) {
-    // Prior releases also printed SNs with i=. A canonical-looking historical SN
-    // can already own that legacy link even if the UUID column is unclaimed.
-    const activeAlias = await db.one('SELECT id FROM ar_device WHERE current_sn_uuid=? AND id<>? LIMIT 1 FOR UPDATE', [key, deviceId]);
-    const retiredAlias = activeAlias ?? await db.one('SELECT device_id FROM ar_device_retired_identifier WHERE legacy_i_uuid=? AND device_id<>? LIMIT 1 FOR UPDATE', [key, deviceId]);
-    if (retiredAlias) throw new ApiError(409, '该 UUID 与另一台设备的历史 SN 二维码冲突');
-  }
 }
 
 export async function updateDeviceIdentifierClaims(db: Database, device: Row, updated: { uuid: string | null; sn: string | null }): Promise<void> {

@@ -24,8 +24,10 @@ export function registerRentals(router: ApiRouter, services: Services, options: 
   route('GET', '/v2/rental/admin/devices/:id/qrcode', async ctx => {
     const principal = await identity(ctx);
     const format = ctx.query?.format;
+    const identifier = ctx.query?.identifier;
     if (format !== undefined && format !== 'typed') throw new ApiError(422, '设备二维码格式无效');
-    return service.deviceQrcode(principal, ctx.params.id, format === 'typed');
+    if (identifier !== undefined && identifier !== 'uuid' && identifier !== 'sn') throw new ApiError(422, '设备标识类型无效');
+    return service.deviceQrcode(principal, ctx.params.id, identifier);
   });
   route('POST', '/v2/rental/devices', async ctx => service.createDevice(await identity(ctx), ctx.body));
   route('PATCH', '/v2/rental/devices/:id', async ctx => service.updateDevice(await identity(ctx), ctx.params.id, ctx.body));

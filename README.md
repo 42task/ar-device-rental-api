@@ -2,9 +2,9 @@
 
 独立的 Node.js 24 / TypeScript / Express 5 后端，为原生微信小程序 **AR设备租赁**（`wx03dbf50c15cac06f`）提供登录、设备、租赁、微信支付与退款接口。使用独立 MySQL 8 数据库（CI 使用 8.4，当前线上为 TDSQL-C MySQL 8.0.30），所有业务表以 `ar_` 开头，不连接旧 `wechat` 服务或旧数据库，也不需要 Redis。
 
-公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码继续使用 `https://d.4mr.cn/d?i=UUID&t=rs2`；扫码入口与 API 域名分别配置。同一工程的小程序源码位于 [apps/miniprogram](../miniprogram)。
+公开 API 目标为 `https://d.4mr.cn/api/v2`。设备二维码使用 `https://d.4mr.cn/d?i=UUID&t=rs2` 或 `https://d.4mr.cn/d?s=SN&t=rs2`。`i` 只接受标准带连字符 UUID，旧 `i=SN` 标签须重印。扫码入口与 API 域名分别配置。同一工程的小程序源码位于 [apps/miniprogram](../miniprogram)。
 
-所有当前商户通过同一个小程序及 `d.4mr.cn` 总入口接入，新建商户默认共享入口 1，不单独填写 AppID、域名或 AppSecret。商户 adminer 维护本商户的名称和 Logo 等品牌基础属性，并在每个文旅场地维护独立显示样式、主图及租金、押金。设备绑定场地并继承场地所属商户，订单绑定设备；服务端在下单时确定商户、费用和收款配置，支付、查单和退款沿用订单原始快照。共享小程序的消费者统一登录且没有商户管理归属，员工权限由独立成员关系决定。当前 schema 16，入口与支付凭据分开，旧设备金额已归档，商户品牌独立保存，用户头像存入独立表；迁移与接入说明见 [多商户运行说明](../../docs/multi-merchant.md)。
+所有当前商户通过同一个小程序及 `d.4mr.cn` 总入口接入，新建商户默认共享入口 1，不单独填写 AppID、域名或 AppSecret。商户 adminer 维护本商户的名称和 Logo 等品牌基础属性，并在每个文旅场地维护独立显示样式、主图及租金、押金。设备绑定场地并继承场地所属商户，订单绑定设备；服务端在下单时确定商户、费用和收款配置，支付、查单和退款沿用订单原始快照。共享小程序的消费者统一登录且没有商户管理归属，员工权限由独立成员关系决定。当前 schema 24 分别保存 UUID 和 SN 标识与租赁订单快照。入口与支付凭据分开，旧设备金额已归档，商户品牌独立保存，用户头像存入独立表；迁移与接入说明见 [多商户运行说明](../../docs/multi-merchant.md)。
 
 ## 部署
 
@@ -86,6 +86,8 @@ GHCR 首次发布默认是私有包；管理员仍需检查组织包权限。Por
 | `/api/v2/rental/admin/auth` | 网页扫码挑战、小程序确认及独立浏览器会话 |
 | `GET /api/v2/rental/admin/overview` | 管理总览 |
 | `GET /api/v2/rental/admin/orders` | 当前管理商户的订单搜索与分页 |
+| `GET /api/v2/rental/admin/rental-events` | 查询授权商户的租赁事件，可搜索 UUID 和 SN |
+| `GET /api/v2/rental/admin/renters` | 查询授权商户的历史租客，可按 `deviceUuid` 或 `deviceSn` 筛选 |
 | `GET /admin/` | 同源网页管理后台，见 [使用说明](../../docs/admin.md) |
 | `POST /api/v2/rental/payment-notify` | 微信支付通知 |
 | `POST /api/v2/rental/refund-notify` | 微信退款通知 |

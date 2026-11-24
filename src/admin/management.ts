@@ -50,9 +50,9 @@ export function registerManagement(router: ApiRouter, db: Database, auth: Rental
     const values: unknown[] = merchant ? [merchant.id, merchant.appId] : [identity.appid];
     if (status) { where.push('status=?'); values.push(status); }
     if (search) {
-      where.push('(device_uuid LIKE ? OR device_name LIKE ? OR CAST(id AS CHAR)=?)');
+      where.push('(device_uuid LIKE ? OR device_sn LIKE ? OR device_name LIKE ? OR CAST(id AS CHAR)=?)');
       const pattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
-      values.push(pattern, pattern, search);
+      values.push(pattern, pattern, pattern, search);
     }
     const filter = where.join(' AND ');
     const count = await db.one('SELECT COUNT(*) AS total FROM ar_rental_order WHERE ' + filter, values);

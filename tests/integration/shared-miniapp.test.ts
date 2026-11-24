@@ -126,14 +126,14 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     const staffSn = '0000123456789051';
     const device = await f.http('post', '/api/v2/rental/devices', staffToken, childId).send({ sn: staffSn, type: 'rokid', merchantId: 1, venueId: venue.id });
     expect(device.status).toBe(200);
-    expect(device.body.device).toMatchObject({ uuid: staffSn, registeredUuid: null, sn: staffSn, merchantId: childId });
+    expect(device.body.device).toMatchObject({ uuid: null, sn: staffSn, merchantId: childId });
     expect(await f.db.one('SELECT merchant_id FROM ar_device WHERE id=?', [device.body.device.id])).toEqual({ merchant_id: childId });
     expect((await f.http('post', '/api/v2/rental/devices', staffToken, 1).send({ uuid: '00000000-0000-4000-8000-000000000102' })).status).toBe(403);
     const rootDevice = await f.http('post', '/api/v2/rental/devices', f.rootToken, childId).send({ uuid: '00000000-0000-4000-8000-000000000103', merchantId: 2147483647, venueId: venue.id });
     expect(rootDevice.status).toBe(200); expect(rootDevice.body.device.merchantId).toBe(childId);
     const list = await f.http('get', '/api/v2/rental/admin/devices', staffToken, childId);
     expect(list.status).toBe(200); expect(list.body.items.map((row: Row) => row.device.id).sort()).toEqual([device.body.device.id, rootDevice.body.device.id].sort());
-    const context = await f.http('get', '/api/v2/rental/devices/context', customerToken).query({ uuid: staffSn });
+    const context = await f.http('get', '/api/v2/rental/devices/context', customerToken).query({ sn: staffSn });
     expect(context.status).toBe(200); expect(context.body.device.merchantId).toBe(childId);
     expect((await f.db.one('SELECT merchant_id FROM ar_user WHERE id=?', [customer.body.data.user.id]))!.merchant_id).toBeNull();
 
@@ -226,14 +226,13 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect(await f.db.one('SELECT uuid,sn,merchant_id FROM ar_device WHERE id=?', [device.id]))
       .toEqual({ uuid: null, sn: serial, merchant_id: separateId });
 
-    const expectedDevice = { id: device.id, uuid: serial, registeredUuid: null, sn: serial, merchantId: separateId };
+    const expectedDevice = { id: device.id, uuid: null, sn: serial, merchantId: separateId };
     const deviceContext = '/api/v2/rental/devices/context';
-    for (const query of [{ uuid: serial }, { sn: serial }]) {
-      const own = await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query(query);
-      expect(own.status).toBe(200);
-      expect(own.body).toMatchObject({ device: expectedDevice, state: 'DISABLED', actions: { canConfigure: true } });
-      expect((await f.http('get', deviceContext, token).query(query)).status).toBe(409);
-    }
+    const own = await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ sn: serial });
+    expect(own.status).toBe(200);
+    expect(own.body).toMatchObject({ device: expectedDevice, state: 'DISABLED', actions: { canConfigure: true } });
+    expect((await f.http('get', deviceContext, token).query({ sn: serial })).status).toBe(409);
+    expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ uuid: serial })).status).toBe(422);
     expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ uuid: serial, sn: serial })).status).toBe(422);
     const list = await f.http('get', '/api/v2/rental/admin/devices', separateToken, separateId, 'independent.example.test')
       .query({ venueId: venue.id, search: serial });
@@ -242,7 +241,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     const qr = await f.http('get', `/api/v2/rental/admin/devices/${device.id}/qrcode`, separateToken, separateId, 'independent.example.test');
     expect(qr.status).toBe(200);
     expect(qr.body.device).toMatchObject(expectedDevice);
-    expect(new URL(qr.body.url).searchParams.get('i')).toBe(serial);
+    expect(new URL(qr.body.url).searchParams.get('s')).toBe(serial);
+    expect(new URL(qr.body.url).searchParams.has('i')).toBe(false);
     const configured = await f.http('patch', `/api/v2/rental/devices/${device.id}/config`, separateToken, separateId, 'independent.example.test')
       .send({ enabled: true, version: 0 });
     expect(configured.status).toBe(200);
@@ -254,15 +254,17 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     const uuidOwner = await f.db.insert('ar_device', { uuid: crossColumn, venue_id: sharedVenue.id });
     const snOwner = await f.db.insert('ar_device', { sn: crossColumn, merchant_id: separateId, venue_id: venue.id });
     expect((await f.http('get', deviceContext, token).query({ uuid: crossColumn })).body)
-      .toMatchObject({ device: { id: uuidOwner.id, registeredUuid: crossColumn } });
+      .toMatchObject({ device: { id: uuidOwner.id, uuid: crossColumn } });
     expect((await f.http('get', deviceContext, token).query({ sn: crossColumn })).status).toBe(409);
-    const shadowedDevice = { id: snOwner.id, uuid: null, registeredUuid: null, sn: crossColumn };
+    const shadowedDevice = { id: snOwner.id, uuid: null, sn: crossColumn };
     expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ sn: crossColumn })).body)
       .toMatchObject({ device: shadowedDevice });
     expect((await f.http('get', '/api/v2/rental/admin/devices', separateToken, separateId, 'independent.example.test')
       .query({ venueId: venue.id, search: crossColumn })).body)
       .toMatchObject({ total: 1, items: [{ device: shadowedDevice }] });
-    expect((await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test')).status).toBe(409);
+    const separateQr = await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test');
+    expect(separateQr.status).toBe(200);
+    expect(new URL(separateQr.body.url).searchParams.get('s')).toBe(crossColumn);
 
     const removePath = `/api/v2/rental/devices/${uuidOwner.id}`;
     expect((await f.http('delete', removePath, token)).status).toBe(403);
@@ -275,15 +277,15 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect((await f.http('get', '/api/v2/rental/admin/devices', f.rootToken, 1).query({ search: crossColumn })).body.total).toBe(0);
     expect((await f.http('get', `/api/v2/rental/admin/devices/${uuidOwner.id}/qrcode`, f.rootToken, 1)).status).toBe(404);
 
-    // A removed UUID keeps its precedence so the old QR cannot open the other merchant's device.
+    // The UUID parameter never resolves a device registered only under SN.
     expect((await f.http('get', deviceContext, f.rootToken, 1).query({ uuid: crossColumn })).body)
       .toMatchObject({ device: null, state: 'UNREGISTERED', actions: { canCreate: true, canDelete: false } });
     expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ sn: crossColumn })).body)
       .toMatchObject({ device: shadowedDevice });
-    expect((await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test')).status).toBe(409);
+    expect((await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test')).status).toBe(200);
     const restored = await f.http('post', '/api/v2/rental/devices', f.rootToken, 1).send({ uuid: crossColumn, venueId: sharedVenue.id });
     expect(restored.status).toBe(200);
-    expect(restored.body).toMatchObject({ created: true, device: { registeredUuid: crossColumn } });
+    expect(restored.body).toMatchObject({ created: true, device: { uuid: crossColumn } });
     expect(restored.body.device.id).not.toBe(uuidOwner.id);
   }), 30_000);
 

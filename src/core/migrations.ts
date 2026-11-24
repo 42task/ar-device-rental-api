@@ -4,9 +4,9 @@ import { createHash } from 'node:crypto';
 import type { Database } from './database';
 import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
-import { archiveDevicePricing, backfillDeviceSerialNumbers, checkNormalizedDeviceUuids } from '../devices/migrations';
+import { archiveDevicePricing, backfillDeviceAndOrderIdentifiers, backfillDeviceSerialNumbers, checkNormalizedDeviceUuids } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 24;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
@@ -192,6 +192,10 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
           alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='deleted_ms'") },
         { version: 22, filename: '022-device-identity-claims.sql', beforeApply: checkNormalizedDeviceUuids,
           alreadyApplied: async (db: Database) => !!await db.one("SHOW INDEX FROM ar_device WHERE Key_name='uq_ar_device_current_uuid'") },
+        { version: 23, filename: '023-rental-order-identifiers.sql',
+          alreadyApplied: async (db: Database) => !!await db.one(
+            "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='ar_rental_order' AND CONSTRAINT_NAME='chk_ar_rental_order_identifier_present' AND CONSTRAINT_TYPE='CHECK' AND ENFORCED='YES'") },
+        { version: 24, filename: '024-device-identifier-backfill.sql', runInTransaction: backfillDeviceAndOrderIdentifiers },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');
