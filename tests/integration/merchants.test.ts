@@ -55,8 +55,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const { app } = createApplication({ db, client, auth });
       const bearer = 'Bearer ' + oldLogin.token.accessToken;
       expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=7')).toEqual({ uuid: null, sn: 'legacy-device' });
-      expect(await db.one('SELECT device_id,device_uuid FROM ar_rental_order WHERE id=42')).toEqual({ device_id: 7, device_uuid: 'legacy-device' });
-      expect((await request(app).get('/api/v2/rental/devices/context?uuid=legacy-device').set('Authorization', bearer)).body).toMatchObject({ device: { id: 7, uuid: 'legacy-device', registeredUuid: null, sn: 'legacy-device', type: 'ios' }, state: 'AVAILABLE', pricing: { version: 3, useFeeCents: 500, depositCents: 2000 } });
+      expect(await db.one('SELECT device_id,device_uuid,device_sn FROM ar_rental_order WHERE id=42')).toEqual({ device_id: 7, device_uuid: null, device_sn: 'legacy-device' });
+      expect((await request(app).get('/api/v2/rental/devices/context?sn=legacy-device').set('Authorization', bearer)).body).toMatchObject({ device: { id: 7, uuid: null, sn: 'legacy-device', type: 'ios' }, state: 'AVAILABLE', pricing: { version: 3, useFeeCents: 500, depositCents: 2000 } });
       expect((await request(app).get('/api/v2/rental/admin/orders').set('Authorization', bearer)).body).toMatchObject({ total: 1, items: [{ id: 42, totalCents: 3000 }] });
       const session = await request(app).get('/api/v2/rental/admin/auth/session').set('Cookie', 'ar_admin_session=' + sessionToken);
       expect(session.status).toBe(200); expect(session.body.user).toMatchObject({ id: 22, role: 'manager' });
@@ -177,7 +177,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const legacyToken = 'd'.repeat(64);
       expect((await request(app).post('/api/v2/rental/auth/merchant-binding/confirm').set('Host', 'd1.4mr.cn').set('Authorization', 'Bearer ' + refreshed.body.data.token.accessToken).send({ bindToken: legacyToken })).status).toBe(410);
       expect((await request(app).post('/api/v2/rental/auth/login').send({ code: 'transferred-b', bindToken: legacyToken })).status).toBe(422);
-      const historical = await db.insert('ar_rental_order', { device_id: secondDevice, device_uuid: secondSn, device_name: '合成历史设备',
+      const historical = await db.insert('ar_rental_order', { device_id: secondDevice, device_sn: secondSn, device_name: '合成历史设备',
         user_id: b.body.data.user.id, merchant_id: secondId, payment_config_id: replacementAccount.body.merchant.configId,
         appid: second.appId, payer_openid: b.body.data.openid, mch_id: '2000000002', use_fee_cents: 5, deposit_cents: 25,
         total_cents: 30, price_version: 1, status: 'COMPENSATING', payment_status: 'SUCCESS', out_trade_no: 'synthetic-compensation-order',

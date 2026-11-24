@@ -8,7 +8,7 @@ import { RentalService } from '../../src/rentals';
 import type { RentalPrincipal } from '../../src/rentals/types';
 
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupancy and financial concurrency', () => {
-  it('allows one SN-only device occupant and locks a single settlement choice for concurrent admins', async () => {
+  it('allows one device occupant and locks a single settlement choice for concurrent admins', async () => {
     if (!['127.0.0.1', 'localhost'].includes(process.env.MYSQL_HOST || '') || process.env.MYSQL_DATABASE !== 'ar_rental_test') throw new Error('Rental concurrency requires the dedicated localhost test database configuration');
     const database = 'ar_rentals_test_' + randomBytes(10).toString('hex');
     const settings = { host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT), user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, dateStrings: true as const };
@@ -17,7 +17,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
     try {
       await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4`); created = true;
       db = new Database(mysql.createPool({ ...settings, database, connectionLimit: 12 }));
-      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql', '018-device-sn.sql', '019-device-identifiers.sql', '021-device-deletion.sql', '022-device-identity-claims.sql']) {
+      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql', '018-device-sn.sql', '019-device-identifiers.sql', '021-device-deletion.sql', '022-device-identity-claims.sql', '023-rental-order-identifiers.sql']) {
         const schema = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(sql => sql.trim()).filter(Boolean);
         for (const statement of schema) await db.execute(statement);
       }
@@ -32,8 +32,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
         await db.insert('ar_user', { id: userId, role, appid: 'wx-rental-test', openid: 'payer-' + userId });
         if (role === 'user') await db.insert('ar_user_phone', { user_id: userId, appid: 'wx-rental-test', phone_e164: '+861380013800' + userId, country_code: '86', verified_ms: Date.now(), code_hash: String(userId).repeat(64) });
       }
-      const deviceSn = 'rental-concurrent-device';
-      const device = await db.insert('ar_device', { sn: deviceSn, name: '并发设备', merchant_id: 1, venue_id: 1 });
+      const device = await db.insert('ar_device', { uuid: '00000000-0000-4000-8000-000000000701', sn: '0000000000000701', name: '并发设备', merchant_id: 1, venue_id: 1 });
       const refunds = new Map<string, Row>();
       let paidOrder: Row | null = null;
       const payment = {
@@ -61,9 +60,11 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       const services = { db } as Services;
       const service = new RentalService(services, options);
       await service.configure(systemAdmin, device.id, { enabled: true, version: 0 });
-      const contenders = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => service.create(principal(index % 2 + 1, 'user'), {
-        deviceId: device.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'parallel-rental-' + index,
-      })));
+      const contenders = await Promise.allSettled(Array.from({ length: 8 }, async (_, index) => {
+        const renter = principal(index % 2 + 1, 'user');
+        const lookup = index % 2 === 0 ? await service.context(renter, device.uuid) : await service.context(renter, device.sn, 'sn');
+        return service.create(renter, { deviceId: lookup.device.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'parallel-rental-' + index });
+      }));
       const successes = contenders.filter(result => result.status === 'fulfilled').map(result => (result as PromiseFulfilledResult<Row>).value.rental);
       const failures = contenders.filter(result => result.status === 'rejected') as PromiseRejectedResult[];
       expect(successes.length).toBeGreaterThan(0);
@@ -73,7 +74,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       expect((await db.one('SELECT COUNT(*) AS total FROM ar_rental_order'))!.total).toBe(1);
       expect((await db.one('SELECT COUNT(*) AS total FROM ar_rental_slot'))!.total).toBe(1);
       const stored = (await db.one('SELECT * FROM ar_rental_order'))!;
-      expect(stored.device_uuid).toBe(deviceSn);
+      expect(stored).toMatchObject({ device_id: device.id, device_uuid: device.uuid, device_sn: device.sn });
       const owner = principal(Number(stored.user_id), 'user');
       await service.payment(owner, stored.id);
       await service.syncPayment(owner, stored.id);
@@ -85,11 +86,11 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       await expect(service.retryRefund(owner, stored.id)).rejects.toMatchObject({ status: 403 });
       expect(refunds.size).toBe(0);
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [systemAdmin.user.id]);
-      expect((await service.context(systemAdmin, deviceSn)).actions.canEndRental).toBe(false);
+      expect((await service.context(systemAdmin, device.uuid)).actions.canEndRental).toBe(false);
       await expect(service.end(systemAdmin, stored.id, { refundMode: 'full', reason: '系统管理权限已撤销', idempotencyKey: 'revoked-system-admin-end' })).rejects.toMatchObject({ status: 403 });
       await db.execute("UPDATE ar_user SET role='adminer' WHERE id=?", [systemAdmin.user.id]);
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [manager.user.id]);
-      expect((await service.context(manager, deviceSn)).actions.canEndRental).toBe(false);
+      expect((await service.context(manager, device.uuid)).actions.canEndRental).toBe(false);
       await expect(service.end(manager, stored.id, { refundMode: 'deposit', reason: '权限已撤销', idempotencyKey: 'revoked-manager-end' })).rejects.toMatchObject({ status: 403 });
       await db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [manager.user.id]);
       const endings = await Promise.allSettled([
@@ -103,7 +104,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       const ended = (await db.one('SELECT * FROM ar_rental_order'))!;
       expect(ended).toMatchObject({ status: 'ENDED', refund_status: 'PROCESSING' });
       expect(Number(ended.refund_amount_cents)).toBe(ended.refund_mode === 'deposit' ? 20000 : 22000);
-      expect((await service.context(owner, deviceSn)).state).toBe('SETTLING');
+      expect((await service.context(owner, device.uuid)).state).toBe('SETTLING');
       await expect(service.deleteDevice(root, device.id)).rejects.toMatchObject({ status: 409 });
       const unsettledSlot = (await db.one('SELECT * FROM ar_rental_slot WHERE device_id=?', [device.id]))!;
       await db.execute('DELETE FROM ar_rental_slot WHERE device_id=?', [device.id]);
@@ -121,11 +122,13 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       await expect(service.retryRefund(systemAdmin, stored.id)).rejects.toMatchObject({ status: 403 });
       [...refunds.values()][0].status = 'SUCCESS';
       await service.syncRefund(root, stored.id);
-      expect((await service.context(owner, deviceSn)).state).toBe('AVAILABLE');
+      expect((await service.context(owner, device.uuid)).state).toBe('AVAILABLE');
       expect((await db.one('SELECT COUNT(*) AS total FROM ar_rental_slot'))!.total).toBe(0);
       await expect(db.execute('DELETE FROM ar_user WHERE id=?', [owner.user.id])).rejects.toMatchObject({ code: 'ER_ROW_IS_REFERENCED_2' });
       // A device cannot be deleted while a new rental occupies it.
+      await db.execute("UPDATE ar_user SET role='manager' WHERE id=?", [manager.user.id]);
       await service.create(owner, { deviceId: device.id, venuePriceVersion: 1, priceVersion: 1, idempotencyKey: 'post-settlement-rental' });
+      await expect(service.deleteDevice(manager, device.id)).rejects.toMatchObject({ status: 409 });
       await expect(db.execute('DELETE FROM ar_device WHERE id=?', [device.id])).rejects.toMatchObject({ code: 'ER_ROW_IS_REFERENCED_2' });
       // Two workers compete for the same persistent job and cancel only once.
       await db.execute("UPDATE ar_rental_order SET expires_ms=0 WHERE status='PENDING_PAYMENT'");
@@ -152,7 +155,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       expect(settled).toBe(false);
       release(); await update;
       await expect(pending).rejects.toMatchObject({ status: 409 });
-      expect((await service.context(owner, deviceSn)).pricing).toMatchObject({ totalCents: 24000, venuePriceVersion: 2 });
+      expect((await service.context(owner, device.uuid)).pricing).toMatchObject({ totalCents: 24000, venuePriceVersion: 2 });
       const raced = await Promise.allSettled([
         service.create(owner, { deviceId: device.id, priceVersion: 1, venuePriceVersion: 2, idempotencyKey: 'reservation-versus-venue-change' }),
         service.configure(root, device.id, { enabled: true, version: 1, venueId: 3 }),
@@ -165,12 +168,12 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       if (slotAfterRace) await service.cancel(owner, slotAfterRace.rental_id);
       expect(await service.deleteDevice(root, device.id)).toEqual({ deleted: true });
       expect((await service.get(owner, stored.id)).rental)
-        .toMatchObject({ deviceId: device.id, uuid: deviceSn, status: 'ENDED', refundStatus: 'SUCCESS' });
+        .toMatchObject({ deviceId: device.id, uuid: device.uuid, sn: device.sn, status: 'ENDED', refundStatus: 'SUCCESS' });
 
       const spare = await db.insert('ar_device', { sn: 'spare-delete-reserve-race', merchant_id: 1, venue_id: 1 });
-      await service.configure(root, spare.id, { enabled: true, version: 0 });
+      await service.configure(manager, spare.id, { enabled: true, version: 0 });
       const [deletion, reservation] = await Promise.allSettled([
-        service.deleteDevice(root, spare.id),
+        service.deleteDevice(manager, spare.id),
         service.create(owner, { deviceId: spare.id, priceVersion: 1, venuePriceVersion: 2, idempotencyKey: 'reservation-versus-delete' }),
       ]);
       if (deletion.status === 'fulfilled') {
@@ -180,7 +183,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
         expect(deletion.reason).toMatchObject({ status: 409 });
         expect(reservation.status).toBe('fulfilled');
         if (reservation.status === 'fulfilled') await service.cancel(owner, reservation.value.rental.id);
-        expect(await service.deleteDevice(root, spare.id)).toEqual({ deleted: true });
+        expect(await service.deleteDevice(manager, spare.id)).toEqual({ deleted: true });
       }
       expect(await db.one('SELECT id,sn,deleted_ms FROM ar_device WHERE id=?', [spare.id]))
         .toMatchObject({ id: spare.id, sn: spare.sn, deleted_ms: expect.anything() });

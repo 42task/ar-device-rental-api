@@ -129,7 +129,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL venue migration
     expect(await f.db.query('SELECT * FROM ar_rental_config ORDER BY device_id')).toEqual(configsBefore.map(({ use_fee_cents, deposit_cents, ...row }) => ({ ...row, merchant_id: 1 })));
     expect(await f.db.query('SELECT device_id,use_fee_cents,deposit_cents,revision FROM ar_legacy_device_pricing_archive ORDER BY device_id')).toEqual(configsBefore.map(row => ({ device_id: row.device_id, use_fee_cents: row.use_fee_cents, deposit_cents: row.deposit_cents, revision: row.version })));
     const orderAfter = (await f.db.one('SELECT * FROM ar_rental_order'))!;
-    expect(orderAfter).toEqual({ ...orderBefore, merchant_id: 1, payment_config_id: 1, venue_id: null, venue_name: null, venue_price_version: null });
+    expect(orderAfter).toEqual({ ...orderBefore, device_uuid: null, device_sn: orderBefore!.device_uuid,
+      merchant_id: 1, payment_config_id: 1, venue_id: null, venue_name: null, venue_price_version: null });
     const ready = await setup(db);
     const edited = await ready.http('patch', `/api/v2/rental/admin/venues/${devices[0].venue_id}`, ready.rootToken, 1).send({ version: 1, useFeeCents: 888 });
     expect(edited.status).toBe(200); expect(edited.body.venue.version).toBe(2);
