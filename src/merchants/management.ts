@@ -107,7 +107,7 @@ export function registerMerchants(router: ApiRouter, registry: MerchantRegistry,
     const reason = field(ctx.body.reason, '调拨原因', 255);
     const device = await registry.db.transaction(async db => {
       // Match rental settlement's device -> account lock order.
-      const row = await db.one('SELECT * FROM ar_device WHERE id=? FOR UPDATE', [id]);
+      const row = await db.one('SELECT * FROM ar_device WHERE id=? AND deleted_ms IS NULL FOR UPDATE', [id]);
       if (!row) throw new ApiError(404, '设备不存在');
       const user = await db.one('SELECT * FROM ar_user WHERE id=? FOR UPDATE', [actor.user.id]);
       if (!user) throw new ApiError(403, '平台权限已变更');

@@ -4,8 +4,15 @@ import { ApiError } from '../core/errors';
 import { quoteForDevice } from './quotes';
 
 export interface DevicePageQuery { merchantId?: number; venueId?: number; allMerchants?: boolean; search: string; page: number; pageSize: number }
-export interface DeviceSummaryRows { device: Row; venue: Row; pricing: Row; state: string }
-/** An old UUID-only lookup must never resolve an SN alias to a different device. */
+export interface DeviceSummaryRows { device: Row; venue: Row; pricing: Row; state: string; canDelete: boolean }
+const unsettledRentalStatus = `(status IN ('PENDING_PAYMENT','ACTIVE')
+  OR ((status='COMPENSATING' OR refund_amount_cents>0) AND (refund_status IS NULL OR refund_status<>'SUCCESS')))`;
+
+export async function hasUnsettledDeviceOrders(db: Database, deviceId: number): Promise<boolean> {
+  return !!await db.one(`SELECT id FROM ar_rental_order WHERE device_id=? AND ${unsettledRentalStatus} LIMIT 1`, [deviceId]);
+}
+
+/** A UUID claim, including a removed device's claim, takes precedence over an SN alias. */
 export const legacyUuidConflictColumn = `EXISTS (
   SELECT 1 FROM ar_device uuid_owner WHERE d.uuid IS NULL AND uuid_owner.uuid=d.sn
 ) AS legacy_uuid_conflict`;
@@ -20,9 +27,9 @@ export async function readDevicePage(db: Database, query: DevicePageQuery): Prom
   const scoped = merchantId !== undefined;
   if (allMerchants && (scoped || venueId !== undefined)) throw new ApiError(503, '设备查询范围冲突');
   const ownership = scoped || allMerchants;
-  const predicates = [...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : []), ...(search ? ["(d.uuid LIKE ? ESCAPE '=' OR d.sn LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=' OR d.remark_name LIKE ? ESCAPE '=')"] : [])];
+  const predicates = ['d.deleted_ms IS NULL', ...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : []), ...(search ? ["(d.uuid LIKE ? ESCAPE '=' OR d.sn LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=' OR d.remark_name LIKE ? ESCAPE '=')"] : [])];
   const pattern = '%' + search.replace(/[=%_]/g, '=$&') + '%';
-  const where = predicates.length ? ' WHERE ' + predicates.join(' AND ') : '';
+  const where = ' WHERE ' + predicates.join(' AND ');
   const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern, pattern, pattern] : [])];
   const [count, rows] = await Promise.all([
     db.one('SELECT COUNT(*) AS total FROM ar_device d' + where, values),
@@ -33,7 +40,8 @@ export async function readDevicePage(db: Database, query: DevicePageQuery): Prom
       ${ownership ? 'c.merchant_id' : 'NULL'} AS config_merchant_id,
       s.device_id AS slot_device_id,s.rental_id AS slot_rental_id,s.state AS slot_state,
       ${ownership ? 's.merchant_id' : 'NULL'} AS slot_merchant_id,o.id AS rental_exists,
-      ${ownership ? 'o.merchant_id' : 'NULL'} AS rental_merchant_id${allMerchants ? ',o.device_id AS rental_device_id' : ''}
+      ${ownership ? 'o.merchant_id' : 'NULL'} AS rental_merchant_id${allMerchants ? ',o.device_id AS rental_device_id' : ''},
+      (s.device_id IS NULL AND NOT EXISTS (SELECT 1 FROM ar_rental_order WHERE device_id=d.id AND ${unsettledRentalStatus})) AS can_delete
       FROM ar_device d
       ${allMerchants ? 'LEFT JOIN ar_merchant m ON m.id=d.merchant_id' : ''}
       LEFT JOIN ar_venue v ON v.id=d.venue_id AND v.merchant_id=d.merchant_id
@@ -53,7 +61,7 @@ export async function readDevicePage(db: Database, query: DevicePageQuery): Prom
     const venue = { id: row.venue_record_id, merchant_id: row.venue_merchant_id, name: row.venue_name, address: row.venue_address,
       description: row.venue_description, status: row.venue_status, use_fee_cents: row.venue_use_fee_cents, deposit_cents: row.venue_deposit_cents, version: row.venue_version };
     const pricing = quoteForDevice(row.config_device_id == null ? null : { enabled: row.config_enabled, version: row.config_version }, venue);
-    return { device: row, venue, pricing, state: row.slot_device_id == null ? pricing.enabled ? 'AVAILABLE' : 'DISABLED' : String(row.slot_state) };
+    return { device: row, venue, pricing, state: row.slot_device_id == null ? pricing.enabled ? 'AVAILABLE' : 'DISABLED' : String(row.slot_state), canDelete: Number(row.can_delete) === 1 };
   });
   return { items, total: Number(count?.total || 0) };
 }

@@ -196,14 +196,15 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL venue migration
     expect(other.status).toBe(200); const otherId = other.body.merchant.id;
     const foreign = await f.http('post', '/api/v2/rental/admin/venues', f.rootToken, otherId).send({ ...f.venueInput, name: 'Foreign venue' });
     expect(foreign.status).toBe(200);
-    const device = await f.http('post', '/api/v2/rental/devices', f.rootToken).send({ uuid: 'venue-bound-device', venueId, merchantId: otherId });
+    const uuid = '00000000-0000-4000-8000-000000000101';
+    const device = await f.http('post', '/api/v2/rental/devices', f.rootToken).send({ uuid, venueId, merchantId: otherId });
     expect(device.status).toBe(200);
     expect(await f.db.one('SELECT merchant_id,venue_id FROM ar_device WHERE id=?', [device.body.device.id])).toEqual({ merchant_id: 1, venue_id: venueId });
     await expect(f.db.execute('INSERT INTO ar_device(uuid,name,device_type,merchant_id,venue_id) VALUES(?,?,?,?,?)', ['foreign-venue-device', 'Synthetic wrong venue', 'ios', 1, foreign.body.venue.id])).rejects.toMatchObject({ code: 'ER_NO_REFERENCED_ROW_2' });
     await expect(f.db.execute('INSERT INTO ar_device(uuid,name,device_type,merchant_id,venue_id) VALUES(?,?,?,?,?)', ['null-venue-device', 'Synthetic missing venue', 'ios', 1, null])).rejects.toMatchObject({ code: 'ER_BAD_NULL_ERROR' });
     await expect(f.db.execute('DELETE FROM ar_venue WHERE id=?', [venueId])).rejects.toMatchObject({ code: 'ER_ROW_IS_REFERENCED_2' });
     const customer = await f.login('customer');
-    const context = await f.http('get', '/api/v2/rental/devices/context', 'Bearer ' + customer.token.accessToken).query({ uuid: 'venue-bound-device' });
+    const context = await f.http('get', '/api/v2/rental/devices/context', 'Bearer ' + customer.token.accessToken).query({ uuid });
     expect(context.status).toBe(200);
     expect(context.body.venue).toEqual({ id: venueId, name: f.venueInput.name, address: f.venueInput.address, description: f.venueInput.description });
     expect(JSON.stringify(context.body.venue)).not.toContain('contactPhone');

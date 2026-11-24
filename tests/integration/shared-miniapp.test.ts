@@ -49,7 +49,7 @@ async function setup(db: Database) {
   };
   const auth = new RentalAuth(db, client, { jwtSecret: 'synthetic-shared-miniapp-http-signing-key-32-bytes' });
   const { app } = createApplication({ db, client, auth, merchants: registry });
-  const http = (method: 'get' | 'post' | 'patch' | 'put', path: string, bearer?: string, merchantId?: number, hostname = host) => {
+  const http = (method: 'get' | 'post' | 'patch' | 'put' | 'delete', path: string, bearer?: string, merchantId?: number, hostname = host) => {
     const req = request(app)[method](path).set('Host', hostname);
     if (bearer) req.set('Authorization', bearer);
     if (merchantId !== undefined) req.set('X-Merchant-Id', String(merchantId));
@@ -122,17 +122,18 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect((await f.http('get', '/api/v2/rental/admin/overview', staffToken, 1)).status).toBe(403);
     expect((await f.http('get', '/api/v2/rental/admin/overview', staffToken, childId)).status).toBe(200);
     expect((await f.http('get', '/api/v2/rental/merchant', customerToken, childId)).status).toBe(403);
-    expect((await f.http('post', '/api/v2/rental/devices', customerToken).send({ uuid: 'ordinary-forbidden', merchantId: childId })).status).toBe(403);
-    const device = await f.http('post', '/api/v2/rental/devices', staffToken, childId).send({ uuid: 'shared-staff-device', type: 'rokid', merchantId: 1, venueId: venue.id });
+    expect((await f.http('post', '/api/v2/rental/devices', customerToken).send({ uuid: '00000000-0000-4000-8000-000000000101', merchantId: childId })).status).toBe(403);
+    const staffSn = '0000123456789051';
+    const device = await f.http('post', '/api/v2/rental/devices', staffToken, childId).send({ sn: staffSn, type: 'rokid', merchantId: 1, venueId: venue.id });
     expect(device.status).toBe(200);
-    expect(device.body.device).toMatchObject({ uuid: 'shared-staff-device', merchantId: childId });
+    expect(device.body.device).toMatchObject({ uuid: staffSn, registeredUuid: null, sn: staffSn, merchantId: childId });
     expect(await f.db.one('SELECT merchant_id FROM ar_device WHERE id=?', [device.body.device.id])).toEqual({ merchant_id: childId });
-    expect((await f.http('post', '/api/v2/rental/devices', staffToken, 1).send({ uuid: 'spoofed-staff-scope' })).status).toBe(403);
-    const rootDevice = await f.http('post', '/api/v2/rental/devices', f.rootToken, childId).send({ uuid: 'shared-root-device', merchantId: 2147483647, venueId: venue.id });
+    expect((await f.http('post', '/api/v2/rental/devices', staffToken, 1).send({ uuid: '00000000-0000-4000-8000-000000000102' })).status).toBe(403);
+    const rootDevice = await f.http('post', '/api/v2/rental/devices', f.rootToken, childId).send({ uuid: '00000000-0000-4000-8000-000000000103', merchantId: 2147483647, venueId: venue.id });
     expect(rootDevice.status).toBe(200); expect(rootDevice.body.device.merchantId).toBe(childId);
     const list = await f.http('get', '/api/v2/rental/admin/devices', staffToken, childId);
     expect(list.status).toBe(200); expect(list.body.items.map((row: Row) => row.device.id).sort()).toEqual([device.body.device.id, rootDevice.body.device.id].sort());
-    const context = await f.http('get', '/api/v2/rental/devices/context', customerToken).query({ uuid: 'shared-staff-device' });
+    const context = await f.http('get', '/api/v2/rental/devices/context', customerToken).query({ uuid: staffSn });
     expect(context.status).toBe(200); expect(context.body.device.merchantId).toBe(childId);
     expect((await f.db.one('SELECT merchant_id FROM ar_user WHERE id=?', [customer.body.data.user.id]))!.merchant_id).toBeNull();
 
@@ -159,8 +160,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     const second = await seedVenue(f.db, merchantId, 300, 400);
     const foreign = await seedVenue(f.db, 1);
     const devices = [];
-    for (const [uuid, venueId, owner] of [['manager-venue-a1', first.id, merchantId], ['manager-venue-a2', first.id, merchantId], ['manager-venue-b1', second.id, merchantId], ['manager-venue-other', foreign.id, 1]] as const) {
-      const created = await f.http('post', '/api/v2/rental/devices', f.rootToken, owner).send({ uuid, venueId });
+    for (const [name, venueId, owner] of [['manager-venue-a1', first.id, merchantId], ['manager-venue-a2', first.id, merchantId], ['manager-venue-b1', second.id, merchantId], ['manager-venue-other', foreign.id, 1]] as const) {
+      const created = await f.http('post', '/api/v2/rental/devices', f.rootToken, owner).send({ uuid: '00000000-0000-4000-8000-' + String(devices.length + 101).padStart(12, '0'), venueId, name });
       expect(created.status).toBe(200); devices.push(created.body.device);
     }
     const ordinary = await f.login('manager-selects-venue'); expect(ordinary.status).toBe(200);
@@ -219,7 +220,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
 
     const serial = '000AbC-independent';
     const device = await f.db.insert('ar_device', { uuid: serial, name: 'Synthetic independent device', merchant_id: separateId, venue_id: venue.id });
-    await f.db.execute('DELETE FROM ar_schema_migration WHERE version=20');
+    await f.db.execute('DELETE FROM ar_schema_migration WHERE version>=20');
     await f.db.execute("UPDATE ar_schema_meta SET version=19 WHERE name='ar-device-rental-api'");
     await migrate(f.db);
     expect(await f.db.one('SELECT uuid,sn,merchant_id FROM ar_device WHERE id=?', [device.id]))
@@ -261,6 +262,25 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect((await f.http('get', '/api/v2/rental/admin/devices', separateToken, separateId, 'independent.example.test')
       .query({ venueId: venue.id, search: crossColumn })).body)
       .toMatchObject({ total: 1, items: [{ device: shadowedDevice }] });
+    expect((await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test')).status).toBe(409);
+
+    const removePath = `/api/v2/rental/devices/${uuidOwner.id}`;
+    expect((await f.http('delete', removePath, token)).status).toBe(403);
+    expect((await f.http('delete', removePath, separateToken, separateId, 'independent.example.test')).status).toBe(404);
+    expect((await f.http('delete', removePath, f.rootToken, 1)).body).toEqual({ deleted: true });
+    expect((await f.http('delete', removePath, f.rootToken, 1)).body).toEqual({ deleted: true });
+    expect(await f.db.one('SELECT id,uuid,sn,deleted_ms FROM ar_device WHERE id=?', [uuidOwner.id]))
+      .toMatchObject({ id: uuidOwner.id, uuid: crossColumn, sn: null, deleted_ms: expect.anything() });
+    expect((await f.http('get', '/api/v2/rental/admin/overview', f.rootToken, 1)).body.devices.total).toBe(0);
+    expect((await f.http('get', '/api/v2/rental/admin/devices', f.rootToken, 1).query({ search: crossColumn })).body.total).toBe(0);
+    expect((await f.http('get', `/api/v2/rental/admin/devices/${uuidOwner.id}/qrcode`, f.rootToken, 1)).status).toBe(404);
+    expect((await f.http('post', '/api/v2/rental/devices', f.rootToken, 1).send({ uuid: crossColumn, venueId: sharedVenue.id })).status).toBe(409);
+
+    // A removed UUID keeps its precedence so the old QR cannot open the other merchant's device.
+    expect((await f.http('get', deviceContext, f.rootToken, 1).query({ uuid: crossColumn })).body)
+      .toMatchObject({ device: null, state: 'UNREGISTERED', actions: { canCreate: false, canDelete: false } });
+    expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ sn: crossColumn })).body)
+      .toMatchObject({ device: shadowedDevice });
     expect((await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test')).status).toBe(409);
   }), 30_000);
 
@@ -304,7 +324,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
   it('keeps shared identity registration available when the entry owner is paused and another merchant is active', async () => withFixture(async f => {
     const child = await f.shared(); expect(child.status).toBe(200);
     const venue = await seedVenue(f.db, 1, 100, 0);
-    const device = await f.http('post', '/api/v2/rental/devices', f.rootToken).send({ uuid: 'paused-entry-device', venueId: venue.id });
+    const uuid = '00000000-0000-4000-8000-000000000101';
+    const device = await f.http('post', '/api/v2/rental/devices', f.rootToken).send({ uuid, venueId: venue.id });
     expect(device.status).toBe(200);
     // Only readiness is synthetic; paused rentals must stop before any provider call.
     f.client.isPaymentReady = () => true;
@@ -313,7 +334,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     await f.db.execute("UPDATE ar_merchant SET status='paused' WHERE id=1");
     const newCustomer = await f.login('new-with-paused-entry'); expect(newCustomer.status).toBe(200);
     const bearer = 'Bearer ' + newCustomer.body.data.token.accessToken;
-    const context = await f.http('get', '/api/v2/rental/devices/context', bearer).query({ uuid: 'paused-entry-device' });
+    const context = await f.http('get', '/api/v2/rental/devices/context', bearer).query({ uuid });
     expect(context.status).toBe(200); expect(context.body).toMatchObject({ paymentReady: false, actions: { canRent: false } });
     expect((await f.http('post', '/api/v2/rentals', bearer).send({ deviceId: device.body.device.id, priceVersion: 1, venuePriceVersion: venue.version, idempotencyKey: 'paused-owner-rental-test' })).status).toBe(503);
     expect(Number((await f.db.one('SELECT COUNT(*) AS total FROM ar_rental_order'))!.total)).toBe(0);
