@@ -8,6 +8,8 @@ import { WeChatClient } from './payments/wechat';
 import { registerRentals } from './rentals';
 import { AdminAuth } from './admin/auth';
 import { registerManagement } from './admin/management';
+import { registerRentalEvents } from './admin/rental-events';
+import { registerRenters } from './admin/renters';
 import { SCHEMA_VERSION } from './core/migrations';
 import { PhoneBinding } from './auth/phone';
 import { registerProfile } from './auth/profile';
@@ -114,6 +116,8 @@ export function createApplication(options: ApplicationOptions = {}) {
   const rentals = registerRentals(router, { db }, { appId: client.config.appId || '', payment: client, authenticate: auth.authenticate,
     ...(merchants ? { resolveMerchant: (id: number) => merchants.runtime(id), resolvePaymentForOrder: (row: import('./core/contracts').Row) => merchants.paymentForOrder(row), resolvePaymentConfig: (id: number) => merchants.clientForConfig(id) } : {}) });
   registerManagement(router, db, auth, rentals);
+  registerRentalEvents(router, db, auth);
+  registerRenters(router, db, auth);
   router.mount(app);
   app.get(/^\/admin$/, (_req, res) => res.redirect(302, '/admin/'));
   app.use('/admin/', (_req, res, next) => {

@@ -5,23 +5,20 @@ import { requireManager } from '../core/roles';
 import { DEFAULT_DEVICE_TYPE, resolveDeviceType } from './types';
 import { currentMerchant } from '../merchants/context';
 import { loadAccountPermissions, requireMerchantManagementScope } from '../auth/identity';
-import { assertDeviceIdentifierAvailable, deviceIdentifierKey, isDeviceUuid, retiredDeviceIdentifier } from './identifiers';
+import { assertDeviceIdentifierAvailable, deviceIdentifierKey, isDeviceUuid } from './identifiers';
 
 export { DEFAULT_DEVICE_TYPE } from './types';
 
 function deviceIdentifier(value: unknown, message: string): string {
-  if (typeof value !== 'string' || !/^\S{1,255}$/u.test(value) || /[\x00-\x1f\x7f]/.test(value)) throw new ApiError(422, message);
+  if (typeof value !== 'string' || !/^\S{1,255}$/u.test(value) || /[\x00-\x1f\x7f]/.test(value)) {
+    throw new ApiError(422, message);
+  }
   return value;
 }
 
 export function deviceUuid(value: unknown): string {
-  return deviceIdentifier(value, '设备 UUID 无效');
-}
-
-export function registeredDeviceUuid(value: unknown): string {
-  const uuid = deviceUuid(value);
-  if (!isDeviceUuid(uuid)) throw new ApiError(422, '设备 UUID 格式无效');
-  return uuid;
+  if (typeof value !== 'string' || !isDeviceUuid(value)) throw new ApiError(422, '设备 UUID 格式无效');
+  return value;
 }
 
 export function deviceSn(value: unknown): string {
@@ -29,8 +26,12 @@ export function deviceSn(value: unknown): string {
 }
 
 export function registeredDeviceSn(value: unknown): string {
-  if (typeof value !== 'string' || !/^[0-9]{16}$/.test(value)) throw new ApiError(422, '设备 SN 必须是 16 位数字');
+  if (!isNewDeviceSn(value)) throw new ApiError(422, '设备 SN 必须是 16 位数字');
   return value;
+}
+
+export function isNewDeviceSn(value: unknown): value is string {
+  return typeof value === 'string' && value.length === 16 && /^[0-9]{16}$/.test(value);
 }
 
 export function deviceType(value: unknown): string {
@@ -42,8 +43,8 @@ export function deviceType(value: unknown): string {
   return resolveDeviceType(value);
 }
 
-export function deviceName(value: unknown, uuid: string): string {
-  if (value === undefined) return uuid;
+export function deviceName(value: unknown, fallback: string): string {
+  if (value === undefined) return fallback;
   if (typeof value !== 'string' || !value.trim() || [...value.trim()].length > 255 || /[\x00-\x1f\x7f]/.test(value)) {
     throw new ApiError(422, '设备名称须为 1 至 255 个字符，且不含控制字符');
   }
@@ -64,10 +65,9 @@ export class DeviceService {
   static display(row: Row, management = false): Row {
     const merchantId = Number(row.merchant_id);
     const venueId = Number(row.venue_id);
-    const registeredUuid = row.uuid == null ? null : String(row.uuid);
+    const uuid = row.uuid == null ? null : String(row.uuid);
     const sn = row.sn == null ? null : String(row.sn);
-    const identifier = registeredUuid ?? (Number(row.legacy_uuid_conflict) === 1 ? null : sn);
-    return { id: Number(row.id), uuid: identifier, registeredUuid, sn, name: String(row.name || registeredUuid || sn || ''), type: resolveDeviceType(String(row.device_type || DEFAULT_DEVICE_TYPE)),
+    return { id: Number(row.id), uuid, sn, name: String(row.name || uuid || sn || ''), type: resolveDeviceType(String(row.device_type || DEFAULT_DEVICE_TYPE)),
       ...(management ? { remarkName: String(row.remark_name ?? '') } : {}),
       ...(Number.isSafeInteger(merchantId) && merchantId > 0 ? { merchantId } : {}), ...(row.merchant_name ? { merchantName: String(row.merchant_name) } : {}),
       ...(Number.isSafeInteger(venueId) && venueId > 0 ? { venueId } : {}), ...(row.venue_name ? { venueName: String(row.venue_name) } : {}) };
@@ -82,20 +82,15 @@ export class DeviceService {
     const checkOwnership = (row: Row): void => {
       if (merchant && Number(row.merchant_id) !== merchant.id) throw new ApiError(409, '设备属于其他商户，请使用对应小程序', 'MERCHANT_MISMATCH');
     };
-    const suppliedUuid = input.uuid == null ? null : deviceUuid(input.uuid);
-    const suppliedSn = input.sn == null ? null : registeredDeviceSn(input.sn);
-    const identifier = suppliedUuid ?? suppliedSn;
+    const uuid = input.uuid == null ? null : deviceUuid(input.uuid);
+    const sn = input.sn == null ? null : deviceSn(input.sn);
+    const identifier = uuid ?? sn;
     if (identifier === null) throw new ApiError(422, '请提供设备 UUID 或 SN');
-    const uuid = suppliedUuid !== null && isDeviceUuid(suppliedUuid) ? suppliedUuid : null;
-    const legacy = suppliedUuid !== null && uuid === null;
-    if (legacy && suppliedSn !== null) throw new ApiError(422, '设备 UUID 格式无效');
-    const sn = suppliedSn ?? (legacy ? suppliedUuid : null);
     const findRegistration = async (db: Database): Promise<Row | null> => {
-      const byUuid = suppliedUuid === null ? null : await db.one('SELECT * FROM ar_device WHERE current_uuid=? FOR UPDATE', [deviceIdentifierKey(suppliedUuid, 'uuid')]);
-      if (legacy && byUuid) return byUuid;
+      const byUuid = uuid === null ? null : await db.one('SELECT * FROM ar_device WHERE current_uuid=? FOR UPDATE', [deviceIdentifierKey(uuid, 'uuid')]);
       const bySn = sn === null ? null : await db.one('SELECT * FROM ar_device WHERE current_sn=? FOR UPDATE', [sn]);
       const existing = byUuid ?? bySn;
-      if (uuid !== null && sn !== null && existing && (deviceIdentifierKey(existing.uuid ?? '', 'uuid') !== deviceIdentifierKey(uuid, 'uuid') || existing.sn !== sn)) {
+      if (uuid !== null && sn !== null && existing && (!byUuid || !bySn || Number(byUuid.id) !== Number(bySn.id))) {
         throw new ApiError(409, 'UUID 或 SN 已被登记');
       }
       return existing;
@@ -126,11 +121,13 @@ export class DeviceService {
             if (Number(existing.venue_id) !== venueId) throw new ApiError(409, '设备已绑定其他场地，请通过设备设置调整');
             return { row: { ...existing, venue_name: venue.name }, created: false };
           }
-          if (legacy) registeredDeviceSn(suppliedUuid);
           if (existing) await db.execute('UPDATE ar_device SET superseded=1 WHERE id=?', [existing.id]);
           else {
             if (uuid !== null) await assertDeviceIdentifierAvailable(db, 'uuid', uuid);
-            if (sn !== null) await assertDeviceIdentifierAvailable(db, 'sn', sn);
+            if (sn !== null) {
+              registeredDeviceSn(sn);
+              await assertDeviceIdentifierAvailable(db, 'sn', sn);
+            }
           }
           const row = await db.insert('ar_device', { uuid: existing ? existing.uuid : uuid, sn: existing ? existing.sn : sn,
             name, remark_name, device_type, merchant_id: ownerId, venue_id: venueId });
@@ -138,12 +135,6 @@ export class DeviceService {
           return { row: { ...row, venue_name: venue.name }, created: true };
         });
         // No rental configuration is written here, so new devices remain disabled.
-        if (result.row.uuid == null && result.row.sn != null) {
-          const key = deviceIdentifierKey(result.row.sn, 'uuid');
-          const owner = await this.services.db.one('SELECT id FROM ar_device WHERE current_uuid=? AND uuid=?', [key, result.row.sn]);
-          const retired = owner ? null : await retiredDeviceIdentifier(this.services.db, 'uuid', key);
-          result.row.legacy_uuid_conflict = owner || retired?.original_identifier === result.row.sn ? 1 : 0;
-        }
         return { device: DeviceService.display(result.row, true), created: result.created };
       } catch (error: any) {
         if (!['ER_DUP_ENTRY', 'ER_LOCK_DEADLOCK'].includes(error?.code)) throw error;

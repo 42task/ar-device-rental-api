@@ -17,6 +17,7 @@ class Element {
   append(...nodes) { for (const value of nodes) { const node = typeof value === 'string' ? new Element('#text', value) : value; node.parent = this; this.children.push(node); } }
   replaceChildren(...nodes) { this.children = []; this.ownText = ''; this.append(...nodes); }
   setAttribute(name, value) { this.attributes[name] = String(value); if (name === 'id') this.id = String(value); if (name === 'class') this.className = String(value); }
+  setAttributeNS(_namespace, name, value) { this.setAttribute(name, value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
   removeAttribute(name) { delete this.attributes[name]; delete this[name]; }
   get classList() {
@@ -47,7 +48,11 @@ class Element {
 
 function fixture(role = 'root') {
   const body = new Element('body'), app = new Element('div'); app.id = 'app'; body.append(app);
-  const document = { body, createElement: tag => new Element(tag), createElementNS: (namespaceURI, tag) => Object.assign(new Element(tag), { namespaceURI }), createTextNode: text => new Element('#text', text), querySelector: selector => body.querySelector(selector), querySelectorAll: selector => body.querySelectorAll(selector), title: '' };
+  const document = { body, createElement: tag => {
+    const element = new Element(tag);
+    if (tag === 'canvas') element.getContext = () => ({ measureText: value => ({ width: [...value].length * 40 }) });
+    return element;
+  }, createElementNS: (namespaceURI, tag) => Object.assign(new Element(tag), { namespaceURI }), createTextNode: text => new Element('#text', text), querySelector: selector => body.querySelector(selector), querySelectorAll: selector => body.querySelectorAll(selector), title: '' };
   const calls = [], fetches = [], replies = [], windowEvents = new Map();
   const location = { origin: 'https://admin.example.test' }; let hash = '#overview';
   Object.defineProperty(location, 'hash', { get: () => hash, set: value => { hash = '#' + String(value).replace(/^#/, ''); } });
@@ -75,6 +80,7 @@ function assertNoEntryControls(form) {
 }
 async function selectRole(controls, role) { controls.select.value = role; await controls.select.emit('change'); controls.checked.checked = true; await controls.checked.emit('change'); controls.reason.value = 'Synthetic role-change test'; }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+function expiredSessionReply() { return { ok: false, status: 401, json: async () => ({ message: 'Synthetic expired session' }) }; }
 // These are deliberately synthetic PEM-shaped strings, never usable payment keys.
 const syntheticPem = (kind, body = 'U1lOVEhFVElDLU9OTFk=') => `-----BEGIN ${kind}-----\n${body}\n-----END ${kind}-----`;
 async function credentialFixture() {
@@ -96,6 +102,8 @@ for (const role of ['manager', 'adminer', 'root']) {
   const f = fixture(role); f.context.location.hash = '#users'; f.spec.shell();
   const navigation = f.app.querySelector('nav').querySelectorAll('a').map(link => link.dataset.page);
   assert.equal(navigation.includes('users'), role !== 'manager');
+  assert.equal(navigation.includes('rental-events'), true);
+  assert.equal(navigation.includes('renters'), role !== 'manager');
   assert.equal(navigation.includes('merchants'), true);
   const group = f.app.querySelector('.nav-group'); assert.ok(group);
   assert.equal(group.querySelector('.nav-parent').textContent, role === 'root' ? '商户管理' : '我的商户');
@@ -107,9 +115,65 @@ for (const role of ['manager', 'adminer', 'root']) {
   assert.equal(f.spec.canManageUsers(role), role !== 'manager');
   assert.ok(f.app.textContent.includes(f.spec.roleLabel(role)));
 }
+
+const historyTime = '2026-01-02T00:00:00.000Z';
+{
+  const f = fixture('manager');
+  const { first } = roleMerchantContext(f);
+  f.spec.setUser({ id: 10, role: 'manager', merchantId: first.id });
+  f.context.location.hash = '#rental-events'; f.spec.shell(); f.spec.useRealPages();
+  f.replies.push({ items: [{ id: 51, rentalId: 21, deviceName: 'Synthetic headset', uuid: null, sn: '0000123456789012', event: 'RENTAL_ENDED',
+    createdAt: historyTime, actorUserId: 10, details: { reason: 'Synthetic return' } }], page: 1, pageSize: 20, total: 1 });
+  await f.spec.loadPage();
+  assert.equal(f.calls[0].headers['X-Merchant-Id'], String(first.id));
+  assert.match(f.app.querySelector('tbody').textContent, /确认归还.*订单 #21.*SN：0000123456789012.*Synthetic return/);
+  const event = f.app.querySelector('.toolbar select'); event.value = 'REFUND_SUCCESS';
+  f.replies.push({ items: [], page: 1, pageSize: 20, total: 0 });
+  await event.emit('change');
+  await new Promise(setImmediate);
+  assert.equal(new URL(f.calls.at(-1).path, f.context.location.origin).searchParams.get('event'), 'REFUND_SUCCESS');
+  assert.match(f.app.textContent, /没有找到匹配的记录/);
+}
+{
+  const f = fixture('adminer');
+  const { first } = roleMerchantContext(f);
+  f.spec.setUser({ id: 10, role: 'adminer', merchantId: first.id });
+  f.context.location.hash = '#renters'; f.spec.shell(); f.spec.useRealPages();
+  const item = { id: 24, nickname: 'Synthetic guest', phone: '+12025550101', rentalCount: 2, firstRentalAt: historyTime, lastRentalAt: historyTime };
+  f.replies.push({ items: [item], page: 1, pageSize: 20, total: 1 });
+  await f.spec.loadPage();
+  assert.match(f.app.querySelector('tbody').textContent, /Synthetic guest.*\+12025550101/);
+  for (const [key, value] of [['deviceUuid', 'c5b7412b-383d-40ea-b40b-54404ad12f3b'], ['deviceSn', '0000123456789012']]) {
+    const search = f.app.querySelector('.toolbar form'), inputs = search.querySelectorAll('input');
+    const kind = search.querySelector('select'); kind.value = key; await kind.emit('change');
+    inputs[0].value = 'guest'; inputs[1].value = value;
+    f.replies.push({ items: [item], page: 1, pageSize: 20, total: 1 });
+    await search.emit('submit');
+    const query = new URL(f.calls.at(-1).path, f.context.location.origin).searchParams;
+    assert.equal(query.get('search'), 'guest'); assert.equal(query.get(key), value);
+    assert.equal(query.get(key === 'deviceUuid' ? 'deviceSn' : 'deviceUuid'), null);
+    assert.doesNotMatch(f.calls.at(-1).path, /12025550101/);
+  }
+}
+{
+  const f = fixture('root'), { first, second } = roleMerchantContext(f), old = deferred();
+  f.replies.push({ items: [first, second] });
+  f.context.location.hash = '#renters'; f.spec.shell(); f.spec.useRealPages();
+  await new Promise(setImmediate);
+  f.context.fetch = async (_path, options) => options.headers['X-Merchant-Id'] === String(first.id) ? old.promise :
+    { ok: true, json: async () => ({ items: [{ id: 25, nickname: 'Selected merchant guest', rentalCount: 1 }], page: 1, pageSize: 20, total: 1 }) };
+  const pending = f.spec.loadPage();
+  assert.equal(f.spec.selectManagementMerchant(second), true);
+  await f.spec.loadPage();
+  old.resolve({ ok: true, json: async () => ({ items: [{ id: 24, nickname: 'Prior merchant guest', phone: '+12025550101', rentalCount: 1 }], page: 1, pageSize: 20, total: 1 }) });
+  await pending;
+  assert.match(f.app.querySelector('tbody').textContent, /Selected merchant guest/);
+  assert.doesNotMatch(f.app.textContent, /Prior merchant guest|12025550101/);
+}
 {
   const f = fixture('user');
   assert.equal(f.spec.canUseAdmin('user'), false);
+  assert.equal(f.spec.canOpenPage('rental-events'), false);
   assert.throws(() => f.spec.completeLogin({ user: { id: 11, role: 'user' } }, () => true), /没有管理权限/);
   f.spec.completeLogin({ user: { id: 12, role: 'adminer' } }, () => true);
   assert.equal(f.spec.getUser().role, 'adminer');
@@ -391,6 +455,8 @@ for (const entryPoint of ['login', 'session']) {
 }
 
 // Managers choose a venue inside their fixed merchant before querying devices.
+const registeredUuid = 'C5B7412B-383D-40EA-B40B-54404AD12F3B';
+const deviceSn = '0000123456789012';
 const deviceVenueFixtures = [
   { id: 21, merchantId: 2, name: 'North scenic venue', status: 'active' },
   { id: 22, merchantId: 2, name: 'South scenic venue', status: 'paused' },
@@ -422,10 +488,13 @@ async function until(condition) {
   select.value = '21'; await select.emit('change');
   const requested = f.calls.find(call => call.path.includes('/devices?')); assert.equal(new URL(requested.path, f.context.location.origin).searchParams.get('venueId'), '21'); assert.equal(requested.headers['X-Merchant-Id'], '2');
   assert.match(f.app.textContent, /当前景点：North scenic venue/); assert.equal(f.app.querySelector('.device-summary'), null); assert.equal(f.calls.some(call => call.path.endsWith('/overview')), false);
-  const searchForm = f.app.querySelector('.search-form'); searchForm.querySelector('input').value = 'scenic'; await searchForm.emit('submit');
+  assert.deepEqual(f.app.querySelector('.devices-table thead').querySelectorAll('th').slice(0, 4).map(node => node.textContent), ['设备', 'UUID', 'SN', '设备型号']);
+  const searchForm = f.app.querySelector('.search-form'), search = searchForm.querySelector('input');
+  assert.equal(search.getAttribute('aria-label'), '搜索设备名称、备注、UUID 或 SN');
+  search.value = ' ' + deviceSn + ' '; await searchForm.emit('submit');
   await until(() => !!f.app.querySelector('.devices-table'));
   let query = new URL(f.calls.filter(call => call.path.includes('/devices?')).at(-1).path, f.context.location.origin).searchParams;
-  assert.equal(query.get('venueId'), '21'); assert.equal(query.get('search'), 'scenic'); assert.equal(query.get('page'), '1');
+  assert.equal(query.get('venueId'), '21'); assert.equal(query.get('search'), deviceSn); assert.equal(query.get('page'), '1');
   await f.app.querySelector('.pagination-actions').querySelectorAll('button').find(button => button.textContent === '下一页').emit('click');
   await until(() => !!f.app.querySelector('.devices-table'));
   query = new URL(f.calls.filter(call => call.path.includes('/devices?')).at(-1).path, f.context.location.origin).searchParams;
@@ -452,6 +521,21 @@ async function until(condition) {
   select.value = '21'; const first = select.emit('change'); await started.promise; assert.equal(f.app.querySelector('.devices-table'), null);
   select.value = '22'; await select.emit('change'); assert.match(f.app.textContent, /Current venue device/);
   delayed.resolve(); await first; assert.match(f.app.textContent, /Current venue device/); assert.doesNotMatch(f.app.textContent, /Old venue device/);
+}
+
+// Device list, venue and summary requests cannot expire a newer session.
+for (const [role, expiredPath] of [['manager', '/venues'], ['manager', '/devices?'], ['adminer', '/devices?'], ['adminer', '/overview']]) {
+  const f = managerDevicesFixture(role), response = deferred(), started = deferred();
+  f.context.fetch = async path => {
+    if (path.includes(expiredPath)) { started.resolve(); return response.promise; }
+    return { ok: true, json: async () => ({ items: path.endsWith('/venues') ? [deviceVenueFixtures[0]] : [] }) };
+  };
+  const pending = f.spec.loadPage(); await started.promise;
+  const newUser = { id: 11, role, merchantId: 2, authVersion: 1 };
+  f.spec.advanceLogin(); f.spec.setUser(newUser);
+  response.resolve(expiredSessionReply()); await pending;
+  assert.equal(f.spec.getUser(), newUser);
+  assert.doesNotMatch(f.app.textContent, /Synthetic expired session/);
 }
 
 // Selection is revalidated on every query; empty, failed or foreign venue lists never fall back to all devices.
@@ -705,22 +789,155 @@ console.log('Local PEM imports, credential-read races and merchant-save context 
 {
   const f = fixture('root'); f.spec.setContext({ id: 2, name: 'Second merchant' }); await f.spec.createDeviceDialog();
   const form = f.document.querySelector('dialog').querySelector('form');
-  const inputs = form.querySelectorAll('input'); inputs[0].value = 'Synthetic device'; inputs[1].value = 'synthetic-device';
+  merchantField(form, '设备名称').value = 'Synthetic device';
+  merchantField(form, '设备 UUID').value = registeredUuid;
   assert.match(form.textContent, /所属商户：Second merchant/); assert.match(form.textContent, /商户归属由所选场地继承/);
   f.spec.setContext({ id: 3, name: 'Third merchant' }); await form.emit('submit');
   assert.equal(f.calls.filter(call => call.method).length, 0); assert.match(form.textContent, /绑定商户已变化/);
 }
 
-// Each staff role can set an optional remark during registration in the authenticated merchant scope.
-for (const role of ['manager', 'adminer', 'root']) {
+// A registration request made before reauthentication cannot expire the new session.
+for (const phase of ['venues', 'submit']) {
+  const f = fixture('root'), response = deferred(), started = deferred();
+  roleMerchantContext(f);
+  const fetch = f.context.fetch;
+  f.context.fetch = async (path, options) => {
+    if (phase === 'venues' ? path.endsWith('/venues') : options?.method === 'POST') { started.resolve(); return response.promise; }
+    return fetch(path, options);
+  };
+  let pending = f.spec.createDeviceDialog();
+  if (phase === 'submit') {
+    await pending;
+    const { form } = controls(f);
+    merchantField(form, '设备名称').value = 'Synthetic device';
+    merchantField(form, '设备 SN').value = deviceSn;
+    pending = form.emit('submit');
+  }
+  await started.promise;
+  const newUser = { id: 11, role: 'root' };
+  f.spec.advanceLogin(); f.spec.setUser(newUser);
+  response.resolve(expiredSessionReply()); await pending;
+  assert.equal(f.spec.getUser(), newUser);
+  assert.equal(f.document.querySelector('.toast'), null);
+}
+
+// Each staff role can register within its scope. Either identifier or both may be supplied.
+for (const [role, identifiers] of [
+  ['manager', { uuid: registeredUuid }],
+  ['adminer', { sn: deviceSn }],
+  ['root', { uuid: registeredUuid, sn: deviceSn }],
+]) {
   const f = fixture(role); f.spec.setUser({ id: 10, role, merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' }); await f.spec.createDeviceDialog();
   const form = f.document.querySelector('dialog').querySelector('form');
-  const inputs = form.querySelectorAll('input'); inputs[0].value = 'Synthetic device'; inputs[1].value = 'synthetic-device';
-  inputs[2].value = '  一楼备用机  ';
+  const uuid = merchantField(form, '设备 UUID'), sn = merchantField(form, '设备 SN');
+  assert.ok(uuid && sn);
+  assert.equal(!!uuid.required, false); assert.equal(!!sn.required, false);
+  assert.equal(sn.inputMode, 'numeric'); assert.match(form.textContent, /8-4-4-4-12.*16 位数字/);
+  merchantField(form, '设备名称').value = 'Synthetic device';
+  uuid.value = identifiers.uuid ? ' ' + identifiers.uuid + ' ' : '';
+  sn.value = identifiers.sn ? ' ' + identifiers.sn + ' ' : '';
+  merchantField(form, '备注名称（选填）').value = '  一楼备用机  ';
   f.replies.push({ created: true }); await form.emit('submit');
-  const created = f.calls.find(call => call.method === 'POST'); assert.equal(created.headers['X-Merchant-Id'], '2');
-  assert.deepEqual(JSON.parse(created.body), { name: 'Synthetic device', uuid: 'synthetic-device', type: 'Rokid Studio2', venueId: 11, remarkName: '一楼备用机' });
+  const created = f.calls.find(call => call.method === 'POST');
+  assert.equal(created?.path, '/api/v2/rental/devices'); assert.equal(created.headers['X-Merchant-Id'], '2');
+  assert.deepEqual(JSON.parse(created.body), { name: 'Synthetic device', ...identifiers, type: 'Rokid Studio2', venueId: 11, remarkName: '一楼备用机' });
 }
+
+// Whitespace is empty and a mistyped UUID must be corrected even when SN is present.
+{
+  const f = fixture('root'); roleMerchantContext(f); await f.spec.createDeviceDialog();
+  const { dialog, form, submit } = controls(f), before = f.fetches.length;
+  merchantField(form, '设备名称').value = 'Synthetic device';
+  const uuid = merchantField(form, '设备 UUID'), sn = merchantField(form, '设备 SN');
+  uuid.value = ' '; sn.value = '   ';
+  await form.emit('submit');
+  assert.equal(f.fetches.length, before); assert.match(dialog.querySelector('.error').textContent, /至少填写一项/);
+  uuid.value = 'not-a-uuid'; sn.value = deviceSn;
+  await form.emit('submit');
+  assert.equal(f.fetches.length, before); assert.match(dialog.querySelector('.error').textContent, /UUID.*格式/);
+  uuid.value = registeredUuid;
+  for (const invalidSn of [deviceSn.slice(1), deviceSn + '3', '０' + deviceSn.slice(1), 'A' + deviceSn.slice(1)]) {
+    sn.value = invalidSn;
+    await form.emit('submit');
+    assert.equal(f.fetches.length, before); assert.match(dialog.querySelector('.error').textContent, /SN.*16 位数字/);
+  }
+  assert.equal(dialog.open, true); assert.equal(submit.disabled, false);
+}
+
+const removableDevice = { device: { id: 7, uuid: 'delete-test', merchantId: 1, venueName: '测试场地', remarkName: '一楼备用机' }, actions: { canDelete: true } };
+function deleteDeviceButton(f, item = removableDevice) {
+  return f.spec.deviceRow(item).querySelectorAll('button').find(button => button.textContent === '删除');
+}
+
+// Each supported identifier combination can be confirmed and deleted by numeric device ID.
+for (const [role, identifiers] of [
+  ['manager', { uuid: registeredUuid }],
+  ['adminer', { uuid: null, sn: deviceSn }],
+  ['root', { uuid: registeredUuid, sn: deviceSn }],
+  ['user', {}],
+]) {
+  const f = fixture(role), { first } = roleMerchantContext(f);
+  f.spec.setUser({ id: 10, role, merchantId: first.id }); f.spec.setPage('devices');
+  const item = { ...removableDevice, device: { ...removableDevice.device, ...identifiers } };
+  const remove = deleteDeviceButton(f, item);
+  assert.equal(!!remove, role !== 'user');
+  assert.equal(deleteDeviceButton(f, { ...item, actions: { canDelete: false }, state: 'SETTLING' }), undefined);
+  if (!remove) continue;
+  await remove.emit('click');
+  let { dialog, form, submit } = controls(f);
+  assert.match(dialog.textContent, /一楼备用机.*First.*测试场地/);
+  const details = dialog.querySelector('.details').children;
+  for (const [label, expected] of [['设备 UUID', identifiers.uuid], ['设备 SN', identifiers.sn]]) {
+    const key = details.findIndex(node => node.textContent === label);
+    assert.equal(key < 0 ? null : details[key + 1].textContent, expected ?? null);
+  }
+  assert.match(dialog.textContent, /历史租赁订单仍可查询/);
+  assert.equal(submit.classList.contains('danger-button'), true);
+  assert.equal(f.calls.length, 0);
+  await form.querySelectorAll('button').find(button => button.textContent === '取消').emit('click');
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.document.querySelector('dialog'), null);
+  await remove.emit('click');
+  ({ form } = controls(f));
+  f.replies.push({ deleted: true }); await form.emit('submit');
+  assert.equal(f.calls[0].path, '/api/v2/rental/devices/7');
+  assert.equal(f.calls[0].method, 'DELETE');
+  assert.equal(f.calls[0].headers['X-Merchant-Id'], '1');
+  assert.equal(f.context.pageLoads, 1);
+  assert.equal(f.document.querySelector('dialog'), null);
+}
+
+// A device can become occupied after rendering its row. Preserve the form and show the server response.
+{
+  const f = fixture('root'); roleMerchantContext(f); f.spec.setPage('devices');
+  f.context.fetch = async path => ({ ok: path.endsWith('/rental/capabilities'), status: 409, json: async () => path.endsWith('/rental/capabilities')
+    ? { currentClientProtocol: 2, minClientProtocol: 2 } : { message: '设备有未完成的租赁或退款' } });
+  await deleteDeviceButton(f).emit('click');
+  const { dialog, form, submit } = controls(f); await form.emit('submit');
+  assert.equal(dialog.open, true);
+  assert.equal(submit.disabled, false);
+  assert.match(dialog.querySelector('.error').textContent, /设备有未完成的租赁或退款/);
+  assert.equal(f.context.pageLoads, 0);
+}
+
+// Protocol checks may wait while the current merchant changes.
+{
+  const f = fixture('root'), { second } = roleMerchantContext(f); f.spec.setPage('devices');
+  await deleteDeviceButton(f).emit('click');
+  const { form } = controls(f), check = deferred(), started = deferred();
+  f.context.fetch = async (path, options = {}) => {
+    if (path.endsWith('/rental/capabilities')) { started.resolve(); return check.promise; }
+    f.calls.push({ path, ...options }); return { ok: true, json: async () => ({ deleted: true }) };
+  };
+  const submission = form.emit('submit'); await started.promise;
+  f.spec.selectManagementMerchant(second);
+  check.resolve({ ok: true, json: async () => ({ currentClientProtocol: 2, minClientProtocol: 2 }) });
+  await submission;
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.document.querySelector('.toast'), null);
+}
+
+console.log('Device deletion role, confirmation, refusal and merchant scope verified.');
 
 // Registration prepared in one scope cannot dispatch after the merchant changes during the protocol check.
 {
@@ -728,7 +945,7 @@ for (const role of ['manager', 'adminer', 'root']) {
   await f.spec.createDeviceDialog();
   const { form } = controls(f);
   merchantField(form, '设备名称').value = 'Synthetic device';
-  merchantField(form, '设备 UUID').value = 'synthetic-device';
+  merchantField(form, '设备 SN').value = deviceSn;
   merchantField(form, '备注名称（选填）').value = '一楼备用机';
   const check = deferred(), started = deferred();
   f.context.fetch = async (path, options = {}) => {
@@ -743,49 +960,88 @@ for (const role of ['manager', 'adminer', 'root']) {
   assert.equal(f.document.querySelector('.toast'), null);
 }
 
-for (const role of ['manager', 'adminer', 'root']) {
-  const f = fixture(role); f.spec.setUser({ id: 10, role, merchantId: 2 }); f.spec.setContext({ id: 2, name: 'Second merchant' });
+const editableDevice = { id: 7, uuid: registeredUuid, merchantId: 1, venueId: 21, venueName: '测试场地', name: '公开名称', type: 'Rokid Studio2', remarkName: '一楼备用机' };
+const editDeviceButton = (f, device = editableDevice) => f.spec.deviceRow({ device }).querySelectorAll('button').find(button => button.textContent === '编辑');
+
+// All staff roles can edit device basics. Only adminer/root can update the remark.
+for (const [role, device, changes, payload] of [
+  ['manager', { ...editableDevice, uuid: null, sn: deviceSn, type: 'Legacy headset' }, { uuid: registeredUuid, sn: '' }, { uuid: registeredUuid, sn: null }],
+  ['adminer', editableDevice, { sn: deviceSn, remarkName: '' }, { sn: deviceSn, remarkName: '' }],
+  ['root', { ...editableDevice, sn: deviceSn }, { uuid: '', type: 'Rokid Studio3', remarkName: '二楼备用机' }, { uuid: null, type: 'Rokid Studio3', remarkName: '二楼备用机' }],
+]) {
+  const f = fixture(role), { first } = roleMerchantContext(f);
+  f.spec.setUser({ id: 10, role, merchantId: first.id });
+  if (role === 'manager') f.spec.shell();
   f.spec.setPage('devices');
-  const row = f.spec.deviceRow({ device: { id: 7, uuid: 'remark-test', name: '公开名称', remarkName: '一楼备用机' } });
-  const identity = row.querySelector('.device-identity');
-  assert.equal(identity.querySelector('.cell-main').textContent, '一楼备用机');
-  assert.equal(identity.querySelector('.cell-sub').textContent, 'remark-test');
-  assert.ok(identity.querySelector('.cell-sub').classList.contains('device-uuid'));
-  assert.equal(identity.children.length, 2);
-  const edit = row.querySelectorAll('button').find(button => button.textContent === '修改备注');
-  assert.equal(!!edit, role !== 'manager');
-  if (!edit) continue;
-  await edit.emit('click');
-  const form = f.document.querySelector('dialog').querySelector('form');
-  assert.equal(form.querySelector('input').value, '一楼备用机');
-  const remarkName = role === 'adminer' ? '二楼备用机' : '';
-  form.querySelector('input').value = remarkName;
-  f.replies.push({ device: { id: 7, remarkName } }); await form.emit('submit');
+  if (role === 'manager') {
+    f.replies.push({ items: [{ id: device.venueId, merchantId: first.id, name: device.venueName, status: 'active' }] }, { items: [{ device }], total: 1 });
+    await f.spec.loadPage();
+  }
+  const before = f.context.pageLoads;
+  await editDeviceButton(f, device).emit('click');
+  const { dialog, form } = controls(f);
+  assert.match(dialog.textContent, /编辑设备 #7.*First.*测试场地/);
+  const fields = { uuid: merchantField(form, '设备 UUID'), sn: merchantField(form, '设备 SN'), type: merchantField(form, '设备类型'), remarkName: merchantField(form, '备注名称') };
+  assert.equal(fields.uuid.value, device.uuid ?? ''); assert.equal(fields.sn.value, device.sn ?? '');
+  assert.equal(merchantField(form, '设备名称').value, device.name);
+  assert.equal(fields.type.value, device.type);
+  assert.ok(fields.type.querySelectorAll('option').some(option => option.value === device.type));
+  assert.equal(fields.remarkName?.value ?? null, role === 'manager' ? null : device.remarkName);
+  for (const [key, value] of Object.entries(changes)) fields[key].value = value;
+  f.replies.push({ device }); await form.emit('submit');
   const saved = f.calls.find(call => call.method === 'PATCH');
-  assert.match(saved.path, /\/rental\/devices\/7\/remark$/);
-  assert.equal(saved.headers['X-Merchant-Id'], '2');
-  assert.deepEqual(JSON.parse(saved.body), { remarkName });
-  assert.equal(f.context.pageLoads, 1);
+  assert.equal(saved?.path, '/api/v2/rental/devices/7');
+  assert.equal(saved.headers['X-Merchant-Id'], '1');
+  assert.deepEqual(JSON.parse(saved.body), payload);
+  assert.equal(f.context.pageLoads, before + 1);
 }
 
-// Devices without a remark use their ordinary name, or just the UUID when no distinct name exists.
+// Unrelated edits preserve unchanged legacy identifiers and no-op edits send no request.
+for (const [label, device, invalid, errorPattern] of [
+  ['设备 UUID', editableDevice, 'wrong-uuid', /UUID.*格式/],
+  ['设备 SN', { ...editableDevice, uuid: null, sn: 'legacy-sn' }, deviceSn.slice(1), /SN.*16 位数字/],
+]) {
+  const f = fixture('root'); roleMerchantContext(f); f.spec.setPage('devices');
+  await editDeviceButton(f, device).emit('click');
+  const before = f.fetches.length;
+  await controls(f).form.emit('submit'); assert.equal(f.fetches.length, before);
+  await editDeviceButton(f, device).emit('click');
+  const { dialog, form } = controls(f);
+  const identifier = merchantField(form, label), original = identifier.value;
+  identifier.value = ' '; await form.emit('submit');
+  assert.equal(f.fetches.length, before); assert.match(dialog.querySelector('.error').textContent, /至少填写一项/);
+  identifier.value = invalid; await form.emit('submit');
+  assert.equal(f.fetches.length, before); assert.match(dialog.querySelector('.error').textContent, errorPattern);
+  identifier.value = original; merchantField(form, '设备名称').value = ' 新名称 ';
+  f.replies.push({ device }); await form.emit('submit');
+  assert.deepEqual(JSON.parse(f.calls.find(call => call.method === 'PATCH').body), { name: '新名称' });
+}
+
+// Access checks apply to the row before opening a device draft.
 {
+  const f = fixture('user'); roleMerchantContext(f); f.spec.setPage('devices');
+  assert.equal(editDeviceButton(f), undefined);
+  const root = fixture('root'); roleMerchantContext(root); root.spec.setPage('devices');
+  await editDeviceButton(root, { ...editableDevice, merchantId: 2 }).emit('click');
+  assert.equal(root.document.querySelector('dialog'), null); assert.equal(root.calls.length, 0);
+}
+
+// The device name, UUID and SN occupy independent columns for every identifier pair.
+for (const [uuid, sn, remarkName] of [[registeredUuid, null, ''], [null, deviceSn, ''], [registeredUuid, deviceSn, '测试备注']]) {
   const f = fixture('root');
-  const named = f.spec.deviceRow({ device: { uuid: 'fallback-id', name: '公开名称', remarkName: '' } }).querySelector('.device-identity');
-  assert.equal(named.querySelector('.cell-main').textContent, '公开名称');
-  assert.equal(named.querySelector('.cell-sub').textContent, 'fallback-id');
-  const unnamed = f.spec.deviceRow({ device: { uuid: 'fallback-id', name: 'fallback-id' } }).querySelector('.device-identity');
-  assert.equal(unnamed.querySelector('.cell-main').textContent, 'fallback-id');
-  assert.ok(unnamed.querySelector('.cell-main').classList.contains('device-uuid'));
-  assert.equal(unnamed.querySelector('.cell-sub'), null);
+  const row = f.spec.deviceRow({ device: { uuid, sn, name: '设备名称', remarkName } });
+  assert.equal(row.children[0].textContent, remarkName || '设备名称');
+  assert.equal(row.children[1].textContent, uuid ?? '—');
+  assert.equal(row.children[2].textContent, sn ?? '—');
+  assert.ok(row.children[1].classList.contains('device-uuid'));
+  assert.ok(row.children[2].classList.contains('device-sn'));
 }
 
-// A completed remark edit only refreshes the device list if the draft's scope is still current.
-{
+// A delayed edit cannot refresh the list or expire a newer session after the scope changes.
+for (const expired of [false, true]) {
   const f = fixture('root'), { first, second } = roleMerchantContext(f);
   f.spec.setPage('devices');
-  const row = f.spec.deviceRow({ device: { id: 7, uuid: 'remark-test', remarkName: '一楼备用机' } });
-  await row.querySelectorAll('button').find(button => button.textContent === '修改备注').emit('click');
+  await editDeviceButton(f).emit('click');
   const { form } = controls(f), response = deferred(), started = deferred();
   merchantField(form, '备注名称').value = '二楼备用机';
   f.context.fetch = async (path, options = {}) => {
@@ -794,13 +1050,16 @@ for (const role of ['manager', 'adminer', 'root']) {
   };
   const submission = form.emit('submit'); await started.promise;
   f.spec.selectManagementMerchant(second);
-  response.resolve({ ok: true, json: async () => ({ device: { id: 7, remarkName: '二楼备用机' } }) });
+  const newUser = { id: 11, role: 'root' };
+  f.spec.advanceLogin(); f.spec.setUser(newUser);
+  response.resolve(expired ? expiredSessionReply() : { ok: true, json: async () => ({ device: { id: 7, remarkName: '二楼备用机' } }) });
   await submission;
+  assert.equal(f.spec.getUser(), newUser);
   assert.equal(f.calls.find(call => call.method === 'PATCH').headers['X-Merchant-Id'], String(first.id));
   assert.equal(f.context.pageLoads, 0);
   assert.equal(f.document.querySelector('.toast'), null);
 }
-console.log('Device remark registration, role-restricted editing, list display and delayed-response isolation verified.');
+console.log('Device UUID/SN validation and display, partial editing, remark permissions and delayed-response isolation verified.');
 
 // A transfer cannot accidentally be submitted after the operation context changes.
 {
@@ -1095,8 +1354,10 @@ console.log('Transfer venue scope, unavailable targets and delayed target respon
 }
 console.log('Protocol gating, complete payment-credential recovery and employee/platform scopes verified.');
 
-const qrDevice = { id: 7, uuid: 'camera%2F+01', name: '<img src=x onerror=alert(1)>', type: 'Rokid Studio2', merchantId: 2, merchantName: 'Synthetic merchant', venueName: 'Synthetic venue' };
-const qrReply = () => ({ device: { ...qrDevice }, url: 'https://d.4mr.cn/d?i=camera%252F%2B01&t=rs2', qr: { size: 21, modules: '1' + '0'.repeat(440) } });
+const qrDevice = { id: 7, uuid: registeredUuid, name: 'Public device name', remarkName: '登记时的备注', type: 'Rokid Studio2', merchantId: 2, merchantName: 'Synthetic merchant', venueName: 'Synthetic venue' };
+const qrPath = kind => '/api/v2/rental/admin/devices/7/qrcode?identifier=' + kind;
+const currentQrRemark = '一楼 <备用机> & 头显';
+const qrReply = () => ({ device: { ...qrDevice, remarkName: currentQrRemark }, url: 'https://d.4mr.cn/d?i=' + registeredUuid + '&t=rs2', qr: { size: 21, modules: '1' + '0'.repeat(440) } });
 const qrButton = (dialog, label) => dialog.querySelectorAll('button').find(node => node.textContent === label);
 function qrFixture(role = 'root') {
   const f = fixture(role);
@@ -1113,17 +1374,109 @@ for (const role of ['manager', 'adminer', 'root']) {
   const trigger = row.querySelectorAll('button').find(node => node.textContent === '二维码');
   assert.ok(trigger, 'Missing device QR action for ' + role);
   await trigger.emit('click');
-  const request = f.calls.find(call => call.path.endsWith('/devices/7/qrcode'));
+  const request = f.calls.find(call => call.path === qrPath('uuid'));
   assert.ok(request); assert.equal(request.method, undefined); assert.equal(request.headers['X-Merchant-Id'], '2'); assert.equal(request.credentials, 'same-origin');
   assert.equal(f.calls.some(call => call.method), false);
   const dialog = f.document.querySelector('.device-qr-dialog'), label = dialog.querySelector('.device-qr-label');
-  assert.match(label.textContent, /微信扫一扫租赁/); assert.ok(label.textContent.includes(qrDevice.uuid)); assert.ok(label.textContent.includes(qrDevice.name));
+  assert.match(label.textContent, /微信扫一扫租赁/);
   assert.equal(label.querySelector('img'), null); assert.equal(label.querySelector('script'), null);
-  assert.equal(label.querySelector('svg').namespaceURI, 'http://www.w3.org/2000/svg');
+  const svg = label.querySelector('svg');
+  assert.equal(svg.namespaceURI, 'http://www.w3.org/2000/svg');
+  assert.deepEqual(svg.children.slice(1).map(node => node.textContent), [currentQrRemark, '', 'UUID：' + qrDevice.uuid]);
   for (const label of ['打印标签', '下载 PNG', '下载 SVG']) assert.equal(qrButton(dialog, label).disabled, false);
   await qrButton(dialog, '打印标签').emit('click'); assert.equal(f.context.window.printCalls, 1);
   assert.equal(dialog.classList.contains('device-qr-print-target'), true); assert.ok(f.document.title.includes(qrDevice.uuid));
   f.windowEvents.get('afterprint')(); assert.equal(dialog.classList.contains('device-qr-print-target'), false); assert.equal(f.document.title, '');
+}
+
+// UUID is the initial choice when both identifiers exist. SN remains selectable.
+for (const [identifiers, parameter, kind, identifier, fileIdentifier] of [
+  [{ sn: null, uuid: registeredUuid }, 'i', 'UUID', registeredUuid, registeredUuid],
+  [{ sn: deviceSn, uuid: registeredUuid }, 'i', 'UUID', registeredUuid, registeredUuid],
+  [{ sn: deviceSn, uuid: registeredUuid }, 's', 'SN', deviceSn, deviceSn],
+  [{ sn: deviceSn, uuid: null }, 's', 'SN', deviceSn, deviceSn],
+  [{ sn: '0000123456789012', uuid: null }, 's', 'SN', '0000123456789012', '0000123456789012'],
+  [{ sn: 'legacy/SN+01', uuid: null }, 's', 'SN', 'legacy/SN+01', 'legacy_SN_01'],
+]) {
+  const f = qrFixture(), device = { ...qrDevice, ...identifiers };
+  const url = 'https://d.4mr.cn/d?' + parameter + '=' + encodeURIComponent(identifier) + '&t=rs2';
+  const downloads = [];
+  f.context.URL = class extends URL {
+    static createObjectURL() { return 'blob:synthetic-qr-label'; }
+  };
+  f.context.Blob = Blob;
+  f.context.XMLSerializer = class { serializeToString() { return '<svg/>'; } };
+  const createElement = f.document.createElement;
+  f.document.createElement = tag => {
+    const element = createElement(tag);
+    if (tag === 'a') element.click = () => downloads.push(element.download);
+    return element;
+  };
+  const both = Boolean(device.uuid && device.sn);
+  if (both && kind === 'SN') f.replies.push({ ...qrReply(), device });
+  else f.replies.push({ ...qrReply(), device, url });
+  await f.spec.deviceQrDialog({ device });
+  const dialog = f.document.querySelector('.device-qr-dialog');
+  const select = dialog.querySelector('select');
+  assert.equal(!!select, both);
+  if (select) {
+    assert.equal(select.value, 'uuid');
+    if (kind === 'SN') {
+      f.replies.push({ ...qrReply(), device, url });
+      select.value = 'sn'; await select.emit('change');
+    }
+  }
+  assert.equal(f.calls.at(-1).path, qrPath(kind.toLowerCase()));
+  const svg = dialog.querySelector('.device-qr-code');
+  assert.equal(svg?.querySelector('.device-qr-identifier')?.textContent, kind + '：' + identifier);
+  assert.equal(dialog.querySelector('.device-qr-link input').value, url);
+  assert.equal(dialog.querySelector('.device-qr-model').textContent, 'Rokid Studio2');
+  const print = qrButton(dialog, '打印标签');
+  assert.equal(print.disabled, false);
+  await print.emit('click');
+  assert.equal(f.document.title, '设备标签 · ' + kind + '：' + identifier);
+  await qrButton(dialog, '下载 SVG').emit('click');
+  assert.deepEqual(downloads, ['device-7-' + kind.toLowerCase() + '-' + fileIdentifier + '.svg']);
+}
+
+// Selecting SN discards an older UUID preview that arrives late.
+{
+  const f = qrFixture(), device = { ...qrDevice, sn: deviceSn }, previous = deferred();
+  f.context.fetch = async path => path === qrPath('uuid') ? previous.promise :
+    { ok: true, json: async () => ({ ...qrReply(), device, url: 'https://d.4mr.cn/d?s=' + deviceSn }) };
+  const first = f.spec.deviceQrDialog({ device });
+  const dialog = f.document.querySelector('.device-qr-dialog'), select = dialog.querySelector('select');
+  select.value = 'sn'; await select.emit('change');
+  previous.resolve({ ok: true, json: async () => qrReply() }); await first;
+  assert.equal(dialog.querySelector('.device-qr-identifier').textContent, 'SN：' + deviceSn);
+}
+
+// Older API responses can use the list remark; a cleared remark from the current API takes precedence.
+for (const [returned, expected] of [[undefined, qrDevice.remarkName], ['', null], ['  ', null]]) {
+  const f = qrFixture(), reply = qrReply(); reply.device.remarkName = returned; f.replies.push(reply);
+  await f.spec.deviceQrDialog({ device: qrDevice });
+  const svg = f.document.querySelector('.device-qr-code');
+  assert.equal(svg.querySelector('.device-qr-remark')?.textContent ?? null, expected);
+  assert.equal(svg.querySelector('.device-qr-identifier').textContent, 'UUID：' + qrDevice.uuid);
+}
+
+{
+  const f = qrFixture(), reply = qrReply();
+  reply.device.remarkName = '景区东门备用设备'.repeat(20);
+  reply.device.uuid = null;
+  reply.device.sn = 'long-equipment-id-'.repeat(10);
+  reply.url = 'https://d.4mr.cn/d?s=' + reply.device.sn;
+  f.replies.push(reply); await f.spec.deviceQrDialog({ device: reply.device });
+  const svg = f.document.querySelector('.device-qr-code');
+  for (const [className, value] of [['.device-qr-remark', reply.device.remarkName], ['.device-qr-identifier', 'SN：' + reply.device.sn]]) {
+    const block = svg.querySelector(className);
+    assert.ok(block.children.length > 1);
+    assert.equal(block.textContent, value);
+    for (const row of block.children) {
+      assert.ok(Number(row.getAttribute('textLength')) <= Number(svg.getAttribute('width')) - 64);
+      assert.equal(row.getAttribute('lengthAdjust'), 'spacingAndGlyphs');
+    }
+  }
 }
 
 // Loading or a failed QR response cannot produce a printable placeholder; retry uses the same device.
@@ -1138,7 +1491,7 @@ for (const role of ['manager', 'adminer', 'root']) {
   for (const label of ['打印标签', '下载 PNG', '下载 SVG']) assert.equal(qrButton(dialog, label).disabled, true);
   f.context.fetch = async (path, options = {}) => { f.calls.push({ path, ...options }); return { ok: true, json: async () => qrReply() }; };
   const retry = dialog.querySelectorAll('button').find(node => /重试|重新生成/.test(node.textContent)); assert.ok(retry); await retry.emit('click');
-  assert.equal(f.calls.at(-1).path, '/api/v2/rental/admin/devices/7/qrcode'); assert.ok(dialog.querySelector('.device-qr-code')); assert.equal(qrButton(dialog, '打印标签').disabled, false);
+  assert.equal(f.calls.at(-1).path, qrPath('uuid')); assert.ok(dialog.querySelector('.device-qr-code')); assert.equal(qrButton(dialog, '打印标签').disabled, false);
 }
 
 // A late response cannot populate a closed dialog or revive a different merchant's QR preview.
@@ -1154,8 +1507,28 @@ for (const changeScope of [false, true]) {
   assert.equal(qrButton(dialog, '打印标签').disabled, true);
 }
 
+// Expiry from the active request still logs out. An earlier login's expiry does not.
+for (const reauthenticated of [false, true]) {
+  const f = qrFixture(), response = deferred(), user = f.spec.getUser();
+  f.context.fetch = async () => response.promise;
+  const pending = f.spec.deviceQrDialog({ device: qrDevice });
+  if (reauthenticated) f.spec.advanceLogin();
+  response.resolve(expiredSessionReply()); await pending;
+  assert.equal(f.spec.getUser(), reauthenticated ? user : null);
+  assert.equal(f.document.querySelector('.device-qr-code'), null);
+}
+
 // A mismatched device or broken response must never become a printable code for the selected row.
-for (const corrupt of [reply => { reply.device.id = 8; }, reply => { reply.url = 'https://d.4mr.cn/d?i=other-device&t=rs2'; }, reply => { reply.qr.modules = '1'; }]) {
+for (const corrupt of [
+  reply => { reply.device.id = 8; },
+  reply => { reply.url = 'https://d.4mr.cn/d?i=other-device&t=rs2'; },
+  reply => { reply.device.uuid = deviceSn; reply.device.sn = deviceSn; reply.url = 'https://d.4mr.cn/d?i=' + deviceSn + '&t=rs2'; },
+  reply => { reply.device.uuid = null; reply.device.sn = deviceSn; reply.url = 'https://d.4mr.cn/d?i=' + deviceSn + '&t=rs2'; },
+  reply => { reply.device.sn = deviceSn; reply.url = 'https://d.4mr.cn/d?s=' + deviceSn + '&t=rs2'; },
+  reply => { reply.url += '&s=' + deviceSn; },
+  reply => { reply.url += '&%69=' + encodeURIComponent(qrDevice.uuid); },
+  reply => { reply.qr.modules = '1'; },
+]) {
   const f = qrFixture(), reply = qrReply(); corrupt(reply); f.replies.push(reply);
   await f.spec.deviceQrDialog({ device: qrDevice });
   const dialog = f.document.querySelector('.device-qr-dialog');

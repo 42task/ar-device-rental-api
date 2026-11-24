@@ -44,3 +44,24 @@ export async function checkNormalizedDeviceUuids(db: Database): Promise<void> {
     GROUP BY LOWER(uuid) HAVING COUNT(*)>1 LIMIT 1`);
   if (collision) throw new Error('Device UUIDs differ only by case. Resolve the conflicting registrations before migrating.');
 }
+
+/** Reclassify any remaining preexisting device identifiers and order snapshots atomically. */
+export async function backfillDeviceAndOrderIdentifiers(db: Database, sql: string): Promise<void> {
+  const conflicts = await db.one(`SELECT COUNT(*) AS total FROM ar_device d
+    WHERE d.uuid IS NOT NULL AND (CHAR_LENGTH(d.uuid)<>36 OR NOT IS_UUID(d.uuid))
+      AND (
+        (d.sn IS NOT NULL AND CAST(d.sn AS BINARY)<>CAST(d.uuid AS BINARY))
+        OR (d.superseded=0 AND EXISTS (
+          SELECT 1 FROM ar_device_retired_identifier retired
+          WHERE retired.kind='sn' AND retired.identifier=d.uuid AND retired.device_id<>d.id
+        ))
+      )`);
+  const count = Number(conflicts?.total || 0);
+  if (count) throw new Error(`Device identifier backfill found ${count} device(s) with conflicting SN assignments.`);
+  try {
+    for (const statement of sql.split(';').map(value => value.trim()).filter(Boolean)) await db.execute(statement);
+  } catch (error: any) {
+    if (error?.code === 'ER_DUP_ENTRY') throw new Error('Device identifier backfill found a duplicate target SN.');
+    throw error;
+  }
+}

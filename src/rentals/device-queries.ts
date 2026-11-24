@@ -14,29 +14,11 @@ export async function hasUnsettledDeviceOrders(db: Database, deviceId: number): 
   return !!await db.one(`SELECT id FROM ar_rental_order WHERE device_id=? AND ${unsettledRentalStatus} LIMIT 1`, [deviceId]);
 }
 
-export const legacyUuidConflictColumn = `(d.uuid IS NULL AND (EXISTS (
-  SELECT 1 FROM ar_device uuid_owner
-  WHERE uuid_owner.current_uuid IN (d.sn,LOWER(d.sn)) AND uuid_owner.uuid=d.sn
-) OR EXISTS (
-  SELECT 1 FROM ar_device_retired_identifier retired
-  WHERE retired.kind='uuid' AND retired.identifier IN (d.sn,LOWER(d.sn)) AND retired.original_identifier=d.sn
-))) AS legacy_uuid_conflict`;
-
 export async function findDeviceRegistration(db: Database, identifier: string, kind: DeviceIdentifierKind): Promise<{ registration: Row | null; retired: boolean }> {
   const key = deviceIdentifierKey(identifier, kind);
-  const byUuid = kind === 'uuid' ? await db.one('SELECT * FROM ar_device WHERE current_uuid=?', [key]) : null;
-  if (byUuid?.uuid === identifier) return { registration: byUuid, retired: false };
-  const retiredUuid = kind === 'uuid' ? await retiredDeviceIdentifier(db, 'uuid', key) : null;
-  if (retiredUuid?.original_identifier === identifier && Number(retiredUuid.device_id) !== Number(byUuid?.id)) {
-    return { registration: null, retired: true };
-  }
-  // An exact historical SN alias keeps its original target when a UUID
-  // becomes newly equivalent after case normalization.
-  const bySn = await db.one(`SELECT d.*,${legacyUuidConflictColumn} FROM ar_device d WHERE d.current_sn=?`, [identifier]);
-  if (bySn) return { registration: bySn, retired: false };
-  const retiredSn = await retiredDeviceIdentifier(db, 'sn', identifier);
-  if (retiredSn || (retiredUuid && !byUuid)) return { registration: null, retired: true };
-  return { registration: byUuid, retired: false };
+  const registration = await db.one(`SELECT * FROM ar_device WHERE current_${kind}=?`, [key]);
+  const retired = !registration && !!await retiredDeviceIdentifier(db, kind, key);
+  return { registration, retired };
 }
 /** A management read model: one count plus one joined page, regardless of the
  * number of devices. Authorization belongs to the caller, mutations never do.
@@ -59,7 +41,7 @@ export async function readDevicePage(db: Database, query: DevicePageQuery): Prom
   const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern, pattern, pattern] : []), ...(uuidKey === null ? [] : [uuidKey])];
   const [count, rows] = await Promise.all([
     db.one('SELECT COUNT(*) AS total FROM ar_device d' + where, values),
-    db.query(`SELECT d.*,${legacyUuidConflictColumn},${allMerchants ? 'm.id AS merchant_record_id,m.name AS merchant_name,' : ''}v.id AS venue_record_id,v.merchant_id AS venue_merchant_id,v.name AS venue_name,
+    db.query(`SELECT d.*,${allMerchants ? 'm.id AS merchant_record_id,m.name AS merchant_name,' : ''}v.id AS venue_record_id,v.merchant_id AS venue_merchant_id,v.name AS venue_name,
       v.address AS venue_address,v.description AS venue_description,v.status AS venue_status,
       v.use_fee_cents AS venue_use_fee_cents,v.deposit_cents AS venue_deposit_cents,v.version AS venue_version,
       c.device_id AS config_device_id,c.enabled AS config_enabled,c.version AS config_version,
