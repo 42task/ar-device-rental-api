@@ -73,7 +73,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       expect(platform.status).toBe(200);
       expect(platform.body).toMatchObject({ total: 1, items: [{ id: ordinary.user.id, role: 'user', merchantId: null, phoneVerified: true }] });
       expect(JSON.stringify(users.body)).not.toContain('test-openid');
-      const uuid = 'http-device-test';
+      const uuid = '00000000-0000-4000-8000-000000000101';
       const venue = await seedVenue(db);
       const missing = await request(app).get('/api/v2/rental/devices/context').query({ uuid }).set('Authorization', ordinaryToken);
       expect(missing.body).toMatchObject({ state: 'UNREGISTERED', actions: { canCreate: false } });
@@ -124,9 +124,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('fresh database and complet
       expect((await request(app).post('/api/v2/rental/auth/refresh').send({ refreshToken: ordinary.token.refreshToken })).status).toBe(200);
       expect((await request(app).get('/api/v2/rentals').set('Authorization', 'Bearer ' + ordinary.token.refreshToken)).status).toBe(401);
       expect((await request(app).put(`/api/v2/rental/admin/users/${manager.user.id}/role`).set('Authorization', ownerToken).send({ role: 'user' })).status).toBe(200);
-      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid: 'forbidden-device' })).status).toBe(401);
+      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', managerToken).send({ uuid: '00000000-0000-4000-8000-000000000102' })).status).toBe(401);
       const demotedToken = 'Bearer ' + (await login('manager')).token.accessToken;
-      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', demotedToken).send({ uuid: 'forbidden-device' })).status).toBe(403);
+      expect((await request(app).post('/api/v2/rental/devices').set('Authorization', demotedToken).send({ uuid: '00000000-0000-4000-8000-000000000102' })).status).toBe(403);
       await migrate(db);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_device'))!.total)).toBe(1);
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_user'))!.total)).toBe(3);

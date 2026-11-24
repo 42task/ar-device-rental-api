@@ -144,7 +144,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const list = await request(app).get('/api/v2/rental/admin/merchants').set('Authorization', rootToken);
       expect(list.body.items).toHaveLength(3);
       const secondVenue = await seedVenue(db, secondId);
-      const registered = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).set('X-Merchant-Id', String(secondId)).send({ uuid: 'second-device', venueId: secondVenue.id });
+      const secondSn = '0000123456789032';
+      const registered = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).set('X-Merchant-Id', String(secondId)).send({ sn: secondSn, venueId: secondVenue.id });
       expect(registered.status).toBe(200);
       const secondDevice = registered.body.device.id;
       expect((await db.one('SELECT merchant_id FROM ar_device WHERE id=?', [secondDevice]))!.merchant_id).toBe(secondId);
@@ -153,7 +154,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const aToken = 'Bearer ' + a.body.data.token.accessToken, bToken = 'Bearer ' + b.body.data.token.accessToken;
       expect(b.body.data.user.merchantId).toBeNull();
       expect(b.body.data.managementMerchant).toBeNull();
-      const mismatch = await request(app).get('/api/v2/rental/devices/context?uuid=second-device').set('Authorization', aToken);
+      const mismatch = await request(app).get('/api/v2/rental/devices/context').query({ sn: secondSn }).set('Authorization', aToken);
       expect(mismatch.status).toBe(409); expect(mismatch.body.code).toBe('MERCHANT_MISMATCH');
       expect((await request(app).get('/api/v2/rental/admin/overview').set('Authorization', aToken).set('X-Merchant-Id', String(secondId))).status).toBe(403);
       expect((await request(app).get('/api/v2/rental/merchant').set('Host', 'unregistered.example.com')).status).toBe(404);
@@ -176,7 +177,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       const legacyToken = 'd'.repeat(64);
       expect((await request(app).post('/api/v2/rental/auth/merchant-binding/confirm').set('Host', 'd1.4mr.cn').set('Authorization', 'Bearer ' + refreshed.body.data.token.accessToken).send({ bindToken: legacyToken })).status).toBe(410);
       expect((await request(app).post('/api/v2/rental/auth/login').send({ code: 'transferred-b', bindToken: legacyToken })).status).toBe(422);
-      const historical = await db.insert('ar_rental_order', { device_id: secondDevice, device_uuid: 'second-device', device_name: '合成历史设备',
+      const historical = await db.insert('ar_rental_order', { device_id: secondDevice, device_uuid: secondSn, device_name: '合成历史设备',
         user_id: b.body.data.user.id, merchant_id: secondId, payment_config_id: replacementAccount.body.merchant.configId,
         appid: second.appId, payer_openid: b.body.data.openid, mch_id: '2000000002', use_fee_cents: 5, deposit_cents: 25,
         total_cents: 30, price_version: 1, status: 'COMPENSATING', payment_status: 'SUCCESS', out_trade_no: 'synthetic-compensation-order',

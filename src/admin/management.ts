@@ -28,7 +28,8 @@ export function registerManagement(router: ApiRouter, db: Database, auth: Rental
         COALESCE(SUM(s.state='RESERVED'),0) AS reserved,
         COALESCE(SUM(s.state='RENTED'),0) AS rented,
         COALESCE(SUM(s.state='SETTLING'),0) AS settling
-        FROM ar_device d LEFT JOIN ar_venue v ON v.id=d.venue_id AND v.merchant_id=d.merchant_id LEFT JOIN ar_rental_config c ON c.device_id=d.id LEFT JOIN ar_rental_slot s ON s.device_id=d.id${merchant ? ' WHERE d.merchant_id=?' : ''}`, merchant ? [merchant.id] : []),
+        FROM ar_device d LEFT JOIN ar_venue v ON v.id=d.venue_id AND v.merchant_id=d.merchant_id LEFT JOIN ar_rental_config c ON c.device_id=d.id LEFT JOIN ar_rental_slot s ON s.device_id=d.id
+        WHERE d.deleted_ms IS NULL${merchant ? ' AND d.merchant_id=?' : ''}`, merchant ? [merchant.id] : []),
       db.one(`SELECT COUNT(*) AS total, COALESCE(SUM(status='ACTIVE'),0) AS active,
         COALESCE(SUM(refund_amount_cents>0 AND refund_status IS NOT NULL AND refund_status<>'SUCCESS'),0) AS refunding
         FROM ar_rental_order WHERE ${merchant ? 'merchant_id=? AND appid' : 'appid'}=?`, merchant ? [merchant.id, merchant.appId] : [identity.appid]),

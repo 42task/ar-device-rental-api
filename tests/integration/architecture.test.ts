@@ -30,7 +30,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('independent application id
       await migrate(db); await migrate(db);
       expect((await db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(SCHEMA_VERSION);
       const journal = await db.query('SELECT version,checksum,applied_ms FROM ar_schema_migration ORDER BY version');
-      expect(journal.map(row => row.version)).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+      expect(journal.map(row => row.version)).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
       expect(await db.one("SHOW COLUMNS FROM ar_device WHERE Field='remark_name'")).toMatchObject({ Null: 'NO', Default: '' });
       expect(await db.one("SHOW COLUMNS FROM ar_rental_config WHERE Field='use_fee_cents'")).toBeNull();
       const appId = 'wx03dbf50c15cac06f';
@@ -77,7 +77,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('independent application id
       expect(merchant.body.merchant).toMatchObject({ miniappOwnerId: 1, origin: 'https://d.4mr.cn', appId, paymentReady: true, configuration: { hasAppSecret: true } });
       const venue = await request(app).post('/api/v2/rental/admin/venues').set('Authorization', rootToken).set('X-Merchant-Id', String(merchantId)).send({ name: 'Synthetic venue', useFeeCents: 2000, depositCents: 8000 });
       expect(venue.status).toBe(200);
-      const device = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).set('X-Merchant-Id', String(merchantId)).send({ uuid: 'synthetic-device', venueId: venue.body.venue.id, remarkName: '一楼备用机' });
+      const uuid = '00000000-0000-4000-8000-000000000101';
+      const device = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).set('X-Merchant-Id', String(merchantId)).send({ uuid, name: 'synthetic-device', venueId: venue.body.venue.id, remarkName: '一楼备用机' });
       expect(device.status).toBe(200);
       expect(device.body.device.remarkName).toBe('一楼备用机');
       const rename = await request(app).patch(`/api/v2/rental/devices/${device.body.device.id}/remark`).set('Authorization', rootToken).set('X-Merchant-Id', String(merchantId)).send({ remarkName: '二楼备用机' });
@@ -86,7 +87,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('independent application id
       expect((await request(app).patch(`/api/v2/rental/devices/${device.body.device.id}/config`).set('Authorization', rootToken).set('X-Merchant-Id', String(merchantId)).send({ enabled: true, version: 0 })).status).toBe(200);
       const customer = await login('customer'), bearer = 'Bearer ' + customer.token.accessToken;
       expect(customer.user.merchantId).toBeNull();
-      const customerContext = await request(app).get('/api/v2/rental/devices/context').set('Authorization', bearer).query({ uuid: 'synthetic-device' });
+      const customerContext = await request(app).get('/api/v2/rental/devices/context').set('Authorization', bearer).query({ uuid });
       expect(customerContext.status).toBe(200);
       expect(customerContext.body.device).not.toHaveProperty('remarkName');
       const reserve = () => request(app).post('/api/v2/rentals').set('Authorization', bearer).send({ deviceId: device.body.device.id, priceVersion: 1, venuePriceVersion: 1, idempotencyKey: 'synthetic-architecture-reservation' });

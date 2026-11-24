@@ -136,7 +136,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       const first = await db.insert('ar_device', { uuid: '000Conflict', sn: 'other-sn', venue_id: venue.id });
       const second = await db.insert('ar_device', { uuid: '000Safe', venue_id: venue.id });
       const owner = await db.insert('ar_device', { sn: '000Safe', venue_id: venue.id });
-      await db.execute('DELETE FROM ar_schema_migration WHERE version=20');
+      await db.execute('DELETE FROM ar_schema_migration WHERE version>=20');
       await db.execute('UPDATE ar_schema_meta SET version=19 WHERE name=?', ['ar-device-rental-api']);
 
       await expect(migrate(db)).rejects.toThrow('2 device(s) with conflicting SN assignments');
@@ -170,18 +170,31 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       expect(login.status).toBe(200);
       const bearer = 'Bearer ' + login.body.data.token.accessToken;
       const venue = await seedVenue(db);
-      const cases = [['http-default', undefined, 'Rokid Studio2'], ['http-explicit-ios', 'ios', 'ios'], ['http-explicit-rokid', 'rokid', 'rokid'], ['http-short-studio', 'rs2', 'Rokid Studio2'], ['http-canonical-studio', 'Rokid Studio', 'Rokid Studio'], ['http-lower-studio', 'rokid studio2', 'Rokid Studio2'], ['http-canonical-studio3', 'Rokid Studio3', 'Rokid Studio3'], ['http-short-studio1', 'RS', 'Rokid Studio'], ['http-short-studio3', 'rs3', 'Rokid Studio3'], ['http-custom', 'Custom Glasses', 'Custom Glasses']] as const;
-      for (const [uuid, type, expected] of cases) {
+      const cases = [
+        [undefined, 'Rokid Studio2'],
+        ['ios', 'ios'],
+        ['rokid', 'rokid'],
+        ['rs2', 'Rokid Studio2'],
+        ['Rokid Studio', 'Rokid Studio'],
+        ['rokid studio2', 'Rokid Studio2'],
+        ['Rokid Studio3', 'Rokid Studio3'],
+        ['RS', 'Rokid Studio'],
+        ['rs3', 'Rokid Studio3'],
+        ['Custom Glasses', 'Custom Glasses'],
+      ] as const;
+      const testUuid = (index: number) => '00000000-0000-4000-8000-' + String(index + 101).padStart(12, '0');
+      for (const [index, [type, expected]] of cases.entries()) {
+        const uuid = testUuid(index);
         const result = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid, venueId: venue.id, ...(type === undefined ? {} : { type }) });
         expect(result.status).toBe(200);
         expect(result.body).toMatchObject({ created: true, device: { uuid, type: expected } });
       }
-      const duplicate = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: 'http-explicit-ios', type: 'rs2', venueId: venue.id });
+      const duplicate = await request(app).post('/api/v2/rental/devices').set('Authorization', bearer).send({ uuid: testUuid(1), type: 'rs2', venueId: venue.id });
       expect(duplicate.status).toBe(200);
-      expect(duplicate.body).toMatchObject({ created: false, device: { uuid: 'http-explicit-ios', type: 'ios' } });
+      expect(duplicate.body).toMatchObject({ created: false, device: { uuid: testUuid(1), type: 'ios' } });
       const remarks = ['一楼备用机', '二楼备用机'];
       const concurrent = await Promise.all(remarks.map(remarkName => request(app).post('/api/v2/rental/devices').set('Authorization', bearer)
-        .send({ uuid: 'http-concurrent-studio', type: 'rs2', venueId: venue.id, remarkName })));
+        .send({ uuid: testUuid(cases.length), type: 'rs2', venueId: venue.id, remarkName })));
       expect(concurrent.map(result => result.status)).toEqual([200, 200]);
       expect(concurrent.map(result => result.body.created).sort()).toEqual([false, true]);
       expect(concurrent[0].body.device).toEqual(concurrent[1].body.device);
@@ -197,4 +210,71 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       expect(Number((await db.one('SELECT COUNT(*) AS total FROM ar_rental_config'))!.total)).toBe(0);
     });
   });
+
+  it('edits UUID and SN independently by ID and reports changes to the QR identifier', async () => {
+    await withTestDatabase(async db => {
+      await migrate(db);
+      const appId = 'wx03dbf50c15cac06f', openid = 'synthetic-device-editor';
+      const manager = await db.insert('ar_user', { appid: appId, openid, role: 'manager', merchant_id: 1, auth_version: 1 });
+      await db.insert('ar_merchant_membership', { user_id: manager.id, merchant_id: 1, role: 'manager', status: 'active', authorization_version: 1, updated_ms: Date.now() });
+      const client = new WeChatClient({ appId, appSecret: 'synthetic-device-editor-secret', payEnabled: false, allowEnvironmentFallback: false,
+        fetch: async () => { throw Error('Device editor integration must not contact WeChat.'); } });
+      client.codeSession = async () => ({ openid });
+      const auth = new RentalAuth(db, client, { jwtSecret: 'synthetic-device-editor-signing-key-at-least-32-bytes', rootPhone: '' });
+      const { app } = createApplication({ db, client, auth });
+      const login = await request(app).post('/api/v2/rental/auth/login').send({ code: 'synthetic-editor-login' });
+      expect(login.status).toBe(200);
+      const bearer = 'Bearer ' + login.body.data.token.accessToken;
+
+      const venue = await seedVenue(db);
+      const originalUuid = '00000000-0000-4000-8000-000000000007';
+      const takenUuid = '00000000-0000-4000-8000-000000000008';
+      const updatedUuid = '00000000-0000-4000-8000-000000000009';
+      const serialNumber = '0000123456789012';
+      const takenSn = '0000123456789013';
+      const details = { name: '设备原名', device_type: 'ios', remark_name: '原备注', venue_id: venue.id };
+      const device = await db.insert('ar_device', { ...details, uuid: originalUuid });
+      await db.insert('ar_device', { uuid: takenUuid, sn: takenSn, venue_id: venue.id });
+      const patch = (fields: Record<string, unknown>) => request(app).patch('/api/v2/rental/devices/' + device.id)
+        .set('Authorization', bearer).set('X-Merchant-Id', '1').send(fields);
+      const read = () => db.one('SELECT name,device_type,remark_name,venue_id,uuid,sn FROM ar_device WHERE id=?', [device.id]);
+
+      const both = await patch({ sn: serialNumber });
+      expect(both.status).toBe(200);
+      expect(both.body).toMatchObject({ device: { id: device.id, registeredUuid: originalUuid, sn: serialNumber }, requiresNewQr: false });
+      expect(await read()).toEqual({ ...details, uuid: originalUuid, sn: serialNumber });
+
+      const snOnly = await patch({ uuid: null });
+      expect(snOnly.status).toBe(200);
+      expect(snOnly.body).toMatchObject({ device: { id: device.id, uuid: serialNumber, registeredUuid: null, sn: serialNumber }, requiresNewQr: true });
+      const qr = await request(app).get('/api/v2/rental/admin/devices/' + device.id + '/qrcode').set('Authorization', bearer).set('X-Merchant-Id', '1');
+      expect(qr.status).toBe(200);
+      expect(new URL(qr.body.url).searchParams.get('i')).toBe(serialNumber);
+
+      expect((await patch({ sn: null, name: '未生效的新名称' })).status).toBe(422);
+      expect((await patch({ uuid: takenUuid, name: '未生效的新名称' })).status).toBe(409);
+      expect((await patch({ sn: takenSn })).status).toBe(409);
+      expect(await read()).toEqual({ ...details, uuid: null, sn: serialNumber });
+
+      const restoredUuid = await patch({ uuid: updatedUuid });
+      expect(restoredUuid.status).toBe(200);
+      expect(restoredUuid.body).toMatchObject({ device: { id: device.id, registeredUuid: updatedUuid, sn: serialNumber }, requiresNewQr: true });
+      const uuidOnly = await patch({ sn: null });
+      expect(uuidOnly.status).toBe(200);
+      expect(uuidOnly.body).toMatchObject({ device: { id: device.id, registeredUuid: updatedUuid, sn: null }, requiresNewQr: false });
+      expect(await read()).toEqual({ ...details, uuid: updatedUuid, sn: null });
+
+      const editDetails = await patch({ name: '设备新名称', type: 'rs3' });
+      expect(editDetails.status).toBe(200);
+      expect(editDetails.body).toMatchObject({ device: { name: '设备新名称', type: 'Rokid Studio3' }, requiresNewQr: true });
+      expect(await read()).toEqual({ ...details, name: '设备新名称', device_type: 'Rokid Studio3', uuid: updatedUuid, sn: null });
+
+      const legacySn = '000LegacyEditor';
+      await db.execute('UPDATE ar_device SET uuid=NULL,sn=? WHERE id=?', [legacySn, device.id]);
+      expect((await patch({ sn: '000OtherEditor' })).status).toBe(422);
+      expect((await patch({ uuid: serialNumber })).status).toBe(422);
+      expect((await patch({ uuid: updatedUuid })).status).toBe(200);
+      expect(await read()).toMatchObject({ uuid: updatedUuid, sn: legacySn });
+    });
+  }, 30_000);
 });

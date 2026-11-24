@@ -156,7 +156,7 @@ describe('durable admin scan login', () => {
     const demoted = await f.auth.authenticateBearer(f.ctx({ token: f.tokens.manager }));
     expect(demoted.user.role).toBe('user');
     // A real privileged service refuses the existing mini-program JWT after demotion.
-    await expect(new DeviceService({ db: f.db as any }).create(demoted.user, { uuid: 'must-not-create' })).rejects.toMatchObject({ status: 403 });
+    await expect(new DeviceService({ db: f.db as any }).create(demoted.user, { uuid: '00000000-0000-4000-8000-000000000101' })).rejects.toMatchObject({ status: 403 });
     await expect(f.invoke('GET', '/session', { cookie: managerSession.cookie })).rejects.toMatchObject({ status: 403 });
     await expect(f.changeRole({ ...grant, cookie: managerSession.cookie })).rejects.toMatchObject({ status: 403 });
     await f.changeRole({ cookie: rootSession.cookie, id: '2', body: { role: 'user', reason: '撤销临时授权' } });
