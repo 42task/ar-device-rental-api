@@ -68,7 +68,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('MySQL merchant branding an
     await migrate(f.db); await migrate(f.db);
     expect(await f.db.query('SELECT * FROM ar_merchant ORDER BY id')).toEqual(before);
     expect((await f.db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(SCHEMA_VERSION);
-    expect(await f.db.query('SELECT version FROM ar_schema_migration ORDER BY version')).toEqual([11, 12, 13, 14, 15, 16, 17, 18].map(version => ({ version })));
+    expect(await f.db.query('SELECT version FROM ar_schema_migration ORDER BY version')).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20].map(version => ({ version })));
     expect((await f.http('get', '/api/v2/rental/branding/1')).body.branding).toMatchObject({ version: 0, logoUrl: '' });
   }), 30_000);
   it('enforces own-merchant adminer access, current membership and deliberate root scope', async () => withFixture(async f => {

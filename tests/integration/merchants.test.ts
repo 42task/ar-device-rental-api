@@ -54,7 +54,9 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       expect(await db.one('SELECT merchant_id FROM ar_user WHERE id=23')).toEqual({ merchant_id: null });
       const { app } = createApplication({ db, client, auth });
       const bearer = 'Bearer ' + oldLogin.token.accessToken;
-      expect((await request(app).get('/api/v2/rental/devices/context?uuid=legacy-device').set('Authorization', bearer)).body).toMatchObject({ device: { id: 7, type: 'ios' }, state: 'AVAILABLE', pricing: { version: 3, useFeeCents: 500, depositCents: 2000 } });
+      expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=7')).toEqual({ uuid: null, sn: 'legacy-device' });
+      expect(await db.one('SELECT device_id,device_uuid FROM ar_rental_order WHERE id=42')).toEqual({ device_id: 7, device_uuid: 'legacy-device' });
+      expect((await request(app).get('/api/v2/rental/devices/context?uuid=legacy-device').set('Authorization', bearer)).body).toMatchObject({ device: { id: 7, uuid: 'legacy-device', registeredUuid: null, sn: 'legacy-device', type: 'ios' }, state: 'AVAILABLE', pricing: { version: 3, useFeeCents: 500, depositCents: 2000 } });
       expect((await request(app).get('/api/v2/rental/admin/orders').set('Authorization', bearer)).body).toMatchObject({ total: 1, items: [{ id: 42, totalCents: 3000 }] });
       const session = await request(app).get('/api/v2/rental/admin/auth/session').set('Cookie', 'ar_admin_session=' + sessionToken);
       expect(session.status).toBe(200); expect(session.body.user).toMatchObject({ id: 22, role: 'manager' });
@@ -102,7 +104,8 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       await db.execute('INSERT INTO ar_user_phone (user_id,appid,phone_e164,country_code,verified_ms,code_hash) VALUES (?,?,?,?,?,?)', [rootId, appId, '+8613700137000', '86', Date.now(), '1'.repeat(64)]);
       await bootstrapRoot(db, rootId, appId, '+8613700137000');
       const firstVenue = await seedVenue(db);
-      const first = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).send({ uuid: 'existing-default-device', venueId: firstVenue.id });
+      const firstUuid = 'fff9002a-7518-423c-8e8b-1902ef3f3305';
+      const first = await request(app).post('/api/v2/rental/devices').set('Authorization', rootToken).send({ uuid: firstUuid, venueId: firstVenue.id });
       expect(first.status).toBe(200);
       expect((await db.one('SELECT merchant_id FROM ar_device WHERE id=?', [first.body.device.id]))!.merchant_id).toBe(1);
       const creation = await request(app).post('/api/v2/rental/admin/merchants').set('Authorization', rootToken).send({ name: '合成测试商户', code: 'second', miniappOwnerId: null, origin: 'https://d1.4mr.cn', appId: 'wx1111111111111111', mchId: '2000000001', status: 'active', payEnabled: false, credentials: { ...paymentCredentials, appSecret: 'synthetic-second-secret', apiV3Key: 'a'.repeat(32) } });
@@ -185,7 +188,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL merchant migrat
       expect(moved.status).toBe(200); expect(moved.body).toMatchObject({ device: { merchantId: 1 }, requiresNewQr: true });
       expect(await db.one('SELECT merchant_id,user_id FROM ar_rental_order WHERE id=?', [historical.id])).toMatchObject({ merchant_id: secondId, user_id: b.body.data.user.id });
       await migrate(db);
-      expect((await db.one('SELECT id FROM ar_device WHERE uuid=?', ['existing-default-device']))!.id).toBe(first.body.device.id);
+      expect((await db.one('SELECT id FROM ar_device WHERE uuid=?', [firstUuid]))!.id).toBe(first.body.device.id);
       expect((await db.one('SELECT merchant_id FROM ar_user WHERE id=?', [rootId]))!.merchant_id).toBeNull();
       expect((await request(app).get('/health')).body).toMatchObject({ status: 'healthy', payments: 'disabled' });
     } finally {
