@@ -17,7 +17,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
     try {
       await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4`); created = true;
       db = new Database(mysql.createPool({ ...settings, database, connectionLimit: 12 }));
-      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql', '018-device-sn.sql', '019-device-identifiers.sql', '021-device-deletion.sql']) {
+      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql', '018-device-sn.sql', '019-device-identifiers.sql', '021-device-deletion.sql', '022-device-identity-claims.sql']) {
         const schema = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(sql => sql.trim()).filter(Boolean);
         for (const statement of schema) await db.execute(statement);
       }

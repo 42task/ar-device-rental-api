@@ -32,6 +32,16 @@ async function sqlDefault(db: Database): Promise<unknown> {
   return (await db.one("SELECT COLUMN_DEFAULT AS value FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='ar_device' AND COLUMN_NAME='device_type'"))?.value;
 }
 
+async function restoreSchema21(db: Database): Promise<void> {
+  await db.execute('DROP TABLE ar_device_retired_identifier');
+  await db.execute(`ALTER TABLE ar_device
+    DROP INDEX uq_ar_device_current_uuid, DROP INDEX uq_ar_device_current_sn, DROP INDEX ix_ar_device_current_sn_uuid,
+    DROP COLUMN current_uuid, DROP COLUMN current_sn, DROP COLUMN current_sn_uuid, DROP COLUMN superseded,
+    ADD UNIQUE KEY uuid(uuid), ADD UNIQUE KEY uq_ar_device_sn(sn)`);
+  await db.execute('DELETE FROM ar_schema_migration WHERE version=22');
+  await db.execute('UPDATE ar_schema_meta SET version=21 WHERE name=?', ['ar-device-rental-api']);
+}
+
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registration and migrations', () => {
   it.each([3, 4])('upgrades schema %i without changing existing device types and remains idempotent', async previousVersion => {
     await withTestDatabase(async db => {
@@ -84,6 +94,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
   it.each(['schema 17', 'schema 18', 'constraints already applied'])('enforces optional, separately unique device identifiers from %s', async startingPoint => {
     await withTestDatabase(async db => {
       await migrate(db);
+      await restoreSchema21(db);
       await db.execute(`ALTER TABLE ar_device DROP CHECK chk_ar_device_identifier_present, DROP INDEX uq_ar_device_sn,
         DROP COLUMN sn, MODIFY COLUMN uuid varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL`);
       await db.execute('DELETE FROM ar_schema_migration WHERE version>=18');
@@ -132,6 +143,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
   it('rolls back an SN backfill with conflicting identifiers, then retries without changing device IDs', async () => {
     await withTestDatabase(async db => {
       await migrate(db);
+      await restoreSchema21(db);
       const venue = await seedVenue(db);
       const first = await db.insert('ar_device', { uuid: '000Conflict', sn: 'other-sn', venue_id: venue.id });
       const second = await db.insert('ar_device', { uuid: '000Safe', venue_id: venue.id });
@@ -150,6 +162,38 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: SCHEMA_VERSION });
       expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=?', [first.id])).toEqual({ uuid: null, sn: '000Conflict' });
       expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=?', [second.id])).toEqual({ uuid: null, sn: '000Safe' });
+    });
+  });
+
+  it('retains released migration checksums and stops before replacing indexes when UUID case conflicts exist', async () => {
+    await withTestDatabase(async db => {
+      await migrate(db);
+      await restoreSchema21(db);
+      const venue = await seedVenue(db);
+      const uuid = '12345678-1234-4123-8123-abcdefabcdef';
+      const upper = await db.insert('ar_device', { uuid: uuid.toUpperCase(), venue_id: venue.id });
+      const lower = await db.insert('ar_device', { uuid, venue_id: venue.id });
+      const journal = 'SELECT version,checksum FROM ar_schema_migration WHERE version BETWEEN 18 AND 21 ORDER BY version';
+      const released = [
+        '289d596d7b0085b9bb01d389e241bec112ac041c90b765e900ba197928f8e056',
+        '150c1529e68a69585937a45024a2855e29800442f7e30f9466de9bef2a69ae9c',
+        '3dd9dd8592d83ed4a1e85e7e105feea0311eb16a41ed04100385e35a59c4a3c3',
+        '601302456e2998a1a1e22838c9bc4c534e3955d85c3f874f09aec9a7d90d43b0',
+      ];
+      expect((await db.query(journal)).map(row => row.checksum)).toEqual(released);
+      await expect(migrate(db)).rejects.toThrow('Device UUIDs differ only by case');
+      expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: 21 });
+      expect(await db.one("SHOW INDEX FROM ar_device WHERE Key_name='uuid'")).toBeTruthy();
+
+      await db.execute('UPDATE ar_device SET uuid=? WHERE id=?', ['12345678-1234-4123-8123-abcdefabcdee', lower.id]);
+      await migrate(db);
+      // Resume after a completed ALTER whose journal transaction did not commit.
+      await db.execute('DELETE FROM ar_schema_migration WHERE version=22');
+      await db.execute('UPDATE ar_schema_meta SET version=21');
+      await migrate(db);
+      expect(await db.one('SELECT id,uuid,current_uuid FROM ar_device WHERE current_uuid=?', [uuid])).toEqual({ id: upper.id, uuid: uuid.toUpperCase(), current_uuid: uuid });
+      expect((await db.query(journal)).map(row => row.checksum)).toEqual(released);
+      await expect(db.insert('ar_device', { uuid, venue_id: venue.id })).rejects.toMatchObject({ code: 'ER_DUP_ENTRY' });
     });
   });
 

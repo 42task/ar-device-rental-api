@@ -21,7 +21,12 @@ export function registerRentals(router: ApiRouter, services: Services, options: 
     return ctx.query.sn === undefined ? service.context(principal, ctx.query.uuid) : service.context(principal, ctx.query.sn, 'sn');
   });
   route('GET', '/v2/rental/admin/devices', async ctx => service.devices(await identity(ctx), ctx.query));
-  route('GET', '/v2/rental/admin/devices/:id/qrcode', async ctx => service.deviceQrcode(await identity(ctx), ctx.params.id));
+  route('GET', '/v2/rental/admin/devices/:id/qrcode', async ctx => {
+    const principal = await identity(ctx);
+    const format = ctx.query?.format;
+    if (format !== undefined && format !== 'typed') throw new ApiError(422, '设备二维码格式无效');
+    return service.deviceQrcode(principal, ctx.params.id, format === 'typed');
+  });
   route('POST', '/v2/rental/devices', async ctx => service.createDevice(await identity(ctx), ctx.body));
   route('PATCH', '/v2/rental/devices/:id', async ctx => service.updateDevice(await identity(ctx), ctx.params.id, ctx.body));
   route('DELETE', '/v2/rental/devices/:id', async ctx => service.deleteDevice(await identity(ctx), ctx.params.id));
@@ -34,6 +39,7 @@ export function registerRentals(router: ApiRouter, services: Services, options: 
     return result;
   });
   route('GET', '/v2/rentals/:id', async ctx => service.get(await identity(ctx), ctx.params.id));
+  route('GET', '/v2/rentals/:id/device-context', async ctx => service.orderDeviceContext(await identity(ctx), ctx.params.id));
   route('POST', '/v2/rentals/:id/payment', async ctx => service.payment(await identity(ctx), ctx.params.id));
   route('POST', '/v2/rentals/:id/sync-payment', async ctx => service.syncPayment(await identity(ctx), ctx.params.id));
   route('POST', '/v2/rentals/:id/cancel', async ctx => service.cancel(await identity(ctx), ctx.params.id));
