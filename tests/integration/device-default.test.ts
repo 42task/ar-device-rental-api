@@ -40,17 +40,17 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       if (previousVersion === 4) await db.execute((await readFile(resolve('database/005-device-type-default.sql'), 'utf8')).replace(/^\s*--.*$/gm, ''));
       await db.execute('CREATE TABLE ar_schema_meta (name varchar(64) NOT NULL PRIMARY KEY, version int NOT NULL) ENGINE=InnoDB');
       await db.execute('INSERT INTO ar_schema_meta (name,version) VALUES (?,?)', ['ar-device-rental-api', previousVersion]);
-      await db.execute('INSERT INTO ar_device (uuid,name,device_type) VALUES (?,?,?),(?,?,?),(?,?,?)', ['legacy-ios', 'Synthetic iOS device', 'ios', 'legacy-rokid', 'Synthetic Rokid device', 'rokid', 'legacy-studio', 'Synthetic Studio device', 'rokid studio2']);
+      await db.execute('INSERT INTO ar_device (uuid,name,device_type) VALUES (?,?,?),(?,?,?),(?,?,?)', ['00000000-0000-4000-8000-000000000001', 'Synthetic iOS device', 'ios', '00000000-0000-4000-8000-000000000002', 'Synthetic Rokid device', 'rokid', '00000000-0000-4000-8000-000000000003', 'Synthetic Studio device', 'rokid studio2']);
       expect(await sqlDefault(db)).toBe(previousVersion === 3 ? 'ios' : 'rokid studio2');
       await migrate(db);
       expect(Number((await db.one('SELECT version FROM ar_schema_meta WHERE name=?', ['ar-device-rental-api']))!.version)).toBe(SCHEMA_VERSION);
       expect(await sqlDefault(db)).toBe('Rokid Studio2');
-      expect(await db.query('SELECT uuid,device_type FROM ar_device ORDER BY uuid')).toEqual([{ uuid: 'legacy-ios', device_type: 'ios' }, { uuid: 'legacy-rokid', device_type: 'rokid' }, { uuid: 'legacy-studio', device_type: 'rokid studio2' }]);
+      expect(await db.query('SELECT uuid,device_type FROM ar_device ORDER BY uuid')).toEqual([{ uuid: '00000000-0000-4000-8000-000000000001', device_type: 'ios' }, { uuid: '00000000-0000-4000-8000-000000000002', device_type: 'rokid' }, { uuid: '00000000-0000-4000-8000-000000000003', device_type: 'rokid studio2' }]);
       const venue = await seedVenue(db);
-      await db.execute('INSERT INTO ar_device (uuid,name,venue_id) VALUES (?,?,?)', ['sql-default', 'Synthetic SQL default device', venue.id]);
+      await db.execute('INSERT INTO ar_device (uuid,name,venue_id) VALUES (?,?,?)', ['00000000-0000-4000-8000-000000000004', 'Synthetic SQL default device', venue.id]);
       await migrate(db);
       expect(await sqlDefault(db)).toBe('Rokid Studio2');
-      expect(await db.query('SELECT uuid,device_type FROM ar_device ORDER BY uuid')).toEqual([{ uuid: 'legacy-ios', device_type: 'ios' }, { uuid: 'legacy-rokid', device_type: 'rokid' }, { uuid: 'legacy-studio', device_type: 'rokid studio2' }, { uuid: 'sql-default', device_type: 'Rokid Studio2' }]);
+      expect(await db.query('SELECT uuid,device_type FROM ar_device ORDER BY uuid')).toEqual([{ uuid: '00000000-0000-4000-8000-000000000001', device_type: 'ios' }, { uuid: '00000000-0000-4000-8000-000000000002', device_type: 'rokid' }, { uuid: '00000000-0000-4000-8000-000000000003', device_type: 'rokid studio2' }, { uuid: '00000000-0000-4000-8000-000000000004', device_type: 'Rokid Studio2' }]);
     });
   });
 
@@ -62,7 +62,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       await db.execute('UPDATE ar_schema_meta SET version=16 WHERE name=?', ['ar-device-rental-api']);
 
       const venue = await seedVenue(db);
-      const previous = { uuid: 'legacy-without-remark', name: '原设备名称', venue_id: venue.id };
+      const previous = { uuid: '00000000-0000-4000-8000-000000000005', name: '原设备名称', venue_id: venue.id };
       await db.insert('ar_device', previous);
       if (columnAlreadyAdded) {
         await db.execute(await readFile(resolve('database/017-device-remark-name.sql'), 'utf8'));
@@ -90,7 +90,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       await db.execute('UPDATE ar_schema_meta SET version=17 WHERE name=?', ['ar-device-rental-api']);
 
       const venue = await seedVenue(db);
-      const legacy = { uuid: 'legacy-without-sn', name: '原设备名称', venue_id: venue.id };
+      const legacy = { uuid: '00000000-0000-4000-8000-000000000006', name: '原设备名称', venue_id: venue.id };
       await db.execute('INSERT INTO ar_device (uuid,name,venue_id) VALUES (?,?,?)', [legacy.uuid, legacy.name, legacy.venue_id]);
       if (startingPoint !== 'schema 17') {
         await db.execute(await readFile(resolve('database/018-device-sn.sql'), 'utf8'));
@@ -126,6 +126,30 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       await migrate(db);
       expect(await db.one('SELECT uuid,sn FROM ar_device WHERE sn=?', ['000AbC123'])).toEqual({ uuid: null, sn: '000AbC123' });
       expect(await db.one('SELECT checksum,applied_ms FROM ar_schema_migration WHERE version=19')).toEqual(applied);
+    });
+  });
+
+  it('rolls back an SN backfill with conflicting identifiers, then retries without changing device IDs', async () => {
+    await withTestDatabase(async db => {
+      await migrate(db);
+      const venue = await seedVenue(db);
+      const first = await db.insert('ar_device', { uuid: '000Conflict', sn: 'other-sn', venue_id: venue.id });
+      const second = await db.insert('ar_device', { uuid: '000Safe', venue_id: venue.id });
+      const owner = await db.insert('ar_device', { sn: '000Safe', venue_id: venue.id });
+      await db.execute('DELETE FROM ar_schema_migration WHERE version=20');
+      await db.execute('UPDATE ar_schema_meta SET version=19 WHERE name=?', ['ar-device-rental-api']);
+
+      await expect(migrate(db)).rejects.toThrow('2 device(s) with conflicting SN assignments');
+      expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: 19 });
+      expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=?', [first.id])).toEqual({ uuid: '000Conflict', sn: 'other-sn' });
+      expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=?', [second.id])).toEqual({ uuid: '000Safe', sn: null });
+
+      await db.execute('UPDATE ar_device SET sn=? WHERE id=?', ['000Conflict', first.id]);
+      await db.execute('UPDATE ar_device SET sn=? WHERE id=?', ['000Other', owner.id]);
+      await migrate(db);
+      expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: SCHEMA_VERSION });
+      expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=?', [first.id])).toEqual({ uuid: null, sn: '000Conflict' });
+      expect(await db.one('SELECT uuid,sn FROM ar_device WHERE id=?', [second.id])).toEqual({ uuid: null, sn: '000Safe' });
     });
   });
 

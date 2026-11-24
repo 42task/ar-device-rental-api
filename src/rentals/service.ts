@@ -3,7 +3,7 @@ import type { Context, Row, Services } from '../core/contracts';
 import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
 import { hasDeviceManagement, requireManager, requireRoot } from '../core/roles';
-import { DeviceService, deviceRemarkName, deviceUuid } from '../devices/service';
+import { DeviceService, deviceRemarkName, deviceSn, deviceUuid } from '../devices/service';
 import { rentalOrderNumber, rentalRefundNumber } from './numbers';
 import type { RentalOptions, RentalPrincipal } from './types';
 import { currentMerchant, entryMerchant, withMerchant } from '../merchants/context';
@@ -13,7 +13,7 @@ import { legacyAccountAdapter, loadAccountPermissions, requireMerchantManagement
 import { requireVerifiedPhone } from '../auth/phone';
 import { refundStatusAfterObservation } from './refund-state';
 import { quoteForDevice, rentalCents as cents, venueForDevice } from './quotes';
-import { readDevicePage } from './device-queries';
+import { legacyUuidConflictColumn, readDevicePage } from './device-queries';
 import { deviceQr } from '../devices/qr';
 
 const iso = (value: unknown): string | null => value === null || value === undefined ? null : new Date(Number(value)).toISOString();
@@ -64,21 +64,11 @@ export class RentalService {
     }
     return withMerchant({ entry, merchant: target }, operation);
   }
-  private async withDeviceMerchant<T>(principal: RentalPrincipal, column: 'id' | 'uuid', value: unknown, hidden: boolean, operation: () => Promise<T>): Promise<T> {
+  private async withDeviceMerchant<T>(principal: RentalPrincipal, value: unknown, hidden: boolean, operation: () => Promise<T>): Promise<T> {
     if (!this.options.resolveMerchant || !entryMerchant()) return operation();
     this.assertPrincipal(principal);
-    const device = await this.services.db.one(`SELECT merchant_id FROM ar_device WHERE ${column}=?`, [column === 'id' ? id(value) : deviceUuid(value)]);
-    if (device) return this.withOwner(device.merchant_id, hidden, operation);
-    // An employee can register a new scan for their own merchant from the shared
-    // application. Client roles and merchant identifiers never choose ownership.
-    if (column === 'uuid' && hasDeviceManagement(principal.user) && principal.user.role !== 'root') {
-      const row = await this.services.db.one('SELECT id,role,merchant_id,auth_version FROM ar_user WHERE id=?', [principal.user.id]);
-      const user = row ? await loadAccountPermissions(this.services.db, row) : null;
-      if (user && hasDeviceManagement(user) && Number(user.auth_version) === Number(principal.authVersion ?? principal.user.auth_version)) {
-        return this.withOwner(user.merchant_id, hidden, operation);
-      }
-    }
-    return operation();
+    const device = await this.services.db.one('SELECT merchant_id FROM ar_device WHERE id=?', [id(value)]);
+    return device ? this.withOwner(device.merchant_id, hidden, operation) : operation();
   }
   private async withOrderMerchant<T>(principal: RentalPrincipal, orderId: unknown, operation: () => Promise<T>): Promise<T> {
     if (!this.options.resolveMerchant || !entryMerchant()) return operation();
@@ -169,13 +159,38 @@ export class RentalService {
     const merchant = currentMerchant();
     return { ...DeviceService.display(device, management), ...(device.merchant_id === undefined ? {} : { merchantId: Number(device.merchant_id), merchantName: device.merchant_name ?? (Number(device.merchant_id) === merchant?.id ? merchant.name : undefined) }) };
   }
-  async context(principal: RentalPrincipal, uuid: unknown): Promise<Row> {
-    return this.withDeviceMerchant(principal, 'uuid', uuid, false, () => this.contextInMerchant(principal, uuid));
+  async context(principal: RentalPrincipal, value: unknown, kind: 'uuid' | 'sn' = 'uuid'): Promise<Row> {
+    this.assertPrincipal(principal);
+    const identifier = kind === 'sn' ? deviceSn(value) : deviceUuid(value);
+    const db = this.services.db;
+    // Legacy QR links put arbitrary device identifiers in the UUID query. A
+    // former UUID moved to SN must still resolve, after an exact UUID match.
+    const byUuid = kind === 'uuid' ? await db.one('SELECT * FROM ar_device WHERE uuid = ?', [identifier]) : null;
+    const device = byUuid ?? await db.one(`SELECT d.*,${legacyUuidConflictColumn} FROM ar_device d WHERE d.sn=?`, [identifier]);
+    if (device) {
+      return this.withOwner(device.merchant_id, false, () => this.options.resolveMerchant && entryMerchant()
+        ? this.contextByDeviceId(principal, device.id)
+        : this.contextInMerchant(principal, device));
+    }
+    // An employee can register a new scan for their own merchant from the shared
+    // application. Client roles and merchant identifiers never choose ownership.
+    const operation = () => this.contextInMerchant(principal, null);
+    if (this.options.resolveMerchant && entryMerchant() && manager(principal) && principal.user.role !== 'root') {
+      const row = await db.one('SELECT id,role,merchant_id,auth_version FROM ar_user WHERE id=?', [principal.user.id]);
+      const user = row ? await loadAccountPermissions(db, row) : null;
+      if (user && hasDeviceManagement(user) && Number(user.auth_version) === Number(principal.authVersion ?? principal.user.auth_version)) {
+        return this.withOwner(user.merchant_id, false, operation);
+      }
+    }
+    return operation();
   }
-  private async contextInMerchant(principal: RentalPrincipal, uuid: unknown): Promise<Row> {
+  private async contextByDeviceId(principal: RentalPrincipal, deviceId: number): Promise<Row> {
+    const device = await this.services.db.one(`SELECT d.*,${legacyUuidConflictColumn} FROM ar_device d WHERE d.id=?`, [deviceId]);
+    return this.contextInMerchant(principal, device);
+  }
+  private async contextInMerchant(principal: RentalPrincipal, device: Row | null): Promise<Row> {
     this.assertPrincipal(principal);
     const merchant = currentMerchant();
-    const device = await this.services.db.one('SELECT * FROM ar_device WHERE uuid = ?', [deviceUuid(uuid)]);
     if (device && merchant && Number(device.merchant_id) !== merchant.id) throw new ApiError(409, '设备属于其他商户，请使用对应小程序', 'MERCHANT_MISMATCH');
     const currentManager = await this.currentManagerUser(principal);
     const canManage = !!currentManager;
@@ -219,7 +234,7 @@ export class RentalService {
     return { items: rows.map(row => this.view(row, principal)), page, pageSize: Math.floor(pageSize), total: Number(count?.total || 0) };
   }
   async create(principal: RentalPrincipal, input: Row): Promise<Row> {
-    return this.withDeviceMerchant(principal, 'id', input.deviceId, false, () => this.createInMerchant(principal, input));
+    return this.withDeviceMerchant(principal, input.deviceId, false, () => this.createInMerchant(principal, input));
   }
   private async createInMerchant(principal: RentalPrincipal, input: Row): Promise<Row> {
     this.assertPrincipal(principal); this.assertReady();
@@ -257,7 +272,7 @@ export class RentalService {
       const now = this.now();
       const info = this.displayDevice(device);
       const order = await db.insert('ar_rental_order', {
-        device_id: deviceId, device_uuid: device.uuid, device_name: info.name, user_id: Number(principal.user.id), appid: principal.appid,
+        device_id: deviceId, device_uuid: device.uuid ?? device.sn, device_name: info.name, user_id: Number(principal.user.id), appid: principal.appid,
         venue_id: Number(venue.id), venue_name: venue.name, venue_price_version: Number(venue.version),
         payer_openid: principal.openid, mch_id: (merchant?.client ?? this.options.payment).config.mchId, use_fee_cents: pricing.useFeeCents, deposit_cents: pricing.depositCents,
         ...(merchant ? { merchant_id: merchant.id, payment_config_id: merchant.configId } : {}),
@@ -521,7 +536,7 @@ export class RentalService {
     return new DeviceService(this.services).create({ ...principal.user, appid: principal.appid, ...(currentMerchant() ? { auth_version: principal.authVersion ?? principal.user.auth_version } : {}) }, input);
   }
   async configure(principal: RentalPrincipal, deviceId: unknown, input: Row): Promise<Row> {
-    return this.withDeviceMerchant(principal, 'id', deviceId, true, () => this.configureInMerchant(principal, deviceId, input));
+    return this.withDeviceMerchant(principal, deviceId, true, () => this.configureInMerchant(principal, deviceId, input));
   }
   async updateDeviceRemark(principal: RentalPrincipal, deviceId: unknown, input: Row): Promise<Row> {
     this.assertPrincipal(principal);
@@ -530,7 +545,7 @@ export class RentalService {
     const merchant = currentMerchant();
     const remarkName = deviceRemarkName(input.remarkName);
     return this.services.db.transaction(async db => {
-      const device = await db.one('SELECT * FROM ar_device WHERE id=?' + (merchant ? ' AND merchant_id=?' : '') + ' FOR UPDATE',
+      const device = await db.one(`SELECT d.*,${legacyUuidConflictColumn} FROM ar_device d WHERE d.id=?` + (merchant ? ' AND d.merchant_id=?' : '') + ' FOR UPDATE',
         [id(deviceId), ...(merchant ? [merchant.id] : [])]);
       if (!device) throw new ApiError(404, '设备不存在');
       requireDeviceRemarkEditor(await this.requireCurrentManager(principal, db, true));
@@ -545,7 +560,7 @@ export class RentalService {
     if (['useFeeCents', 'depositCents', 'totalCents', 'use_fee_cents', 'deposit_cents', 'total_cents'].some(key => Object.prototype.hasOwnProperty.call(input, key))) throw new ApiError(422, '租赁费用请在场地设置中调整');
     const version = Number(input.version);
     if (!Number.isSafeInteger(version) || version < 0) throw new ApiError(422, '配置版本无效，请刷新设备');
-    const device = await this.services.db.transaction(async db => {
+    const configuredId = await this.services.db.transaction(async db => {
       const current = await db.one('SELECT * FROM ar_device WHERE id = ?' + (merchant ? ' AND merchant_id = ?' : '') + ' FOR UPDATE', [id(deviceId), ...(merchant ? [merchant.id] : [])]);
       if (!current) throw new ApiError(404, '设备不存在');
       await this.requireCurrentManager(principal, db, true);
@@ -571,9 +586,9 @@ export class RentalService {
       if (changed) await db.execute('UPDATE ar_device SET venue_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', [venueId, current.id]);
       if (config) await db.execute('UPDATE ar_rental_config SET enabled=?,version=version+1,updated_ms=?,updated_by=? WHERE device_id=?', [enabled, this.now(), principal.user.id, current.id]);
       else await db.insert('ar_rental_config', { device_id: current.id, enabled, version: 1, updated_ms: this.now(), updated_by: principal.user.id, ...(merchant ? { merchant_id: merchant.id } : {}) });
-      return current;
+      return current.id;
     });
-    return this.context(principal, device.uuid);
+    return this.contextByDeviceId(principal, configuredId);
   }
   async devices(principal: RentalPrincipal, query: Row): Promise<Row> {
     this.assertPrincipal(principal);
@@ -612,11 +627,16 @@ export class RentalService {
   async deviceQrcode(principal: RentalPrincipal, deviceId: unknown): Promise<Row> {
     this.assertPrincipal(principal); await this.requireCurrentManager(principal);
     const merchant = currentMerchant();
-    const device = await this.services.db.one(`SELECT d.*,v.name AS venue_name FROM ar_device d
+    const device = await this.services.db.one(`SELECT d.*,${legacyUuidConflictColumn},v.name AS venue_name FROM ar_device d
       LEFT JOIN ar_venue v ON v.id=d.venue_id AND v.merchant_id=d.merchant_id
       WHERE d.id=?` + (merchant ? ' AND d.merchant_id=?' : ''), [id(deviceId), ...(merchant ? [merchant.id] : [])]);
     if (!device) throw new ApiError(404, '设备不存在');
-    return { device: this.displayDevice(device, true), ...deviceQr(device.uuid, device.device_type, merchant?.origin) };
+    const identifier = device.uuid ?? device.sn;
+    if (device.legacy_uuid_conflict) {
+      throw new ApiError(409, '设备 SN 与二维码标识冲突，无法生成设备标签');
+    }
+    // Existing label clients validate the QR parameter against device.uuid.
+    return { device: { ...this.displayDevice(device, true), uuid: identifier }, ...deviceQr(identifier, device.device_type, merchant?.origin) };
   }
   async paymentNotification(ctx: Context): Promise<Row> {
     const { notice, client, configId } = await this.notification(ctx);

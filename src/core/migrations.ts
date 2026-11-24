@@ -4,9 +4,9 @@ import { createHash } from 'node:crypto';
 import type { Database } from './database';
 import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
-import { archiveDevicePricing } from '../devices/migrations';
+import { archiveDevicePricing, backfillDeviceSerialNumbers } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
@@ -187,17 +187,19 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
         { version: 19, filename: '019-device-identifiers.sql', run: async (_db: Database) => {},
           alreadyApplied: async (db: Database) => !!await db.one(
             "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='ar_device' AND CONSTRAINT_NAME='chk_ar_device_identifier_present' AND CONSTRAINT_TYPE='CHECK' AND ENFORCED='YES'") },
+        { version: 20, filename: '020-device-sn-backfill.sql', runInTransaction: backfillDeviceSerialNumbers },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');
         const recorded = await connection.one('SELECT checksum FROM ar_schema_migration WHERE version=?', [step.version]);
         if (recorded && recorded.checksum !== checksum) throw new Error(`Applied migration ${step.version} was modified; use a new migration instead.`);
         if (version < step.version) {
-          if (!await step.alreadyApplied?.(connection)) {
+          if (!step.runInTransaction && !await step.alreadyApplied?.(connection)) {
             for (const statement of source.replace(/^\s*--.*$/gm, '').split(';').map(value => value.trim()).filter(Boolean)) await connection.execute(statement);
           }
-          await step.run(connection);
+          await step.run?.(connection);
           await connection.transaction(async tx => {
+            await step.runInTransaction?.(tx, source);
             await tx.execute('INSERT INTO ar_schema_migration (version,checksum,applied_ms) VALUES (?,?,?)', [step.version, checksum, Date.now()]);
             await tx.execute('INSERT INTO ar_schema_meta (name,version) VALUES (?,?) ON DUPLICATE KEY UPDATE version=?', ['ar-device-rental-api', step.version, step.version]);
           });
