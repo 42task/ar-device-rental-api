@@ -4,13 +4,13 @@ import { createHash } from 'node:crypto';
 import type { Database } from './database';
 import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
-import { archiveDevicePricing, backfillDeviceSerialNumbers } from '../devices/migrations';
+import { archiveDevicePricing, backfillDeviceSerialNumbers, checkNormalizedDeviceUuids } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
-const TABLES = new Set(['ar_schema_meta', 'ar_schema_migration', 'ar_device', 'ar_user', 'ar_role_audit', 'ar_admin_guard', 'ar_rental_config', 'ar_rental_order', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job', 'ar_user_phone', 'ar_admin_login_challenge', 'ar_admin_session', 'ar_merchant', 'ar_merchant_wechat_config', 'ar_user_wechat_identity', 'ar_user_merchant_binding', 'ar_user_phone_history', 'ar_merchant_audit', 'ar_venue', 'ar_merchant_membership', 'ar_application', 'ar_application_merchant', 'ar_legacy_device_pricing_archive', 'ar_merchant_branding', 'ar_venue_appearance', 'ar_user_avatar']);
+const TABLES = new Set(['ar_schema_meta', 'ar_schema_migration', 'ar_device', 'ar_user', 'ar_role_audit', 'ar_admin_guard', 'ar_rental_config', 'ar_rental_order', 'ar_rental_slot', 'ar_rental_event', 'ar_rental_job', 'ar_user_phone', 'ar_admin_login_challenge', 'ar_admin_session', 'ar_merchant', 'ar_merchant_wechat_config', 'ar_user_wechat_identity', 'ar_user_merchant_binding', 'ar_user_phone_history', 'ar_merchant_audit', 'ar_venue', 'ar_merchant_membership', 'ar_application', 'ar_application_merchant', 'ar_legacy_device_pricing_archive', 'ar_merchant_branding', 'ar_venue_appearance', 'ar_user_avatar', 'ar_device_retired_identifier']);
 
 /** Each DDL step can resume after interruption; MySQL DDL is not transactional. */
 async function migrateMerchantColumns(db: Database): Promise<void> {
@@ -190,6 +190,8 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
         { version: 20, filename: '020-device-sn-backfill.sql', runInTransaction: backfillDeviceSerialNumbers },
         { version: 21, filename: '021-device-deletion.sql', run: async (_db: Database) => {},
           alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='deleted_ms'") },
+        { version: 22, filename: '022-device-identity-claims.sql', beforeApply: checkNormalizedDeviceUuids,
+          alreadyApplied: async (db: Database) => !!await db.one("SHOW INDEX FROM ar_device WHERE Key_name='uq_ar_device_current_uuid'") },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');
@@ -197,6 +199,7 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
         if (recorded && recorded.checksum !== checksum) throw new Error(`Applied migration ${step.version} was modified; use a new migration instead.`);
         if (version < step.version) {
           if (!step.runInTransaction && !await step.alreadyApplied?.(connection)) {
+            await step.beforeApply?.(connection);
             for (const statement of source.replace(/^\s*--.*$/gm, '').split(';').map(value => value.trim()).filter(Boolean)) await connection.execute(statement);
           }
           await step.run?.(connection);

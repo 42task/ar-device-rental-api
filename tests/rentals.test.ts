@@ -7,6 +7,7 @@ import { ApiRouter } from '../src/core/router';
 import type { Context, Row, Services } from '../src/core/contracts';
 import type { RentalPrincipal } from '../src/rentals/types';
 import { DeviceService } from '../src/devices/service';
+import { isDeviceUuid } from '../src/devices/identifiers';
 import { withMerchant, type MerchantRuntime } from '../src/merchants/context';
 import { ApiError } from '../src/core/errors';
 import { registerManagement } from '../src/admin/management';
@@ -18,13 +19,15 @@ class RentalDb {
   sqlite = new DatabaseSync(':memory:');
   constructor() {
     opened.push(this);
+    this.sqlite.function('IS_UUID', { deterministic: true }, value => typeof value === 'string' && isDeviceUuid(value) ? 1 : 0);
     this.sqlite.exec(`PRAGMA foreign_keys=ON;
       CREATE TABLE ar_user(id INTEGER PRIMARY KEY,role TEXT,appid TEXT DEFAULT 'wx-rental-test',tel TEXT);
       INSERT INTO ar_user(id,role) VALUES(1,'user'),(2,'manager'),(3,'user'),(4,'root'),(5,'adminer');
       CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY REFERENCES ar_user(id),appid TEXT NOT NULL,identity_id INTEGER,verified_ms INTEGER NOT NULL);
       CREATE TABLE ar_venue(id INTEGER PRIMARY KEY,merchant_id INTEGER NOT NULL,name TEXT,address TEXT DEFAULT '',description TEXT DEFAULT '',status TEXT NOT NULL DEFAULT 'active',use_fee_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1);
       INSERT INTO ar_venue(id,merchant_id,name,use_fee_cents,deposit_cents) VALUES(1,1,'场地一',2000,20000),(2,2,'场地二',3000,9000),(3,1,'场地三',3000,10000);
-      CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,sn TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,remark_name TEXT NOT NULL DEFAULT '',deleted_ms INTEGER,merchant_id INTEGER NOT NULL DEFAULT 1,venue_id INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT,sn TEXT,deleted_ms INTEGER,superseded INTEGER NOT NULL DEFAULT 0,current_uuid TEXT GENERATED ALWAYS AS (CASE WHEN superseded=0 THEN CASE WHEN IS_UUID(uuid) THEN LOWER(uuid) ELSE uuid END END) UNIQUE,current_sn TEXT GENERATED ALWAYS AS (CASE WHEN superseded=0 THEN sn END) UNIQUE,current_sn_uuid TEXT GENERATED ALWAYS AS (CASE WHEN superseded=0 AND IS_UUID(sn) THEN LOWER(sn) END),device_type TEXT DEFAULT 'ios',name TEXT,remark_name TEXT NOT NULL DEFAULT '',merchant_id INTEGER NOT NULL DEFAULT 1,venue_id INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE ar_device_retired_identifier(kind TEXT,identifier TEXT,original_identifier TEXT,device_id INTEGER REFERENCES ar_device(id),legacy_i_uuid TEXT GENERATED ALWAYS AS (CASE WHEN kind='sn' AND IS_UUID(identifier) THEN LOWER(identifier) END),PRIMARY KEY(kind,identifier));
       INSERT INTO ar_device(id,uuid,device_type,name) VALUES(7,'camera-7','rokid','AR眼镜'),(8,'camera-8','ios','设备8');`);
     const mysql = readFileSync(resolve('database/002-rentals.sql'), 'utf8');
     const schema = mysql.replace(/^\s*--.*$/gm, '')
@@ -173,6 +176,42 @@ describe('independent AR rental lifecycle', () => {
     await expect(f.service.configure(forged, created.device.id, { enabled: false, version: 1 })).rejects.toMatchObject({ status: 403 });
     expect((await f.service.context(actor, created.device.uuid)).pricing).toMatchObject({ enabled: true, totalCents: 22000, version: 1 });
   });
+  it('archives only an unoccupied device, retains its rental history and registers the same QR under a new device ID', async () => {
+    const f = fixture();
+    const uuid = testUuid(7);
+    await f.db.execute('UPDATE ar_device SET uuid=? WHERE id=?', [uuid, 7]);
+    await f.configure();
+    const created = await f.create();
+    const remove = () => f.service.deleteDevice(f.manager, 7);
+    await expect(remove()).rejects.toMatchObject({ status: 409 });
+    await f.service.payment(f.user, created.rental.id);
+    const order = (await f.db.one('SELECT * FROM ar_rental_order WHERE id=?', [created.rental.id]))!;
+    f.orders.get(order.out_trade_no)!.trade_state = 'SUCCESS';
+    await f.service.syncPayment(f.user, order.id);
+    expect((await f.service.context(f.manager, uuid)).actions.canDelete).toBe(false);
+    await expect(remove()).rejects.toMatchObject({ status: 409 });
+    await f.service.end(f.manager, order.id, { refundMode: 'deposit', idempotencyKey: 'deletion-after-refund' });
+    await expect(remove()).rejects.toMatchObject({ status: 409 });
+    await f.db.execute('DELETE FROM ar_rental_slot WHERE device_id=7');
+    expect((await f.service.context(f.manager, uuid)).actions.canDelete).toBe(false);
+    expect(await f.service.devices(f.manager, { venueId: 1, search: uuid })).toMatchObject({ items: [{ actions: { canDelete: false } }] });
+    await expect(remove()).rejects.toMatchObject({ status: 409 });
+    [...f.refunds.values()][0].status = 'SUCCESS';
+    await f.service.syncRefund(f.manager, order.id);
+    expect(await remove()).toEqual({ deleted: true });
+    expect(await f.service.context(f.manager, uuid)).toMatchObject({ state: 'UNREGISTERED', device: null, actions: { canCreate: true, canDelete: false } });
+    await expect(f.service.deviceQrcode(f.manager, 7)).rejects.toMatchObject({ status: 404 });
+    await expect(f.service.configure(f.manager, 7, { enabled: true, version: 1 })).rejects.toMatchObject({ status: 404 });
+    await expect(f.service.updateDeviceRemark(f.adminer, 7, { remarkName: '已删除设备' })).rejects.toMatchObject({ status: 404 });
+    await expect(f.create(f.user, 'new-rental-after-delete')).rejects.toMatchObject({ status: 404 });
+    expect((await f.create()).rental).toMatchObject({ id: order.id, status: 'ENDED' });
+    expect((await f.service.get(f.user, order.id)).rental).toMatchObject({ deviceId: 7, uuid, refundStatus: 'SUCCESS' });
+    const replacement = await f.service.createDevice(f.manager, { uuid, venueId: 1 });
+    expect(replacement).toMatchObject({ created: true, device: { uuid } });
+    expect(replacement.device.id).not.toBe(7);
+    expect(await remove()).toEqual({ deleted: true });
+    expect(await f.service.context(f.manager, uuid)).toMatchObject({ state: 'DISABLED', device: { id: replacement.device.id }, pricing: { version: 0 } });
+  });
   it('keeps remarks private, makes them searchable, and restricts updates to current adminers and root', async () => {
     const f = fixture();
     const uuid = testUuid(3);
@@ -300,12 +339,24 @@ describe('independent AR rental lifecycle', () => {
   });
   it('requires refreshed quote and prevents another payer from reserving an occupied device', async () => {
     const f = fixture(); await f.configure();
+    const uuid = testUuid(7), sn = '0000000000000007';
+    await f.db.execute('UPDATE ar_device SET uuid=?,sn=? WHERE id=7', [uuid, sn]);
+    const router = new ApiRouter();
+    registerRentals(router, f.services, f.options);
+    const route = router.routes.find(route => route.method === 'GET' && route.path === '/v2/rental/devices/context')!;
+    const readContext = (query: Row) => route.handler({ query, res: { setHeader() {} } } as Context) as Promise<Row>;
+    const bySn = await readContext({ sn });
+    expect(bySn).toMatchObject({ device: { id: 7, registeredUuid: uuid, sn }, pricing: { version: 1, venuePriceVersion: 1, totalCents: 22000 } });
+    expect(await readContext({ uuid })).toEqual(bySn);
+    expect(await readContext({ uuid: sn })).toEqual(bySn);
+    await expect(readContext({ uuid, sn })).rejects.toMatchObject({ status: 422 });
     await expect(f.service.create(f.user, { deviceId: 7, venuePriceVersion: 1, priceVersion: 2, idempotencyKey: 'rental-request-1' })).rejects.toMatchObject({ status: 409 });
-    const first = await f.create();
+    const first = await f.service.create(f.user, { deviceId: bySn.device.id, venuePriceVersion: bySn.pricing.venuePriceVersion,
+      priceVersion: bySn.pricing.version, idempotencyKey: 'rental-request-1' });
     expect((await f.create()).rental.id).toBe(first.rental.id);
     expect((await f.create(f.user, 'another-request')).rental.id).toBe(first.rental.id);
     await expect(f.create(f.other, 'other-user-request')).rejects.toMatchObject({ status: 409 });
-    const context = await f.service.context(f.other, 'camera-7');
+    const context = await f.service.context(f.other, uuid);
     expect(context).toMatchObject({ state: 'RESERVED', relation: 'other', rental: null });
     expect(await f.db.query('SELECT * FROM ar_rental_order')).toHaveLength(1);
   });
@@ -794,6 +845,61 @@ function merchantFixture(shared = false) {
   return { first, second, db, service, options, a, b, user, manager, root, userB, managerB, merchantA, merchantB, clients, resolveMerchant, resolvePaymentForOrder, configure, configureB, create, createB, providerSuccess };
 }
 
+describe('device identifier ownership', () => {
+  const uuid = '12345678-1234-4123-8123-abcdefabcdef';
+  const sn = '0000000000000007';
+
+  it('looks up canonical UUID variants and preserves exact historical SN alias owners', async () => {
+    const f = fixture();
+    await f.db.execute('UPDATE ar_device SET uuid=? WHERE id=7', [uuid]);
+    expect((await f.service.context(f.user, uuid.toUpperCase())).device.id).toBe(7);
+    expect(await f.service.devices(f.manager, { venueId: 1, search: uuid.toUpperCase() })).toMatchObject({ total: 1, items: [{ device: { id: 7 } }] });
+    await f.db.execute('UPDATE ar_device SET uuid=NULL,sn=? WHERE id=8', [uuid.toUpperCase()]);
+    expect((await f.service.context(f.user, uuid)).device.id).toBe(7);
+    expect((await f.service.context(f.user, uuid.toUpperCase())).device.id).toBe(8);
+    await expect(f.service.createDevice(f.manager, { uuid: uuid.toUpperCase(), venueId: 1 })).resolves.toMatchObject({ created: false, device: { id: 7 } });
+    expect(await f.service.updateDevice(f.manager, 7, { uuid: uuid.toUpperCase() })).toMatchObject({ requiresNewQr: false });
+  });
+
+  it('blocks reuse and fallthrough after editing a UUID or SN', async () => {
+    const f = fixture();
+    await f.db.execute('UPDATE ar_device SET uuid=?,sn=? WHERE id=7', [uuid, sn]);
+    await f.db.execute('UPDATE ar_device SET sn=? WHERE id=8', [uuid]);
+    await f.service.updateDevice(f.manager, 7, { uuid: testUuid(9), sn: '0000000000000009' });
+    expect(await f.service.context(f.manager, uuid)).toMatchObject({ state: 'UNREGISTERED', actions: { canCreate: false } });
+    expect((await f.service.context(f.user, uuid, 'sn')).device.id).toBe(8);
+    expect(await f.service.context(f.manager, sn, 'sn')).toMatchObject({ state: 'UNREGISTERED', actions: { canCreate: false } });
+    await expect(f.service.createDevice(f.manager, { uuid: uuid.toUpperCase(), venueId: 1 })).rejects.toMatchObject({ status: 409 });
+    await expect(f.service.updateDevice(f.manager, 8, { sn })).rejects.toMatchObject({ status: 409 });
+    expect((await f.service.updateDevice(f.manager, 7, { uuid, sn })).device).toMatchObject({ registeredUuid: uuid, sn });
+  });
+
+  it('protects canonical-looking historical SN links before and after the SN is edited', async () => {
+    const f = fixture();
+    await f.db.execute('UPDATE ar_device SET uuid=NULL,sn=? WHERE id=7', [uuid.toUpperCase()]);
+    expect((await f.service.context(f.user, uuid.toUpperCase())).device.id).toBe(7);
+    const register = () => f.service.createDevice(f.manager, { uuid, venueId: 1 });
+    await expect(register()).rejects.toMatchObject({ status: 409 });
+    await f.service.updateDevice(f.manager, 7, { sn });
+    await expect(register()).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('retains both archived identifiers on partial re-registration and refuses a conflicting pair', async () => {
+    const f = fixture();
+    const previousSn = '0000000000000006';
+    await f.db.execute('UPDATE ar_device SET uuid=?,sn=? WHERE id=7', [uuid, previousSn]);
+    await f.service.updateDevice(f.manager, 7, { sn });
+    await f.service.deleteDevice(f.manager, 7);
+    await expect(f.service.createDevice(f.manager, { uuid, sn: '0000000000000008', venueId: 1 })).rejects.toMatchObject({ status: 409 });
+    const replacement = await f.service.createDevice(f.manager, { uuid, venueId: 1 });
+    expect(replacement).toMatchObject({ created: true, device: { registeredUuid: uuid, sn } });
+    expect(replacement.device.id).not.toBe(7);
+    expect((await f.service.context(f.user, sn, 'sn')).device.id).toBe(replacement.device.id);
+    await expect(f.service.createDevice(f.manager, { sn: previousSn, venueId: 1 })).rejects.toMatchObject({ status: 409 });
+    expect((await f.service.updateDevice(f.manager, replacement.device.id, { sn: previousSn })).device.sn).toBe(previousSn);
+  });
+});
+
 describe('admin device QR generation', () => {
   it.each(['manager', 'adminer', 'root'] as const)('allows current %s permissions without changing device or rental state', async role => {
     const f = fixture();
@@ -825,6 +931,37 @@ describe('admin device QR generation', () => {
     await expect(route.handler({ params: { id: '7' }, res: { setHeader } } as any)).rejects.toMatchObject({ status: 401 });
     await expect(f.service.deviceQrcode(f.manager, '7 OR 1=1')).rejects.toMatchObject({ status: 422 });
     await expect(f.service.deviceQrcode(f.manager, 999)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('prefers the registered UUID and prints an explicit SN for a device without one', async () => {
+    const f = fixture(); const router = new ApiRouter();
+    registerRentals(router, f.services, { ...f.options, authenticate: async () => f.manager });
+    const route = router.routes.find(route => route.path === '/v2/rental/admin/devices/:id/qrcode')!;
+    const print = () => route.handler({ params: { id: '7' }, query: { format: 'typed' }, res: { setHeader() {} } } as Context);
+    const uuid = testUuid(7), sn = '0000000000000007';
+    await f.db.execute('UPDATE ar_device SET uuid=?,sn=? WHERE id=7', [uuid, sn]);
+    expect(await print()).toMatchObject({ device: { registeredUuid: uuid, sn }, url: `https://d.4mr.cn/d?i=${uuid}&t=rokid` });
+
+    await f.db.execute('UPDATE ar_device SET uuid=NULL WHERE id=7');
+    const olderAdmin = () => route.handler({ params: { id: '7' }, query: {}, res: { setHeader() {} } } as Context);
+    expect(await olderAdmin()).toMatchObject({ url: `https://d.4mr.cn/d?i=${sn}&t=rokid` });
+    await f.db.execute('UPDATE ar_device SET uuid=? WHERE id=8', [sn]);
+    expect(await print()).toMatchObject({ device: { registeredUuid: null, sn }, url: `https://d.4mr.cn/d?s=${sn}&t=rokid` });
+    await expect(olderAdmin()).rejects.toMatchObject({ status: 409 });
+    expect((await f.service.context(f.user, sn, 'sn')).device.id).toBe(7);
+    expect((await f.service.context(f.user, sn)).device.id).toBe(8);
+  });
+
+  it('requires a new QR when its selected parameter or type changes', async () => {
+    const f = fixture();
+    const sn = '0000000000000007';
+    // Some historical UUIDs retained their original value in both columns.
+    await f.db.execute('UPDATE ar_device SET uuid=?,sn=? WHERE id=7', [sn, sn]);
+    const update = (input: Row) => f.service.updateDevice(f.manager, 7, input);
+    expect(await update({ sn: '0000000000000006' })).toMatchObject({ requiresNewQr: false });
+    expect(await update({ sn })).toMatchObject({ requiresNewQr: false });
+    expect(await update({ uuid: null })).toMatchObject({ requiresNewQr: true });
+    expect(await update({ type: 'rs2' })).toMatchObject({ requiresNewQr: true });
   });
 
   it.each([false, true])('keeps selected-merchant scope for independent/shared entries (shared=%s)', async shared => {
@@ -951,6 +1088,48 @@ describe('shared mini-program merchant rentals', () => {
     await f.a(() => f.service.syncRefund(f.managerB, old.id));
     expect(await f.a(() => f.service.context(f.user, 'second-device'))).toMatchObject({ merchant: { id: 1 }, state: 'RENTED', rental: { id: next.id }, relation: 'mine' });
     expect(replacement.payment.payment).not.toHaveBeenCalled();
+  });
+});
+
+describe('order-bound device context', () => {
+  it('reads the authorized order device ID even when the old SN would resolve as another UUID', async () => {
+    const f = fixture();
+    const sn = '0000000000000007';
+    await f.db.execute('UPDATE ar_device SET uuid=NULL,sn=? WHERE id=7', [sn]);
+    await f.db.execute('UPDATE ar_device SET uuid=? WHERE id=8', [sn]);
+    await f.configure();
+    const { rental } = await f.create();
+    expect(rental).toMatchObject({ deviceId: 7, uuid: sn });
+    expect((await f.service.context(f.user, sn)).device.id).toBe(8);
+
+    let principal = f.user;
+    const router = new ApiRouter();
+    registerRentals(router, f.services, { ...f.options, authenticate: async () => principal });
+    const route = router.routes.find(route => route.method === 'GET' && route.path === '/v2/rentals/:id/device-context')!;
+    const open = () => route.handler({ params: { id: String(rental.id) }, query: { deviceId: '8' }, res: { setHeader() {} } } as Context);
+    expect(await open()).toMatchObject({ device: { id: 7, sn }, rental: { id: rental.id }, relation: 'mine' });
+    principal = f.other;
+    await expect(open()).rejects.toMatchObject({ status: 403 });
+
+    await f.service.cancel(f.user, rental.id);
+    const updatedSn = '0000000000000006';
+    await f.service.updateDevice(f.manager, 7, { sn: updatedSn });
+    principal = f.manager;
+    expect(await open()).toMatchObject({ device: { id: 7, sn: updatedSn } });
+    await f.service.deleteDevice(f.manager, 7);
+    expect(await open()).toMatchObject({ device: null, deviceUnavailable: true, actions: { canCreate: false, canRent: false } });
+  });
+
+  it('does not expose another merchant’s current device through an order made before transfer', async () => {
+    const f = merchantFixture(true);
+    await f.configure();
+    const { rental } = await f.create();
+    expect(await f.a(() => f.service.orderDeviceContext(f.user, rental.id))).toMatchObject({ device: { id: 7 } });
+    await f.a(() => f.service.cancel(f.user, rental.id));
+    await f.db.execute('UPDATE ar_device SET merchant_id=2,venue_id=2 WHERE id=7');
+    expect(await f.a(() => f.service.orderDeviceContext(f.manager, rental.id))).toMatchObject({
+      device: null, deviceUnavailable: true, actions: { canCreate: false, canConfigure: false },
+    });
   });
 });
 

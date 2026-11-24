@@ -37,3 +37,10 @@ export async function backfillDeviceSerialNumbers(db: Database, sql: string): Pr
     WHERE ${legacyUuid} LIMIT 1 FOR UPDATE`, [canonicalUuid]);
   if (remaining) throw new Error('Device SN backfill left legacy identifiers in the UUID column.');
 }
+
+export async function checkNormalizedDeviceUuids(db: Database): Promise<void> {
+  const collision = await db.one(`SELECT LOWER(uuid) AS normalized FROM ar_device
+    WHERE CHAR_LENGTH(uuid)=36 AND IS_UUID(uuid)
+    GROUP BY LOWER(uuid) HAVING COUNT(*)>1 LIMIT 1`);
+  if (collision) throw new Error('Device UUIDs differ only by case. Resolve the conflicting registrations before migrating.');
+}

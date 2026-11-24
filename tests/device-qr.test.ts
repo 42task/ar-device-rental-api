@@ -25,6 +25,16 @@ describe('printable device QR contract', () => {
     expect(result.url).toBe('https://d.4mr.cn/d?i=12345');
   });
 
+  it.each(['0000000000000007', 'legacy%2F+中文/01?&='])('uses a dedicated SN parameter for %s', sn => {
+    const result = deviceQr(sn, 'Rokid Studio2', 'https://independent.example', 'sn');
+    expect(result.url).toBe(`https://independent.example/d?s=${encodeURIComponent(sn)}&t=rs2`);
+    if (miniprogramQr) {
+      const { url } = deviceQr(sn, 'Rokid Studio2', undefined, 'sn');
+      expect(miniprogramQr.parse(url)).toEqual({ sn, type: 'rs2' });
+      expect(miniprogramQr.entry({ q: encodeURIComponent(url) })).toEqual({ sn, type: 'rs2' });
+    }
+  });
+
   it.skipIf(!miniprogramQr)('opens every generated model and historical hint with the adjacent mini-program parser', () => {
     for (const [type, code] of modelCases) {
       const result = deviceQr('camera%2F+中文/01?&=', type);
@@ -41,8 +51,9 @@ describe('printable device QR contract', () => {
     }
   });
 
-  it.each(['', 'with space', 'control\u0000', '\ud800', 'a'.repeat(256), '😀'.repeat(255)])('reports invalid or over-capacity UUIDs %j without changing identity', uuid => {
-    expect(() => deviceQr(uuid, 'rs2')).toThrow(expect.objectContaining({ status: 422 }));
+  it.each(['', 'with space', 'control\u0000', '\ud800', 'a'.repeat(256), '😀'.repeat(255)])('rejects invalid or over-capacity identifiers %j', value => {
+    expect(() => deviceQr(value, 'rs2')).toThrow(expect.objectContaining({ status: 422 }));
+    expect(() => deviceQr(value, 'rs2', undefined, 'sn')).toThrow(expect.objectContaining({ status: 422 }));
   });
 
   it('serializes a row-major QR matrix with finder patterns, timing and Q error correction', () => {
