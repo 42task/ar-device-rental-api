@@ -58,7 +58,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
     await withTestDatabase(async db => {
       await migrate(db);
       await db.execute('ALTER TABLE ar_device DROP COLUMN remark_name');
-      await db.execute('DELETE FROM ar_schema_migration WHERE version=17');
+      await db.execute('DELETE FROM ar_schema_migration WHERE version>=17');
       await db.execute('UPDATE ar_schema_meta SET version=16 WHERE name=?', ['ar-device-rental-api']);
 
       const venue = await seedVenue(db);
@@ -69,7 +69,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       }
 
       await migrate(db);
-      expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: 17 });
+      expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: SCHEMA_VERSION });
       expect(await db.one('SELECT uuid,name,venue_id,remark_name FROM ar_device')).toEqual({ ...previous, remark_name: '' });
       const applied = await db.one('SELECT checksum,applied_ms FROM ar_schema_migration WHERE version=17');
       expect(applied?.checksum).toMatch(/^[a-f0-9]{64}$/);
@@ -78,6 +78,35 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL device registra
       await migrate(db);
       expect(await db.one('SELECT uuid,name,venue_id,remark_name FROM ar_device')).toEqual({ ...previous, remark_name: '一楼备用机' });
       expect(await db.one('SELECT checksum,applied_ms FROM ar_schema_migration WHERE version=17')).toEqual(applied);
+    });
+  });
+
+  it.each([false, true])('adds an optional SN to schema 17 (column already added: %s)', async columnAlreadyAdded => {
+    await withTestDatabase(async db => {
+      await migrate(db);
+      await db.execute('ALTER TABLE ar_device DROP COLUMN sn');
+      await db.execute('DELETE FROM ar_schema_migration WHERE version=18');
+      await db.execute('UPDATE ar_schema_meta SET version=17 WHERE name=?', ['ar-device-rental-api']);
+
+      const venue = await seedVenue(db);
+      const previous = { uuid: 'legacy-without-sn', name: '原设备名称', venue_id: venue.id };
+      await db.insert('ar_device', previous);
+      const sn = '000AbC123';
+      if (columnAlreadyAdded) {
+        await db.execute(await readFile(resolve('database/018-device-sn.sql'), 'utf8'));
+        await db.execute('UPDATE ar_device SET sn=? WHERE uuid=?', [sn, previous.uuid]);
+      }
+
+      await migrate(db);
+      expect(await db.one('SELECT version FROM ar_schema_meta')).toEqual({ version: SCHEMA_VERSION });
+      expect(await db.one('SELECT uuid,name,venue_id,sn FROM ar_device')).toEqual({ ...previous, sn: columnAlreadyAdded ? sn : null });
+      const applied = await db.one('SELECT checksum,applied_ms FROM ar_schema_migration WHERE version=18');
+      expect(applied?.checksum).toMatch(/^[a-f0-9]{64}$/);
+
+      await db.execute('UPDATE ar_device SET sn=? WHERE uuid=?', [sn, previous.uuid]);
+      await migrate(db);
+      expect(await db.one('SELECT uuid,name,venue_id,sn FROM ar_device')).toEqual({ ...previous, sn });
+      expect(await db.one('SELECT checksum,applied_ms FROM ar_schema_migration WHERE version=18')).toEqual(applied);
     });
   });
 
