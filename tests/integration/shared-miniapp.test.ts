@@ -274,14 +274,17 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect((await f.http('get', '/api/v2/rental/admin/overview', f.rootToken, 1)).body.devices.total).toBe(0);
     expect((await f.http('get', '/api/v2/rental/admin/devices', f.rootToken, 1).query({ search: crossColumn })).body.total).toBe(0);
     expect((await f.http('get', `/api/v2/rental/admin/devices/${uuidOwner.id}/qrcode`, f.rootToken, 1)).status).toBe(404);
-    expect((await f.http('post', '/api/v2/rental/devices', f.rootToken, 1).send({ uuid: crossColumn, venueId: sharedVenue.id })).status).toBe(409);
 
     // A removed UUID keeps its precedence so the old QR cannot open the other merchant's device.
     expect((await f.http('get', deviceContext, f.rootToken, 1).query({ uuid: crossColumn })).body)
-      .toMatchObject({ device: null, state: 'UNREGISTERED', actions: { canCreate: false, canDelete: false } });
+      .toMatchObject({ device: null, state: 'UNREGISTERED', actions: { canCreate: true, canDelete: false } });
     expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ sn: crossColumn })).body)
       .toMatchObject({ device: shadowedDevice });
     expect((await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test')).status).toBe(409);
+    const restored = await f.http('post', '/api/v2/rental/devices', f.rootToken, 1).send({ uuid: crossColumn, venueId: sharedVenue.id });
+    expect(restored.status).toBe(200);
+    expect(restored.body).toMatchObject({ created: true, device: { registeredUuid: crossColumn } });
+    expect(restored.body.device.id).not.toBe(uuidOwner.id);
   }), 30_000);
 
   it('lets root assign and revoke a shared-application employee without employee confirmation', async () => withFixture(async f => {

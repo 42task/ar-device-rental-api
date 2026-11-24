@@ -1,10 +1,12 @@
 import type { Row } from '../core/contracts';
 import type { Database } from '../core/database';
 import { ApiError } from '../core/errors';
+import { deviceIdentifierKey, isDeviceUuid, retiredDeviceIdentifier, type DeviceIdentifierKind } from '../devices/identifiers';
 import { quoteForDevice } from './quotes';
 
 export interface DevicePageQuery { merchantId?: number; venueId?: number; allMerchants?: boolean; search: string; page: number; pageSize: number }
 export interface DeviceSummaryRows { device: Row; venue: Row; pricing: Row; state: string; canDelete: boolean }
+
 const unsettledRentalStatus = `(status IN ('PENDING_PAYMENT','ACTIVE')
   OR ((status='COMPENSATING' OR refund_amount_cents>0) AND (refund_status IS NULL OR refund_status<>'SUCCESS')))`;
 
@@ -12,11 +14,30 @@ export async function hasUnsettledDeviceOrders(db: Database, deviceId: number): 
   return !!await db.one(`SELECT id FROM ar_rental_order WHERE device_id=? AND ${unsettledRentalStatus} LIMIT 1`, [deviceId]);
 }
 
-/** A UUID claim, including a removed device's claim, takes precedence over an SN alias. */
-export const legacyUuidConflictColumn = `EXISTS (
-  SELECT 1 FROM ar_device uuid_owner WHERE d.uuid IS NULL AND uuid_owner.uuid=d.sn
-) AS legacy_uuid_conflict`;
+export const legacyUuidConflictColumn = `(d.uuid IS NULL AND (EXISTS (
+  SELECT 1 FROM ar_device uuid_owner
+  WHERE uuid_owner.current_uuid IN (d.sn,LOWER(d.sn)) AND uuid_owner.uuid=d.sn
+) OR EXISTS (
+  SELECT 1 FROM ar_device_retired_identifier retired
+  WHERE retired.kind='uuid' AND retired.identifier IN (d.sn,LOWER(d.sn)) AND retired.original_identifier=d.sn
+))) AS legacy_uuid_conflict`;
 
+export async function findDeviceRegistration(db: Database, identifier: string, kind: DeviceIdentifierKind): Promise<{ registration: Row | null; retired: boolean }> {
+  const key = deviceIdentifierKey(identifier, kind);
+  const byUuid = kind === 'uuid' ? await db.one('SELECT * FROM ar_device WHERE current_uuid=?', [key]) : null;
+  if (byUuid?.uuid === identifier) return { registration: byUuid, retired: false };
+  const retiredUuid = kind === 'uuid' ? await retiredDeviceIdentifier(db, 'uuid', key) : null;
+  if (retiredUuid?.original_identifier === identifier && Number(retiredUuid.device_id) !== Number(byUuid?.id)) {
+    return { registration: null, retired: true };
+  }
+  // An exact historical SN alias keeps its original target when a UUID
+  // becomes newly equivalent after case normalization.
+  const bySn = await db.one(`SELECT d.*,${legacyUuidConflictColumn} FROM ar_device d WHERE d.current_sn=?`, [identifier]);
+  if (bySn) return { registration: bySn, retired: false };
+  const retiredSn = await retiredDeviceIdentifier(db, 'sn', identifier);
+  if (retiredSn || (retiredUuid && !byUuid)) return { registration: null, retired: true };
+  return { registration: byUuid, retired: false };
+}
 /** A management read model: one count plus one joined page, regardless of the
  * number of devices. Authorization belongs to the caller, mutations never do.
  */
@@ -27,10 +48,15 @@ export async function readDevicePage(db: Database, query: DevicePageQuery): Prom
   const scoped = merchantId !== undefined;
   if (allMerchants && (scoped || venueId !== undefined)) throw new ApiError(503, '设备查询范围冲突');
   const ownership = scoped || allMerchants;
-  const predicates = ['d.deleted_ms IS NULL', ...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : []), ...(search ? ["(d.uuid LIKE ? ESCAPE '=' OR d.sn LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=' OR d.remark_name LIKE ? ESCAPE '=')"] : [])];
+  const predicates = ['d.deleted_ms IS NULL', ...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : [])];
+  const uuidKey = isDeviceUuid(search) ? deviceIdentifierKey(search, 'uuid') : null;
+  if (search) {
+    const exactUuidMatch = uuidKey === null ? '' : ' OR d.current_uuid=?';
+    predicates.push(`(d.uuid LIKE ? ESCAPE '=' OR d.sn LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=' OR d.remark_name LIKE ? ESCAPE '='${exactUuidMatch})`);
+  }
   const pattern = '%' + search.replace(/[=%_]/g, '=$&') + '%';
   const where = ' WHERE ' + predicates.join(' AND ');
-  const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern, pattern, pattern] : [])];
+  const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern, pattern, pattern] : []), ...(uuidKey === null ? [] : [uuidKey])];
   const [count, rows] = await Promise.all([
     db.one('SELECT COUNT(*) AS total FROM ar_device d' + where, values),
     db.query(`SELECT d.*,${legacyUuidConflictColumn},${allMerchants ? 'm.id AS merchant_record_id,m.name AS merchant_name,' : ''}v.id AS venue_record_id,v.merchant_id AS venue_merchant_id,v.name AS venue_name,

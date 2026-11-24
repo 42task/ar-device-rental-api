@@ -5,10 +5,9 @@ import { requireManager } from '../core/roles';
 import { DEFAULT_DEVICE_TYPE, resolveDeviceType } from './types';
 import { currentMerchant } from '../merchants/context';
 import { loadAccountPermissions, requireMerchantManagementScope } from '../auth/identity';
+import { assertDeviceIdentifierAvailable, deviceIdentifierKey, isDeviceUuid, retiredDeviceIdentifier } from './identifiers';
 
 export { DEFAULT_DEVICE_TYPE } from './types';
-
-const canonicalUuid = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
 
 function deviceIdentifier(value: unknown, message: string): string {
   if (typeof value !== 'string' || !/^\S{1,255}$/u.test(value) || /[\x00-\x1f\x7f]/.test(value)) throw new ApiError(422, message);
@@ -21,7 +20,7 @@ export function deviceUuid(value: unknown): string {
 
 export function registeredDeviceUuid(value: unknown): string {
   const uuid = deviceUuid(value);
-  if (!canonicalUuid.test(uuid)) throw new ApiError(422, '设备 UUID 格式无效');
+  if (!isDeviceUuid(uuid)) throw new ApiError(422, '设备 UUID 格式无效');
   return uuid;
 }
 
@@ -82,69 +81,74 @@ export class DeviceService {
     if (!Number.isSafeInteger(ownerId) || ownerId < 1) throw new ApiError(422, '设备必须绑定有效商户');
     const checkOwnership = (row: Row): void => {
       if (merchant && Number(row.merchant_id) !== merchant.id) throw new ApiError(409, '设备属于其他商户，请使用对应小程序', 'MERCHANT_MISMATCH');
-      if (row.deleted_ms != null) throw new ApiError(409, '该 UUID 或 SN 属于已删除设备，无法重新登记');
     };
     const suppliedUuid = input.uuid == null ? null : deviceUuid(input.uuid);
     const suppliedSn = input.sn == null ? null : registeredDeviceSn(input.sn);
     const identifier = suppliedUuid ?? suppliedSn;
     if (identifier === null) throw new ApiError(422, '请提供设备 UUID 或 SN');
-    const uuid = suppliedUuid !== null && canonicalUuid.test(suppliedUuid) ? suppliedUuid : null;
-    if (suppliedUuid !== null && uuid === null && suppliedSn !== null) throw new ApiError(422, '设备 UUID 格式无效');
-    const sn = suppliedSn ?? (uuid === null ? suppliedUuid : null);
+    const uuid = suppliedUuid !== null && isDeviceUuid(suppliedUuid) ? suppliedUuid : null;
     const legacy = suppliedUuid !== null && uuid === null;
+    if (legacy && suppliedSn !== null) throw new ApiError(422, '设备 UUID 格式无效');
+    const sn = suppliedSn ?? (legacy ? suppliedUuid : null);
     const findRegistration = async (db: Database): Promise<Row | null> => {
-      const byUuid = suppliedUuid === null ? null : await db.one('SELECT * FROM ar_device WHERE uuid=?', [suppliedUuid]);
+      const byUuid = suppliedUuid === null ? null : await db.one('SELECT * FROM ar_device WHERE current_uuid=? FOR UPDATE', [deviceIdentifierKey(suppliedUuid, 'uuid')]);
       if (legacy && byUuid) return byUuid;
-      const bySn = sn === null ? null : await db.one('SELECT * FROM ar_device WHERE sn=?', [sn]);
-      if (uuid !== null && sn !== null) {
-        const existing = byUuid ?? bySn;
-        if (existing && (existing.uuid !== uuid || existing.sn !== sn)) throw new ApiError(409, 'UUID 或 SN 已被登记');
+      const bySn = sn === null ? null : await db.one('SELECT * FROM ar_device WHERE current_sn=? FOR UPDATE', [sn]);
+      const existing = byUuid ?? bySn;
+      if (uuid !== null && sn !== null && existing && (deviceIdentifierKey(existing.uuid ?? '', 'uuid') !== deviceIdentifierKey(uuid, 'uuid') || existing.sn !== sn)) {
+        throw new ApiError(409, 'UUID 或 SN 已被登记');
       }
-      return byUuid ?? bySn;
+      return existing;
     };
     const device_type = deviceType(input.type ?? input.device_type);
     const name = deviceName(input.name, identifier);
     const remark_name = input.remarkName === undefined ? undefined : deviceRemarkName(input.remarkName);
     const venueId = Number(input.venueId);
     if (!Number.isSafeInteger(venueId) || venueId < 1) throw new ApiError(422, '请选择设备所属场地');
-    let result: { row: Row; created: boolean };
-    try {
-      result = await this.services.db.transaction(async db => {
-        const account = merchant
-          ? await db.one('SELECT id,role,merchant_id,auth_version FROM ar_user WHERE id=? FOR UPDATE', [user.id])
-          : await db.one('SELECT id,role FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [user.id, user.appid ?? '']);
-        const currentUser = account ? await loadAccountPermissions(db, account) : null;
-        if (!currentUser) throw new ApiError(403, '设备管理权限已变更，请重新登录');
-        requireManager(currentUser);
-        if (merchant && (Number(currentUser.auth_version) !== Number(user.auth_version)
-          || currentUser.role !== 'root' && Number(currentUser.merchant_id) !== merchant.id)) throw new ApiError(403, '设备管理权限已变更，请重新登录');
-        const venue = await db.one('SELECT * FROM ar_venue WHERE id=? AND merchant_id=? FOR UPDATE', [venueId, ownerId]);
-        if (!venue || venue.status !== 'active') throw new ApiError(422, '请选择本商户已启用的场地');
-        const existing = await findRegistration(db);
-        if (existing) {
-          checkOwnership(existing);
-          if (Number(existing.venue_id) !== venueId) throw new ApiError(409, '设备已绑定其他场地，请通过设备设置调整');
-          return { row: { ...existing, venue_name: venue.name }, created: false };
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result: { row: Row; created: boolean } = await this.services.db.transaction(async db => {
+          // Deletion keeps registered identifiers claimed. Lock the record before the actor
+          // and venue so ownership remains authoritative during re-registration.
+          const existing = await findRegistration(db);
+          const account = merchant
+            ? await db.one('SELECT id,role,merchant_id,auth_version FROM ar_user WHERE id=? FOR UPDATE', [user.id])
+            : await db.one('SELECT id,role FROM ar_user WHERE id=? AND appid=? FOR UPDATE', [user.id, user.appid ?? '']);
+          const currentUser = account ? await loadAccountPermissions(db, account) : null;
+          if (!currentUser) throw new ApiError(403, '设备管理权限已变更，请重新登录');
+          requireManager(currentUser);
+          if (merchant && (Number(currentUser.auth_version) !== Number(user.auth_version)
+            || currentUser.role !== 'root' && Number(currentUser.merchant_id) !== merchant.id)) throw new ApiError(403, '设备管理权限已变更，请重新登录');
+          const venue = await db.one('SELECT * FROM ar_venue WHERE id=? AND merchant_id=? FOR UPDATE', [venueId, ownerId]);
+          if (!venue || venue.status !== 'active') throw new ApiError(422, '请选择本商户已启用的场地');
+          if (existing && (existing.deleted_ms == null || currentUser.role !== 'root')) checkOwnership(existing);
+          if (existing && existing.deleted_ms == null) {
+            if (Number(existing.venue_id) !== venueId) throw new ApiError(409, '设备已绑定其他场地，请通过设备设置调整');
+            return { row: { ...existing, venue_name: venue.name }, created: false };
+          }
+          if (legacy) registeredDeviceSn(suppliedUuid);
+          if (existing) await db.execute('UPDATE ar_device SET superseded=1 WHERE id=?', [existing.id]);
+          else {
+            if (uuid !== null) await assertDeviceIdentifierAvailable(db, 'uuid', uuid);
+            if (sn !== null) await assertDeviceIdentifierAvailable(db, 'sn', sn);
+          }
+          const row = await db.insert('ar_device', { uuid: existing ? existing.uuid : uuid, sn: existing ? existing.sn : sn,
+            name, remark_name, device_type, merchant_id: ownerId, venue_id: venueId });
+          if (existing) await db.execute('UPDATE ar_device_retired_identifier SET device_id=? WHERE device_id=?', [row.id, existing.id]);
+          return { row: { ...row, venue_name: venue.name }, created: true };
+        });
+        // No rental configuration is written here, so new devices remain disabled.
+        if (result.row.uuid == null && result.row.sn != null) {
+          const key = deviceIdentifierKey(result.row.sn, 'uuid');
+          const owner = await this.services.db.one('SELECT id FROM ar_device WHERE current_uuid=? AND uuid=?', [key, result.row.sn]);
+          const retired = owner ? null : await retiredDeviceIdentifier(this.services.db, 'uuid', key);
+          result.row.legacy_uuid_conflict = owner || retired?.original_identifier === result.row.sn ? 1 : 0;
         }
-        if (legacy) registeredDeviceSn(suppliedUuid);
-        return { row: { ...await db.insert('ar_device', { uuid, sn, name, remark_name, device_type, merchant_id: ownerId, venue_id: venueId }), venue_name: venue.name }, created: true };
-      });
-    } catch (error: any) {
-      // The UUID and SN unique indexes resolve concurrent confirmations.
-      if (error?.code !== 'ER_DUP_ENTRY') throw error;
-      const existing = await findRegistration(this.services.db);
-      if (!existing) throw error;
-      checkOwnership(existing);
-      if (Number(existing.venue_id) !== venueId) throw new ApiError(409, '设备已绑定其他场地，请通过设备设置调整');
-      const venue = await this.services.db.one('SELECT name FROM ar_venue WHERE id=? AND merchant_id=?', [venueId, ownerId]);
-      result = { row: { ...existing, venue_name: venue?.name }, created: false };
+        return { device: DeviceService.display(result.row, true), created: result.created };
+      } catch (error: any) {
+        if (!['ER_DUP_ENTRY', 'ER_LOCK_DEADLOCK'].includes(error?.code)) throw error;
+        if (attempt === 2) throw new ApiError(409, '设备登记状态已变化，请刷新后重试');
+      }
     }
-    // No rental configuration is written here, so new devices remain disabled.
-    const row = result.row;
-    if (row.uuid == null && row.sn != null) {
-      const owner = await this.services.db.one('SELECT id FROM ar_device WHERE uuid=?', [row.sn]);
-      row.legacy_uuid_conflict = owner ? 1 : 0;
-    }
-    return { device: DeviceService.display(row, true), created: result.created };
   }
 }
