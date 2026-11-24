@@ -20,11 +20,11 @@ class DeviceDb {
       INSERT INTO ar_merchant_membership VALUES(2,1,'manager','active',1),(3,2,'adminer','active',1);
       CREATE TABLE ar_venue(id INTEGER PRIMARY KEY,merchant_id INTEGER,name TEXT,address TEXT,description TEXT,status TEXT,use_fee_cents INTEGER,deposit_cents INTEGER,version INTEGER,contact_phone TEXT);
       INSERT INTO ar_venue VALUES(101,1,'默认场地','','','active',2000,8000,1,'private-contact'),(202,2,'测试场地','','','active',300,1000,1,'private-contact');
-      CREATE TABLE ar_device(id INTEGER PRIMARY KEY,uuid TEXT,sn TEXT,name TEXT,device_type TEXT,merchant_id INTEGER,venue_id INTEGER,remark_name TEXT DEFAULT '');
+      CREATE TABLE ar_device(id INTEGER PRIMARY KEY,uuid TEXT,sn TEXT,name TEXT,device_type TEXT,merchant_id INTEGER,venue_id INTEGER,remark_name TEXT DEFAULT '',deleted_ms INTEGER);
       INSERT INTO ar_device(id,uuid,name,device_type,merchant_id,venue_id) VALUES(11,'global-1','设备Alpha %_','Rokid Studio2',1,101),(12,'global-2','设备Beta %_','Rokid Studio2',2,202),(13,'global-3','第三台设备','Rokid Studio3',1,101);
       CREATE TABLE ar_rental_config(device_id INTEGER PRIMARY KEY,merchant_id INTEGER,enabled INTEGER,version INTEGER);
       INSERT INTO ar_rental_config VALUES(11,1,1,1),(12,2,1,1),(13,1,0,1);
-      CREATE TABLE ar_rental_order(id INTEGER PRIMARY KEY,device_id INTEGER,merchant_id INTEGER);
+      CREATE TABLE ar_rental_order(id INTEGER PRIMARY KEY,device_id INTEGER,merchant_id INTEGER,status TEXT,refund_amount_cents INTEGER,refund_status TEXT);
       CREATE TABLE ar_rental_slot(device_id INTEGER PRIMARY KEY,rental_id INTEGER,merchant_id INTEGER,state TEXT);
     `);
   }
@@ -164,10 +164,10 @@ describe('explicit root device listing across merchants', () => {
     ['missing merchant', 'DELETE FROM ar_merchant WHERE id=2'],
     ['foreign venue', 'UPDATE ar_device SET venue_id=101 WHERE id=12'],
     ['foreign configuration', 'UPDATE ar_rental_config SET merchant_id=1 WHERE device_id=12'],
-    ['foreign slot', "INSERT INTO ar_rental_order VALUES(100,12,2); INSERT INTO ar_rental_slot VALUES(12,100,1,'RENTED')"],
-    ['foreign rental', "INSERT INTO ar_rental_order VALUES(100,12,1); INSERT INTO ar_rental_slot VALUES(12,100,2,'RENTED')"],
+    ['foreign slot', "INSERT INTO ar_rental_order (id,device_id,merchant_id) VALUES(100,12,2); INSERT INTO ar_rental_slot VALUES(12,100,1,'RENTED')"],
+    ['foreign rental', "INSERT INTO ar_rental_order (id,device_id,merchant_id) VALUES(100,12,1); INSERT INTO ar_rental_slot VALUES(12,100,2,'RENTED')"],
     ['missing rental', "INSERT INTO ar_rental_slot VALUES(12,100,2,'RENTED')"],
-    ['another device rental', "INSERT INTO ar_rental_order VALUES(100,11,2); INSERT INTO ar_rental_slot VALUES(12,100,2,'RENTED')"],
+    ['another device rental', "INSERT INTO ar_rental_order (id,device_id,merchant_id) VALUES(100,11,2); INSERT INTO ar_rental_slot VALUES(12,100,2,'RENTED')"],
   ])('fails closed on a %s relationship in the global page', async (_label, corrupt) => {
     const f = fixture();
     f.db.sqlite.exec(corrupt);
@@ -176,10 +176,10 @@ describe('explicit root device listing across merchants', () => {
 
   it('reads a valid occupied device without disclosing its rental or mutating its slot', async () => {
     const f = fixture();
-    f.db.sqlite.exec("INSERT INTO ar_rental_order VALUES(100,12,2); INSERT INTO ar_rental_slot VALUES(12,100,2,'SETTLING')");
+    f.db.sqlite.exec("INSERT INTO ar_rental_order (id,device_id,merchant_id) VALUES(100,12,2); INSERT INTO ar_rental_slot VALUES(12,100,2,'SETTLING')");
     const execute = vi.spyOn(f.db, 'execute');
     expect(await f.scoped(1, () => f.service.devices(f.root, { scope: 'all', search: 'global-2' })))
-      .toMatchObject({ total: 1, items: [{ device: { id: 12, merchantName: '测试商户' }, state: 'SETTLING' }] });
+      .toMatchObject({ total: 1, items: [{ device: { id: 12, merchantName: '测试商户' }, state: 'SETTLING', actions: { canDelete: false } }] });
     expect(execute).not.toHaveBeenCalled();
     expect((await f.db.one('SELECT state FROM ar_rental_slot WHERE device_id=12'))!.state).toBe('SETTLING');
   });

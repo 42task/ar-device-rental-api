@@ -6,7 +6,7 @@ import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
 import { archiveDevicePricing, backfillDeviceSerialNumbers } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
@@ -188,6 +188,8 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
           alreadyApplied: async (db: Database) => !!await db.one(
             "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='ar_device' AND CONSTRAINT_NAME='chk_ar_device_identifier_present' AND CONSTRAINT_TYPE='CHECK' AND ENFORCED='YES'") },
         { version: 20, filename: '020-device-sn-backfill.sql', runInTransaction: backfillDeviceSerialNumbers },
+        { version: 21, filename: '021-device-deletion.sql', run: async (_db: Database) => {},
+          alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='deleted_ms'") },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');

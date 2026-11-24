@@ -17,7 +17,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
     try {
       await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4`); created = true;
       db = new Database(mysql.createPool({ ...settings, database, connectionLimit: 12 }));
-      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql', '018-device-sn.sql', '019-device-identifiers.sql']) {
+      for (const file of ['001-core.sql', 'user-schema.sql', '002-rentals.sql', '004-phone.sql', '018-device-sn.sql', '019-device-identifiers.sql', '021-device-deletion.sql']) {
         const schema = (await readFile('database/' + file, 'utf8')).replace(/^\s*--.*$/gm, '').split(';').map(sql => sql.trim()).filter(Boolean);
         for (const statement of schema) await db.execute(statement);
       }
@@ -104,6 +104,12 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       expect(ended).toMatchObject({ status: 'ENDED', refund_status: 'PROCESSING' });
       expect(Number(ended.refund_amount_cents)).toBe(ended.refund_mode === 'deposit' ? 20000 : 22000);
       expect((await service.context(owner, deviceSn)).state).toBe('SETTLING');
+      await expect(service.deleteDevice(root, device.id)).rejects.toMatchObject({ status: 409 });
+      const unsettledSlot = (await db.one('SELECT * FROM ar_rental_slot WHERE device_id=?', [device.id]))!;
+      await db.execute('DELETE FROM ar_rental_slot WHERE device_id=?', [device.id]);
+      // An unfinished refund must block deletion even if its slot is unexpectedly absent.
+      await expect(service.deleteDevice(root, device.id)).rejects.toMatchObject({ status: 409 });
+      await db.insert('ar_rental_slot', unsettledSlot);
       await expect(service.syncRefund(owner, stored.id)).rejects.toMatchObject({ status: 403 });
       await db.execute("UPDATE ar_user SET role='user' WHERE id=?", [manager.user.id]);
       await expect(service.syncRefund(manager, stored.id)).rejects.toMatchObject({ status: 403 });
@@ -156,6 +162,29 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL rental occupanc
       const binding = (await db.one('SELECT venue_id FROM ar_device WHERE id=?', [device.id]))!;
       const slotAfterRace = await db.one('SELECT * FROM ar_rental_slot WHERE device_id=?', [device.id]);
       expect(Number(binding.venue_id)).toBe(slotAfterRace ? 1 : 3);
+      if (slotAfterRace) await service.cancel(owner, slotAfterRace.rental_id);
+      expect(await service.deleteDevice(root, device.id)).toEqual({ deleted: true });
+      expect((await service.get(owner, stored.id)).rental)
+        .toMatchObject({ deviceId: device.id, uuid: deviceSn, status: 'ENDED', refundStatus: 'SUCCESS' });
+
+      const spare = await db.insert('ar_device', { sn: 'spare-delete-reserve-race', merchant_id: 1, venue_id: 1 });
+      await service.configure(root, spare.id, { enabled: true, version: 0 });
+      const [deletion, reservation] = await Promise.allSettled([
+        service.deleteDevice(root, spare.id),
+        service.create(owner, { deviceId: spare.id, priceVersion: 1, venuePriceVersion: 2, idempotencyKey: 'reservation-versus-delete' }),
+      ]);
+      if (deletion.status === 'fulfilled') {
+        expect(deletion.value).toEqual({ deleted: true });
+        expect(reservation).toMatchObject({ status: 'rejected', reason: { status: 404 } });
+      } else {
+        expect(deletion.reason).toMatchObject({ status: 409 });
+        expect(reservation.status).toBe('fulfilled');
+        if (reservation.status === 'fulfilled') await service.cancel(owner, reservation.value.rental.id);
+        expect(await service.deleteDevice(root, spare.id)).toEqual({ deleted: true });
+      }
+      expect(await db.one('SELECT id,sn,deleted_ms FROM ar_device WHERE id=?', [spare.id]))
+        .toMatchObject({ id: spare.id, sn: spare.sn, deleted_ms: expect.anything() });
+      expect(await db.one('SELECT device_id FROM ar_rental_slot WHERE device_id=?', [spare.id])).toBeNull();
     } finally {
       await db?.close();
       if (created) await admin.query(`DROP DATABASE ${database}`);

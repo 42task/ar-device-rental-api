@@ -19,8 +19,19 @@ export function deviceUuid(value: unknown): string {
   return deviceIdentifier(value, '设备 UUID 无效');
 }
 
+export function registeredDeviceUuid(value: unknown): string {
+  const uuid = deviceUuid(value);
+  if (!canonicalUuid.test(uuid)) throw new ApiError(422, '设备 UUID 格式无效');
+  return uuid;
+}
+
 export function deviceSn(value: unknown): string {
   return deviceIdentifier(value, '设备 SN 无效');
+}
+
+export function registeredDeviceSn(value: unknown): string {
+  if (typeof value !== 'string' || !/^[0-9]{16}$/.test(value)) throw new ApiError(422, '设备 SN 必须是 16 位数字');
+  return value;
 }
 
 export function deviceType(value: unknown): string {
@@ -32,7 +43,7 @@ export function deviceType(value: unknown): string {
   return resolveDeviceType(value);
 }
 
-function deviceName(value: unknown, uuid: string): string {
+export function deviceName(value: unknown, uuid: string): string {
   if (value === undefined) return uuid;
   if (typeof value !== 'string' || !value.trim() || [...value.trim()].length > 255 || /[\x00-\x1f\x7f]/.test(value)) {
     throw new ApiError(422, '设备名称须为 1 至 255 个字符，且不含控制字符');
@@ -71,9 +82,10 @@ export class DeviceService {
     if (!Number.isSafeInteger(ownerId) || ownerId < 1) throw new ApiError(422, '设备必须绑定有效商户');
     const checkOwnership = (row: Row): void => {
       if (merchant && Number(row.merchant_id) !== merchant.id) throw new ApiError(409, '设备属于其他商户，请使用对应小程序', 'MERCHANT_MISMATCH');
+      if (row.deleted_ms != null) throw new ApiError(409, '该 UUID 或 SN 属于已删除设备，无法重新登记');
     };
     const suppliedUuid = input.uuid == null ? null : deviceUuid(input.uuid);
-    const suppliedSn = input.sn == null ? null : deviceSn(input.sn);
+    const suppliedSn = input.sn == null ? null : registeredDeviceSn(input.sn);
     const identifier = suppliedUuid ?? suppliedSn;
     if (identifier === null) throw new ApiError(422, '请提供设备 UUID 或 SN');
     const uuid = suppliedUuid !== null && canonicalUuid.test(suppliedUuid) ? suppliedUuid : null;
@@ -114,6 +126,7 @@ export class DeviceService {
           if (Number(existing.venue_id) !== venueId) throw new ApiError(409, '设备已绑定其他场地，请通过设备设置调整');
           return { row: { ...existing, venue_name: venue.name }, created: false };
         }
+        if (legacy) registeredDeviceSn(suppliedUuid);
         return { row: { ...await db.insert('ar_device', { uuid, sn, name, remark_name, device_type, merchant_id: ownerId, venue_id: venueId }), venue_name: venue.name }, created: true };
       });
     } catch (error: any) {
