@@ -632,7 +632,7 @@ export class RentalService {
       WHERE d.id=?` + (merchant ? ' AND d.merchant_id=?' : ''), [id(deviceId), ...(merchant ? [merchant.id] : [])]);
     if (!device) throw new ApiError(404, '设备不存在');
     const identifier = device.uuid ?? device.sn;
-    if (device.legacy_uuid_conflict) {
+    if (Number(device.legacy_uuid_conflict) === 1) {
       throw new ApiError(409, '设备 SN 与二维码标识冲突，无法生成设备标签');
     }
     // Existing label clients validate the QR parameter against device.uuid.
