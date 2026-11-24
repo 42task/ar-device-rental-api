@@ -22,7 +22,7 @@ class RentalDb {
       CREATE TABLE ar_user_phone(user_id INTEGER PRIMARY KEY REFERENCES ar_user(id),appid TEXT NOT NULL,identity_id INTEGER,verified_ms INTEGER NOT NULL);
       CREATE TABLE ar_venue(id INTEGER PRIMARY KEY,merchant_id INTEGER NOT NULL,name TEXT,address TEXT DEFAULT '',description TEXT DEFAULT '',status TEXT NOT NULL DEFAULT 'active',use_fee_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1);
       INSERT INTO ar_venue(id,merchant_id,name,use_fee_cents,deposit_cents) VALUES(1,1,'场地一',2000,20000),(2,2,'场地二',3000,9000),(3,1,'场地三',3000,10000);
-      CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,remark_name TEXT NOT NULL DEFAULT '',merchant_id INTEGER NOT NULL DEFAULT 1,venue_id INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE ar_device(id INTEGER PRIMARY KEY AUTOINCREMENT,uuid TEXT UNIQUE,sn TEXT UNIQUE,device_type TEXT DEFAULT 'ios',name TEXT,remark_name TEXT NOT NULL DEFAULT '',merchant_id INTEGER NOT NULL DEFAULT 1,venue_id INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
       INSERT INTO ar_device(id,uuid,device_type,name) VALUES(7,'camera-7','rokid','AR眼镜'),(8,'camera-8','ios','设备8');`);
     const mysql = readFileSync(resolve('database/002-rentals.sql'), 'utf8');
     const schema = mysql.replace(/^\s*--.*$/gm, '')
@@ -205,7 +205,7 @@ describe('independent AR rental lifecycle', () => {
     expect(await f.service.createDevice(f.manager, { venueId: 1, uuid: 'explicit-rokid-device', type: 'rokid' })).toMatchObject({ device: { type: 'rokid' } });
     expect(await f.service.createDevice(f.manager, { venueId: 1, uuid: 'explicit-studio-device', type: 'rokid studio2' })).toMatchObject({ device: { type: 'Rokid Studio2' } });
     expect(await f.service.createDevice(f.manager, { venueId: 1, uuid: 'short-studio-device', type: 'rs2' })).toMatchObject({ created: true, device: { type: 'Rokid Studio2' } });
-    expect((await f.db.one('SELECT device_type FROM ar_device WHERE uuid=?', ['short-studio-device']))!.device_type).toBe('Rokid Studio2');
+    expect(await f.db.one('SELECT uuid,device_type FROM ar_device WHERE sn=?', ['short-studio-device'])).toEqual({ uuid: null, device_type: 'Rokid Studio2' });
     expect(await f.service.createDevice(f.manager, { venueId: 1, uuid: 'camera-8', type: 'rs2' })).toMatchObject({ created: false, device: { type: 'ios' } });
     expect((await f.service.context(f.user, 'camera-8')).device.type).toBe('ios');
     expect(DeviceService.display({ id: 99, uuid: 'legacy-empty', device_type: '' }).type).toBe('Rokid Studio2');

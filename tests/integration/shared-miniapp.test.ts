@@ -67,7 +67,8 @@ async function setup(db: Database) {
 describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp entry and merchant management', () => {
   it('upgrades an existing schema-8 entry, permits shared merchants and retains independent-entry uniqueness', async () => withFixture(async f => {
     const venue = await seedVenue(f.db);
-    await f.db.insert('ar_device', { uuid: 'pre-shared-schema-eight', name: 'Synthetic existing device', device_type: 'ios', merchant_id: 1, venue_id: venue.id });
+    const legacyUuid = '435ea07f-78bc-45a8-9f14-d2c27230bc75';
+    await f.db.insert('ar_device', { uuid: legacyUuid, name: 'Synthetic existing device', device_type: 'ios', merchant_id: 1, venue_id: venue.id });
     // Remove later authoritative tables and their ledger before recreating the
     // pre-shared constraints. Merely lowering meta leaves an impossible upgrade.
     for (const table of ['ar_application_merchant', 'ar_application', 'ar_merchant_membership', 'ar_schema_migration']) await f.db.execute(`DROP TABLE ${table}`);
@@ -83,7 +84,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     expect((await f.db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(8);
     await migrate(f.db); await migrate(f.db);
     expect((await f.db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(SCHEMA_VERSION);
-    expect(await f.db.one("SELECT merchant_id FROM ar_device WHERE uuid='pre-shared-schema-eight'")).toEqual({ merchant_id: 1 });
+    expect(await f.db.one('SELECT merchant_id FROM ar_device WHERE uuid=?', [legacyUuid])).toEqual({ merchant_id: 1 });
 
     const child = await f.shared(); expect(child.status).toBe(200);
     const merchant = child.body.merchant;
@@ -211,9 +212,56 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('real MySQL shared-miniapp 
     const separateToken = 'Bearer ' + refreshedStaff.body.data.token.accessToken;
     expect((await f.http('get', '/api/v2/rental/admin/overview', separateToken, separateId, 'independent.example.test')).status).toBe(200);
     expect((await f.http('get', '/api/v2/rental/admin/overview', separateToken, child.body.merchant.id, 'independent.example.test')).status).toBe(403);
-    const device = await f.http('post', '/api/v2/rental/devices', f.rootToken, separateId).send({ uuid: 'independent-device', venueId: venue.id });
-    expect(device.status).toBe(200); expect(device.body.device.merchantId).toBe(separateId);
-    expect((await f.http('get', '/api/v2/rental/devices/context', token).query({ uuid: 'independent-device' })).status).toBe(409);
+    const independentUuid = '09af89d4-4ba0-4db1-a7ef-b2a4b6135d02';
+    const registered = await f.http('post', '/api/v2/rental/devices', f.rootToken, separateId).send({ uuid: independentUuid, venueId: venue.id });
+    expect(registered.status).toBe(200);
+    expect(registered.body.device).toMatchObject({ uuid: independentUuid, merchantId: separateId });
+
+    const serial = '000AbC-independent';
+    const device = await f.db.insert('ar_device', { uuid: serial, name: 'Synthetic independent device', merchant_id: separateId, venue_id: venue.id });
+    await f.db.execute('DELETE FROM ar_schema_migration WHERE version=20');
+    await f.db.execute("UPDATE ar_schema_meta SET version=19 WHERE name='ar-device-rental-api'");
+    await migrate(f.db);
+    expect(await f.db.one('SELECT uuid,sn,merchant_id FROM ar_device WHERE id=?', [device.id]))
+      .toEqual({ uuid: null, sn: serial, merchant_id: separateId });
+
+    const expectedDevice = { id: device.id, uuid: serial, registeredUuid: null, sn: serial, merchantId: separateId };
+    const deviceContext = '/api/v2/rental/devices/context';
+    for (const query of [{ uuid: serial }, { sn: serial }]) {
+      const own = await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query(query);
+      expect(own.status).toBe(200);
+      expect(own.body).toMatchObject({ device: expectedDevice, state: 'DISABLED', actions: { canConfigure: true } });
+      expect((await f.http('get', deviceContext, token).query(query)).status).toBe(409);
+    }
+    expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ uuid: serial, sn: serial })).status).toBe(422);
+    const list = await f.http('get', '/api/v2/rental/admin/devices', separateToken, separateId, 'independent.example.test')
+      .query({ venueId: venue.id, search: serial });
+    expect(list.status).toBe(200);
+    expect(list.body).toMatchObject({ total: 1, items: [{ device: expectedDevice }] });
+    const qr = await f.http('get', `/api/v2/rental/admin/devices/${device.id}/qrcode`, separateToken, separateId, 'independent.example.test');
+    expect(qr.status).toBe(200);
+    expect(qr.body.device).toMatchObject(expectedDevice);
+    expect(new URL(qr.body.url).searchParams.get('i')).toBe(serial);
+    const configured = await f.http('patch', `/api/v2/rental/devices/${device.id}/config`, separateToken, separateId, 'independent.example.test')
+      .send({ enabled: true, version: 0 });
+    expect(configured.status).toBe(200);
+    expect(configured.body).toMatchObject({ device: expectedDevice, state: 'AVAILABLE', pricing: { version: 1 } });
+
+    // Shared text values can identify different devices in different columns.
+    const sharedVenue = await seedVenue(f.db);
+    const crossColumn = 'd7bd1bd1-84c5-4a09-b8da-78a12c815d84';
+    const uuidOwner = await f.db.insert('ar_device', { uuid: crossColumn, venue_id: sharedVenue.id });
+    const snOwner = await f.db.insert('ar_device', { sn: crossColumn, merchant_id: separateId, venue_id: venue.id });
+    expect((await f.http('get', deviceContext, token).query({ uuid: crossColumn })).body)
+      .toMatchObject({ device: { id: uuidOwner.id, registeredUuid: crossColumn } });
+    expect((await f.http('get', deviceContext, token).query({ sn: crossColumn })).status).toBe(409);
+    const shadowedDevice = { id: snOwner.id, uuid: null, registeredUuid: null, sn: crossColumn };
+    expect((await f.http('get', deviceContext, separateToken, undefined, 'independent.example.test').query({ sn: crossColumn })).body)
+      .toMatchObject({ device: shadowedDevice });
+    expect((await f.http('get', '/api/v2/rental/admin/devices', separateToken, separateId, 'independent.example.test')
+      .query({ venueId: venue.id, search: crossColumn })).body)
+      .toMatchObject({ total: 1, items: [{ device: shadowedDevice }] });
+    expect((await f.http('get', `/api/v2/rental/admin/devices/${snOwner.id}/qrcode`, separateToken, separateId, 'independent.example.test')).status).toBe(409);
   }), 30_000);
 
   it('lets root assign and revoke a shared-application employee without employee confirmation', async () => withFixture(async f => {

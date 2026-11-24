@@ -5,6 +5,11 @@ import { quoteForDevice } from './quotes';
 
 export interface DevicePageQuery { merchantId?: number; venueId?: number; allMerchants?: boolean; search: string; page: number; pageSize: number }
 export interface DeviceSummaryRows { device: Row; venue: Row; pricing: Row; state: string }
+/** An old UUID-only lookup must never resolve an SN alias to a different device. */
+export const legacyUuidConflictColumn = `EXISTS (
+  SELECT 1 FROM ar_device uuid_owner WHERE d.uuid IS NULL AND uuid_owner.uuid=d.sn
+) AS legacy_uuid_conflict`;
+
 /** A management read model: one count plus one joined page, regardless of the
  * number of devices. Authorization belongs to the caller, mutations never do.
  */
@@ -15,13 +20,13 @@ export async function readDevicePage(db: Database, query: DevicePageQuery): Prom
   const scoped = merchantId !== undefined;
   if (allMerchants && (scoped || venueId !== undefined)) throw new ApiError(503, '设备查询范围冲突');
   const ownership = scoped || allMerchants;
-  const predicates = [...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : []), ...(search ? ["(d.uuid LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=' OR d.remark_name LIKE ? ESCAPE '=')"] : [])];
+  const predicates = [...(scoped ? ['d.merchant_id=?'] : []), ...(venueId !== undefined ? ['d.venue_id=?'] : []), ...(search ? ["(d.uuid LIKE ? ESCAPE '=' OR d.sn LIKE ? ESCAPE '=' OR d.name LIKE ? ESCAPE '=' OR d.remark_name LIKE ? ESCAPE '=')"] : [])];
   const pattern = '%' + search.replace(/[=%_]/g, '=$&') + '%';
   const where = predicates.length ? ' WHERE ' + predicates.join(' AND ') : '';
-  const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern, pattern] : [])];
+  const values = [...(scoped ? [merchantId] : []), ...(venueId !== undefined ? [venueId] : []), ...(search ? [pattern, pattern, pattern, pattern] : [])];
   const [count, rows] = await Promise.all([
     db.one('SELECT COUNT(*) AS total FROM ar_device d' + where, values),
-    db.query(`SELECT d.*,${allMerchants ? 'm.id AS merchant_record_id,m.name AS merchant_name,' : ''}v.id AS venue_record_id,v.merchant_id AS venue_merchant_id,v.name AS venue_name,
+    db.query(`SELECT d.*,${legacyUuidConflictColumn},${allMerchants ? 'm.id AS merchant_record_id,m.name AS merchant_name,' : ''}v.id AS venue_record_id,v.merchant_id AS venue_merchant_id,v.name AS venue_name,
       v.address AS venue_address,v.description AS venue_description,v.status AS venue_status,
       v.use_fee_cents AS venue_use_fee_cents,v.deposit_cents AS venue_deposit_cents,v.version AS venue_version,
       c.device_id AS config_device_id,c.enabled AS config_enabled,c.version AS config_version,

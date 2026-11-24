@@ -30,7 +30,7 @@ describe.skipIf(process.env.RUN_INTEGRATION !== '1')('independent application id
       await migrate(db); await migrate(db);
       expect((await db.one('SELECT version FROM ar_schema_meta'))!.version).toBe(SCHEMA_VERSION);
       const journal = await db.query('SELECT version,checksum,applied_ms FROM ar_schema_migration ORDER BY version');
-      expect(journal.map(row => row.version)).toEqual([11, 12, 13, 14, 15, 16, 17, 18]);
+      expect(journal.map(row => row.version)).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
       expect(await db.one("SHOW COLUMNS FROM ar_device WHERE Field='remark_name'")).toMatchObject({ Null: 'NO', Default: '' });
       expect(await db.one("SHOW COLUMNS FROM ar_rental_config WHERE Field='use_fee_cents'")).toBeNull();
       const appId = 'wx03dbf50c15cac06f';

@@ -1,4 +1,5 @@
 import type { Context, Services } from '../core/contracts';
+import { ApiError } from '../core/errors';
 import type { ApiRouter } from '../core/router';
 import { RentalService } from './service';
 import type { RentalOptions } from './types';
@@ -14,7 +15,11 @@ export function registerRentals(router: ApiRouter, services: Services, options: 
     return handler(ctx);
   });
   const identity = options.authenticate;
-  route('GET', '/v2/rental/devices/context', async ctx => service.context(await identity(ctx), ctx.query.uuid));
+  route('GET', '/v2/rental/devices/context', async ctx => {
+    const principal = await identity(ctx);
+    if (ctx.query.uuid !== undefined && ctx.query.sn !== undefined) throw new ApiError(422, '请仅提供 UUID 或 SN');
+    return ctx.query.sn === undefined ? service.context(principal, ctx.query.uuid) : service.context(principal, ctx.query.sn, 'sn');
+  });
   route('GET', '/v2/rental/admin/devices', async ctx => service.devices(await identity(ctx), ctx.query));
   route('GET', '/v2/rental/admin/devices/:id/qrcode', async ctx => service.deviceQrcode(await identity(ctx), ctx.params.id));
   route('POST', '/v2/rental/devices', async ctx => service.createDevice(await identity(ctx), ctx.body));
