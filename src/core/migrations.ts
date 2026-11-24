@@ -6,7 +6,7 @@ import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
 import { archiveDevicePricing } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
@@ -184,6 +184,9 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
           alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='remark_name'") },
         { version: 18, filename: '018-device-sn.sql', run: async (_db: Database) => {},
           alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='sn'") },
+        { version: 19, filename: '019-device-identifiers.sql', run: async (_db: Database) => {},
+          alreadyApplied: async (db: Database) => !!await db.one(
+            "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='ar_device' AND CONSTRAINT_NAME='chk_ar_device_identifier_present' AND CONSTRAINT_TYPE='CHECK' AND ENFORCED='YES'") },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');
