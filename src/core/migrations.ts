@@ -6,7 +6,7 @@ import { migrateMemberships } from '../auth/migrations';
 import { migrateApplications } from '../applications/migrations';
 import { archiveDevicePricing } from '../devices/migrations';
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 const CURRENT_ROLE_ENUM = "enum('user','manager','adminer','root')";
 const LEGACY_ROLE_ENUM = "enum('user','manager','admin','root')";
 const TRANSITIONAL_ROLE_ENUM = "enum('user','manager','admin','root','adminer')";
@@ -182,6 +182,8 @@ export async function migrate(db: Database, root = process.cwd()): Promise<void>
         { version: 16, filename: '016-user-profile.sql', run: async (_db: Database) => {} },
         { version: 17, filename: '017-device-remark-name.sql', run: async (_db: Database) => {},
           alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='remark_name'") },
+        { version: 18, filename: '018-device-sn.sql', run: async (_db: Database) => {},
+          alreadyApplied: async (db: Database) => !!await db.one("SHOW COLUMNS FROM ar_device WHERE Field='sn'") },
       ]) {
         const source = await readFile(resolve(root, 'database', step.filename), 'utf8');
         const checksum = createHash('sha256').update(source).digest('hex');
